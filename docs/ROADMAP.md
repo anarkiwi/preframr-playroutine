@@ -38,6 +38,19 @@ Prove the IR is practical on the original platform, not just by estimate:
   multispeed, add an IR→6502 compile step (the form the original players already
   take).
 
+## Known not-yet-modelled gaps (fixable; no missing instrumentation assumed)
+
+- **FutureComposer FREQ vibrato / portamento** (keeps Tune_06 at ~0.90). The
+  PITCHWALK base is recovered; the residual is the SMC vibrato (self-modified
+  depth, delayed triangle) and 16-bit portamento glide, whose instantaneous freq
+  is computed in CPU registers and not held in a normal RAM cell. Before adding
+  any new observable, try recovering it from data we **already** log: the
+  self-modifying-code immediate writes (depth/glide bytes patched into the player
+  code) are captured by the RAM-write hook, so the modulation should be
+  recoverable as a register-space BACC from those code-region writes. Only if
+  that genuinely fails, log the emitted accumulator at each `$D400/$D401` `STA`
+  (a small tracer hook).
+
 ## Scope: generative tunes
 
 For algorithmically-generated melodies (e.g. *A Mind Is Born*) we model the

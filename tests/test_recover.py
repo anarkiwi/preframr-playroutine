@@ -322,6 +322,147 @@ def test_classify_table_walk_noread_image_mask():
     assert np.array_equal(res["table"], table)
 
 
+def _pitch_table(length):
+    """A monotonic 16-bit pitch table with high-entropy lo bytes (FC-style)."""
+    pitch = (0x0100 + np.arange(length) * 0x57).astype(np.int64) & 0xFFFF
+    return pitch
+
+
+def _build_pitchwalk_trace(idx_series, idx_cells, lo_base=0x1564, hi_base=0x15C4, note_len=16):
+    """Trace whose FREQ is ``pitchtable[sum(idx_cells)]`` (FC-style pitch walk).
+
+    ``idx_series`` is a list of per-frame index-cell-value tuples (one per cell in
+    ``idx_cells``); the emitted FREQ is the pitch-table entry at their sum.
+    """
+    n = len(idx_series)
+    length = max(int(sum(v)) for v in idx_series) + 1
+    pitch = _pitch_table(length)
+    lo_tab = (pitch & 0xFF).astype(np.uint8)
+    hi_tab = ((pitch >> 8) & 0xFF).astype(np.uint8)
+    ram = np.zeros(65536, dtype=np.uint8)
+    ram[lo_base : lo_base + length] = lo_tab
+    ram[hi_base : hi_base + length] = hi_tab
+    recs = []
+    ramwr = []
+    for i, parts in enumerate(idx_series):
+        tick = _frame_cycle(i)
+        k = int(sum(parts))
+        freq = int(pitch[k])
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        gate = 0x41 if i % note_len else 0x40
+        recs.append(_ev(tick + 6, SID_WRITE, reg=4, value=gate, addr=0xD404, aux=0x1552))
+        recs.append(_ev(tick + 10, SID_WRITE, reg=0, value=freq & 0xFF, addr=0xD400, aux=0x190E))
+        recs.append(
+            _ev(tick + 10, SID_WRITE, reg=1, value=(freq >> 8) & 0xFF, addr=0xD401, aux=0x190E)
+        )
+        for cell, val in zip(idx_cells, parts):
+            ramwr.append(_ra(tick + 4, cell, int(val)))
+    return _build_trace(recs, ram_writes=ramwr, ram=ram)
+
+
+def test_classify_pitchwalk_single_index_cell():
+    rng = np.random.default_rng(3)
+    idx = rng.integers(0, 16, size=96)
+    trace = _build_pitchwalk_trace([(int(k),) for k in idx], [0x1930])
+    res = classify_register(trace, 0xD400)
+    assert res["type"] == "PITCHWALK", res["type"]
+    assert res["lo_base"] == 0x1564
+    assert res["hi_base"] == 0x15C4
+    assert res["index_cells"] == [0x1930]
+    rt = round_trip(trace)
+    assert rt[0xD400] == 1.0
+    assert rt[0xD401] == 1.0
+
+
+def test_classify_pitchwalk_additive_offset():
+    # idx = note ($1930) + arp offset ($0041); the additive index must be recovered.
+    # The arp offset is 0 on the held note (dominant) with periodic +4/+7 jumps,
+    # exactly as a Future Composer arpeggio drives the pitch index.
+    rng = np.random.default_rng(7)
+    note = rng.integers(2, 12, size=160)
+    arp = np.array([0, 0, 0, 0, 4, 0, 0, 7] * 20)[:160]
+    trace = _build_pitchwalk_trace(list(zip(note.tolist(), arp.tolist())), [0x1930, 0x0041])
+    res = classify_register(trace, 0xD400)
+    assert res["type"] == "PITCHWALK"
+    assert set(res["index_cells"]) == {0x1930, 0x0041}
+    rt = round_trip(trace)
+    assert rt[0xD400] == 1.0
+    assert rt[0xD401] == 1.0
+
+
+def test_classify_pitchwalk_with_override():
+    # Pitch walk plus a hard-restart override: on flag frames the player forces
+    # FREQ to $FFFF (off table). The override predicate must be recovered so the
+    # walk round-trips exactly.
+    rng = np.random.default_rng(11)
+    idx = rng.integers(0, 14, size=140)
+    flag_cell = 0x0050
+    length = 16
+    pitch = _pitch_table(length)
+    lo_tab = (pitch & 0xFF).astype(np.uint8)
+    hi_tab = ((pitch >> 8) & 0xFF).astype(np.uint8)
+    ram = np.zeros(65536, dtype=np.uint8)
+    ram[0x1564 : 0x1564 + length] = lo_tab
+    ram[0x15C4 : 0x15C4 + length] = hi_tab
+    recs = []
+    ramwr = []
+    for i, k in enumerate(idx):
+        tick = _frame_cycle(i)
+        forced = i % 20 == 1
+        freq = 0xFFFF if forced else int(pitch[int(k)])
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        gate = 0x41 if i % 16 else 0x40
+        recs.append(_ev(tick + 6, SID_WRITE, reg=4, value=gate, addr=0xD404, aux=0x1552))
+        recs.append(_ev(tick + 10, SID_WRITE, reg=0, value=freq & 0xFF, addr=0xD400, aux=0x190E))
+        recs.append(
+            _ev(tick + 10, SID_WRITE, reg=1, value=(freq >> 8) & 0xFF, addr=0xD401, aux=0x190E)
+        )
+        ramwr.append(_ra(tick + 4, 0x1930, int(k)))
+        ramwr.append(_ra(tick + 3, flag_cell, 1 if forced else 0))
+    trace = _build_trace(recs, ram_writes=ramwr, ram=ram)
+    res = classify_register(trace, 0xD400)
+    assert res["type"] == "PITCHWALK"
+    assert res["overrides"]
+    rt = round_trip(trace)
+    assert rt[0xD400] == 1.0
+    assert rt[0xD401] == 1.0
+
+
+def test_reconstruct_pitchwalk_no_sampler_zeros():
+    desc = {
+        "type": "PITCHWALK",
+        "byte_role": "lo",
+        "lo_table": np.arange(8, dtype=np.uint8),
+        "hi_table": np.zeros(8, dtype=np.uint8),
+        "index_cells": [0x90],
+        "overrides": [],
+    }
+    recon = reconstruct_register(desc, _ticks(10))  # no trace/sampler -> zeros
+    assert np.array_equal(recon, np.zeros(10, dtype=np.int64))
+
+
+def test_reconstruct_pitchwalk_roundtrip():
+    length = 16
+    pitch = _pitch_table(length)
+    desc = {
+        "type": "PITCHWALK",
+        "byte_role": "hi",
+        "lo_base": 0x1564,
+        "hi_base": 0x15C4,
+        "lo_table": (pitch & 0xFF).astype(np.uint8),
+        "hi_table": ((pitch >> 8) & 0xFF).astype(np.uint8),
+        "index_cells": [0x90],
+        "overrides": [],
+    }
+    cursor = np.tile(np.arange(length), 5).astype(np.int64)
+    n = len(cursor)
+    recs = [_ev(_frame_cycle(i) + 2, CPU_VECTOR, value=VEC_IRQ) for i in range(n)]
+    ramwr = [_ra(_frame_cycle(i) + 4, 0x90, int(cursor[i])) for i in range(n)]
+    trace = _build_trace(recs, ram_writes=ramwr)
+    recon = reconstruct_register(desc, _ticks(n), trace=trace)
+    assert np.array_equal(recon, (pitch[cursor] >> 8) & 0xFF)
+
+
 def test_classify_per_note_ad_cell_seq():
     n = 80
     note_len = 16

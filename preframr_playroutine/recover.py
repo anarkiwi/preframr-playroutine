@@ -850,6 +850,7 @@ def _bacc_with_feeder(bacc, series, sid_addr, ctx):
 def _classify_freq(trace, sid_addr, series, voice, reg_off, ctx, result):
     """Pick the FREQ model (composite vs accumulator) with the best round-trip."""
     candidates = [
+        _pitch_walk(trace, sid_addr, reg_off, ctx),
         _composite(trace, sid_addr, series, ctx, reg_off),
         _bacc_with_feeder(
             _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx), series, sid_addr, ctx
@@ -1080,6 +1081,190 @@ def _override_descriptor(forced_byte, ctx):
     force_val = int(vals[counts.argmax()])
     terms = _find_override(forced_byte == force_val, ctx)
     return None if terms is None else {"predicate": terms, "force": force_val}
+
+
+def _anchor_bases(cur_s, val_s, cmax, ram, ramhist, n_anchors=16, cap=256):
+    """Candidate table bases so ``ram[base + cur_s] == val_s`` could hold.
+
+    Each anchor frame ``f`` votes for every base ``pos - cur_s[f]`` where
+    ``ram[pos] == val_s[f]``; the true base collects a vote from every in-table
+    anchor while spurious bases get one or two, so the top-voted bases survive
+    even when the values are low-entropy and ubiquitous in the image (the FREQ hi
+    bytes). The rarest-valued anchor frames are used first to keep the vote pools
+    small. Returns the most-voted candidate bases.
+    """
+    order = np.argsort(ramhist[val_s], kind="stable")[:n_anchors]
+    pools = []
+    for f in order:
+        pos = np.nonzero(ram == int(val_s[f]))[0].astype(np.int64) - int(cur_s[f])
+        pools.append(pos[(pos >= 0) & (pos + cmax < len(ram))])
+    if not pools:
+        return np.empty(0, dtype=np.int64)
+    allb = np.concatenate(pools)
+    if len(allb) == 0:
+        return np.empty(0, dtype=np.int64)
+    ub, cnt = np.unique(allb, return_counts=True)
+    return ub[np.argsort(cnt, kind="stable")[::-1][:cap]]
+
+
+def _pitch_table_for_cell(cursor, lo_o, hi_o, cmax, ram, ramhist, sample):
+    """(base_lo, base_hi, combined_fraction) of a 16-bit pitch table for ``cursor``.
+
+    Finds, in the static RAM image, contiguous lo/hi byte sub-tables such that
+    ``ram[base_lo + cursor]`` and ``ram[base_hi + cursor]`` reproduce the emitted
+    FREQ lo/hi bytes. The (high-entropy) lo base is fixed first; the hi base is
+    then chosen to maximise the *combined* lo&hi match, so the low-entropy hi
+    bytes (values 1..8) cannot anchor a spurious base. Scored on the subsample,
+    so the cost is independent of trace length.
+    """
+    cur_s = cursor[sample]
+    lo_s = lo_o[sample]
+    hi_s = hi_o[sample]
+    lo_bases = _anchor_bases(cur_s, lo_s, cmax, ram, ramhist)
+    if len(lo_bases) == 0:
+        return None
+    lo_scores = np.array([np.mean(ram[b + cur_s] == lo_s) for b in lo_bases])
+    base_lo = int(lo_bases[int(lo_scores.argmax())])
+    lo_ok = ram[base_lo + cur_s] == lo_s
+    hi_bases = _anchor_bases(cur_s, hi_s, cmax, ram, ramhist)
+    if len(hi_bases) == 0:
+        return None
+    combined = np.array([np.mean(lo_ok & (ram[b + cur_s] == hi_s)) for b in hi_bases])
+    k = int(combined.argmax())
+    return base_lo, int(hi_bases[k]), float(combined[k])
+
+
+def _pitch_index_cells(idx, inb, grid, addrs, tlen, primary, max_extra=2):
+    """Index cells whose end-of-frame sum reproduces a pitch-table index.
+
+    ``idx`` is the per-frame table index inverted from the oracle (``-1`` off
+    table, ``inb`` marks the in-table frames). Starting from the ``primary``
+    column (the note cell), greedily add cells whose value explains the residual
+    ``idx - running``, keeping each only while it raises the in-table match. The
+    sum models ``note + transpose + arp/wavetable offset`` of the FC pitch walk.
+    """
+    chosen = [int(addrs[primary])]
+    running = grid[:, primary].copy()
+    used = {primary}
+
+    def score(run):
+        return float(np.mean((np.clip(run, 0, tlen - 1) == idx)[inb]))
+
+    cur_score = score(running)
+    for _ in range(max_extra):
+        resid = idx - running
+        match = (grid == resid[:, None])[inb].mean(axis=0)
+        match[list(used)] = -1.0
+        j = int(match.argmax())
+        if j in used:
+            break
+        cand = running + grid[:, j]
+        if score(cand) <= cur_score + 1e-9:
+            break
+        chosen.append(int(addrs[j]))
+        used.add(j)
+        running = cand
+        cur_score = score(cand)
+    return chosen, running
+
+
+def _pitch_walk(trace, sid_addr, reg_off, ctx):
+    """Recover FC-style FREQ: a 16-bit pitch-table walk indexed by note + offset.
+
+    FREQ is ``pitchtable[idx]`` with ``idx = note (+ transpose + arp/wavetable
+    offset)``, all paced by the per-voice note sequencer -- a two-level table
+    walk, not a single accumulator. The pitch table (lo/hi byte sub-tables) is
+    located in the static RAM image via the note state cell; the index is then
+    recovered as a sum of observable cells (:func:`_pitch_index_cells`). Off-table
+    frames (vibrato/portamento, computed in registers and never stored to RAM)
+    are left to a value-forcing override pass. Returns a ``PITCHWALK`` descriptor
+    or ``None``.
+    """
+    ram = ctx.ram
+    partner = _LOHI_PARTNER.get(reg_off)
+    if ram is None or partner is None or ctx.sampler is None:
+        return None
+    role = "lo" if reg_off == _FREQ_LO else "hi"
+    lo_addr = sid_addr if role == "lo" else sid_addr + partner
+    hi_addr = sid_addr + partner if role == "lo" else sid_addr
+    lo_o = _register_series(trace, lo_addr, ctx.kind)[1]
+    hi_o = _register_series(trace, hi_addr, ctx.kind)[1]
+    ramu = np.asarray(ram, dtype=np.uint8)
+    grid = ctx.stateseq.grid.astype(np.int64)
+    addrs = ctx.stateseq.addrs
+    n = grid.shape[0]
+    if n == 0:
+        return None
+    # An index (note) cell has a small range and few distinct values; that prefilter
+    # plus a subsampled, anchor-based base search keeps the cost trace-length
+    # independent (the table walk reconstructs over all frames either way).
+    cols = [
+        j
+        for j in range(grid.shape[1])
+        if grid[:, j].max() <= 95
+        and grid[:, j].min() != grid[:, j].max()
+        and len(np.unique(grid[:, j])) <= 64
+    ][:48]
+    sample = np.unique(np.linspace(0, n - 1, min(n, 256)).astype(np.int64))
+    ramhist = np.bincount(ramu, minlength=256)
+    found = []
+    for j in cols:
+        cur = grid[:, j]
+        res = _pitch_table_for_cell(cur, lo_o, hi_o, int(cur.max()), ramu, ramhist, sample)
+        if res is not None and res[2] >= 0.2:
+            found.append((res[2], j, res[0], res[1]))
+    if not found:
+        return None
+    # The base of a single (note) cell only matches frames whose note offset is
+    # zero, so try the strongest few candidate tables and keep whichever, after
+    # recovering its additive index, actually reconstructs FREQ best.
+    found.sort(reverse=True)
+    best_desc, best_fid = None, -1.0
+    for _frac, primary, base_lo, base_hi in found[:4]:
+        desc = _build_pitchwalk(role, base_lo, base_hi, primary, lo_o, hi_o, grid, addrs, ramu, ctx)
+        if desc is None:
+            continue
+        if desc["residual"] > best_fid:
+            best_desc, best_fid = desc, desc["residual"]
+    return best_desc
+
+
+def _build_pitchwalk(role, base_lo, base_hi, primary, lo_o, hi_o, grid, addrs, ramu, ctx):
+    """Assemble (and score) a PITCHWALK descriptor for one candidate pitch table."""
+    span = abs(base_hi - base_lo) if base_hi != base_lo else 96
+    tlen = int(
+        min(max(span, int(grid[:, primary].max()) + 1), 256, 65536 - base_lo, 65536 - base_hi)
+    )
+    lotab = ramu[base_lo : base_lo + tlen].astype(np.int64)
+    hitab = ramu[base_hi : base_hi + tlen].astype(np.int64)
+    tab16 = lotab | (hitab << 8)
+    tgt = (lo_o | (hi_o << 8)).astype(np.int64)
+    idx = np.full(len(tgt), -1, dtype=np.int64)
+    for k in range(tlen):
+        idx[tgt == int(tab16[k])] = k
+    inb = idx >= 0
+    if not np.any(inb):
+        return None
+    index_cells, _run = _pitch_index_cells(idx, inb, grid, addrs, tlen, primary)
+    desc = {
+        "type": "PITCHWALK",
+        "byte_role": role,
+        "lo_base": int(base_lo),
+        "hi_base": int(base_hi),
+        "lo_table": lotab.astype(np.uint8),
+        "hi_table": hitab.astype(np.uint8),
+        "index_cells": index_cells,
+        "overrides": [],
+    }
+    out = _recon_pitchwalk(desc, ctx.n_frames, ctx.sampler)
+    oracle = lo_o if role == "lo" else hi_o
+    forced = np.where(out == oracle, -1, oracle).astype(np.int64)
+    ov = _override_descriptor(forced, ctx)
+    if ov is not None:
+        desc["overrides"].append(ov)
+        out = _recon_pitchwalk(desc, ctx.n_frames, ctx.sampler)
+    desc["residual"] = float(np.mean(out == oracle))
+    return desc
 
 
 def _composite(trace, sid_addr, series, ctx, reg_off=None):
@@ -1459,6 +1644,22 @@ def _recon_composite(desc, n, sampler) -> np.ndarray:
     return _apply_overrides(out, desc.get("overrides", []), sampler)
 
 
+def _recon_pitchwalk(desc, n, sampler) -> np.ndarray:
+    """Regenerate an FC pitch-table walk: ``pitchtable[sum(index_cells)]``."""
+    lotab = np.asarray(desc["lo_table"], dtype=np.int64)
+    hitab = np.asarray(desc["hi_table"], dtype=np.int64)
+    length = len(lotab)
+    if sampler is None or length == 0:
+        return np.zeros(n, dtype=np.int64)
+    isum = np.zeros(n, dtype=np.int64)
+    for cell in desc.get("index_cells", []):
+        isum = isum + sampler.eof(cell)
+    idx = np.clip(isum, 0, length - 1)
+    val16 = lotab[idx] | (hitab[idx] << 8)
+    out = val16 & 0xFF if desc.get("byte_role") == "lo" else (val16 >> 8) & 0xFF
+    return _apply_overrides(out, desc.get("overrides", []), sampler)
+
+
 def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndarray:
     """Regenerate a register's per-frame output from its recovered descriptor.
 
@@ -1479,7 +1680,12 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
     if kind == "SEQ":
         return _recon_seq(descriptor, n)
     smp = _sampler_for(ticks, trace, sampler)
-    builders = {"BACC": _recon_bacc, "TABLE_WALK": _recon_table, "COMPOSITE": _recon_composite}
+    builders = {
+        "BACC": _recon_bacc,
+        "TABLE_WALK": _recon_table,
+        "COMPOSITE": _recon_composite,
+        "PITCHWALK": _recon_pitchwalk,
+    }
     if kind in builders:
         return builders[kind](descriptor, n, smp)
     # XSTATE: not yet modelled -- best effort is the closest observable feeder
