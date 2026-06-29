@@ -29,13 +29,18 @@ them.
 
 ## Current status
 
-Built and merged (PRs #2/#7/#8/#9/#10):
+Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13):
 
 - **Oracle + instrumentation.** Deterministic, byte-exact tracer (`sidtrace`) on
   patched libsidplayfp: cycle-stamped SID writes (PC-tagged), CIA/VIC interrupts,
   CPU vectors, play-window-scoped RAM read/write logs, PC coverage, RAM image.
 - **Recovery primitives.** `CONST`, `SEQ`, `BACC`, `TABLE_WALK`, `COMPOSITE`,
   `PITCHWALK`, plus the note/pitch layer (`recover_tuning`, `voice_detune`).
+- **Global tuning / absolute notes.** `recover_tuning` emits absolute MIDI
+  `note_numbers` / `note_range` (so the IR's notes are absolute pitch, comparable
+  across tunes) and fits the reference A4 from the recovered note→frequency table
+  when a `PITCHWALK` ladder is available (`source: note_table`, cleaner than the
+  sparse live frequencies), falling back to the live fit (`source: live_freq`).
 - **Lossless gate.** `reconstruct_register` + `round_trip` regenerate each
   register from its IR and score it byte-for-byte against the oracle.
 - **25 HVSC fixtures** (3× the top-6 trackers + 3 defMON + A Mind Is Born +
@@ -43,9 +48,10 @@ Built and merged (PRs #2/#7/#8/#9/#10):
   ratchet**: every fixture must round-trip perfectly with zero XSTATE; the
   not-yet-perfect ones are `xfail(strict=True)`, so the gap can only shrink (a
   fix XPASS-fails CI until its marker is removed).
-
-In flight (this branch): `recover_tuning` + `voice_detune` + the
-Commando/Grid Runner/Cauldron II fixtures (validating).
+- **Analysis performance.** `_table_walk_scan` (the no-read-log table-walk
+  recovery, dominant on long JCH tunes) is vectorized ~2×, byte-for-byte
+  identical (frozen-reference parity test), keeping CI time bounded as fixtures
+  grow.
 
 **Round-trip landscape** (whole-song): 3 perfect (Doctagop, Only_3, Denarius);
 most tunes 0.96–1.0; weakest are Commando 0.77 (Hubbard's hand-coded player),
@@ -59,13 +65,14 @@ CTRL stragglers on JCH.
    recovering it from the already-logged self-modifying-code immediate writes
    before adding any observable); the defMON FREQ cases; the per-tune
    filter-cutoff (`$D416`) and CTRL stragglers.
-2. **Absolute tuning anchor.** `recover_tuning` is currently modulo a semitone;
-   pin the octave/semitone from the note table so A4 is fully absolute.
+2. **Absolute octave/semitone label.** `recover_tuning` now emits absolute note
+   numbers and fits the reference from the recovered note table; the residual is
+   the integer octave/semitone label, which is per-player-convention dependent
+   (frequency pins tuning only modulo one semitone). Wire a per-player
+   note-table base where the convention is known so A4 is fully absolute.
 3. **6502 reference replayer** (assemble the IR with the in-build `xa65`, run it
    under the emulator, round-trip against the oracle) — proves on-platform
    practicality.
-4. **Performance.** `_table_walk_scan` dominates analysis time on long JCH tunes;
-   optimise it to keep CI time bounded as fixtures grow.
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for detail.
 
