@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e ".[test]"
+      - name: black
+        run: black --check preframr_playroutine tests
+      - name: pylint
+        run: pylint preframr_playroutine
+      - name: Unit tests (analysis layer)
+        run: pytest -q
+
+  docker-oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t preframr-playroutine:ci .
+      - name: Run full test suite (incl. end-to-end oracle)
+        run: docker run --rm preframr-playroutine:ci -q

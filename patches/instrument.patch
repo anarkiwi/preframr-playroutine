@@ -1,0 +1,326 @@
+diff --git a/Makefile.am b/Makefile.am
+index 0a5b033..d575286 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -84,6 +84,8 @@ src/simpleMixer.h \
+ src/romCheck.h \
+ src/sidemu.cpp \
+ src/sidemu.h \
++src/instrument.cpp \
++src/instrument.h \
+ src/sidendian.h \
+ src/sidrandom.h \
+ src/stringutils.h \
+diff --git a/src/c64/CIA/timer.h b/src/c64/CIA/timer.h
+index d3cad84..0eca5c9 100644
+--- a/src/c64/CIA/timer.h
++++ b/src/c64/CIA/timer.h
+@@ -206,6 +206,13 @@ public:
+      */
+     inline uint_least16_t getTimer() const { return timer; }
+ 
++    /**
++     * Get the reload latch value (programmed period).
++     *
++     * @return the latch value
++     */
++    inline uint_least16_t getLatch() const { return latch; }
++
+     /**
+      * Get PB6/PB7 Flipflop state.
+      *
+diff --git a/src/c64/CPU/mos6510.cpp b/src/c64/CPU/mos6510.cpp
+index 10bec1a..38dd670 100644
+--- a/src/c64/CPU/mos6510.cpp
++++ b/src/c64/CPU/mos6510.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include "Event.h"
+ #include "sidendian.h"
++#include "instrument.h"
+ 
+ #include "opcodes.h"
+ 
+@@ -305,6 +306,11 @@ void MOS6510::IRQHiRequest()
+ {
+     endian_16hi8(Register_ProgramCounter, cpuRead(Cycle_EffectiveAddress + 1));
+     flags.setI(true);
++
++    InstrumentSink *sink = getInstrumentSink();
++    if (sink != nullptr) UNLIKELY
++        sink->cpuVector(eventScheduler.getTime(EVENT_CLOCK_PHI2),
++                        endian_16lo8(Cycle_EffectiveAddress), Register_ProgramCounter);
+ }
+ 
+ /**
+diff --git a/src/c64/VIC_II/mos656x.h b/src/c64/VIC_II/mos656x.h
+index 4bc2c1d..46fea70 100644
+--- a/src/c64/VIC_II/mos656x.h
++++ b/src/c64/VIC_II/mos656x.h
+@@ -315,6 +315,12 @@ protected:
+     MOS656X(EventScheduler &scheduler);
+     ~MOS656X() = default;
+ 
++    /// Current raster line (instrumentation).
++    unsigned int getRasterY() const { return rasterY; }
++
++    /// Programmed raster compare line (instrumentation).
++    unsigned int getRasterLineIRQ() const { return readRasterLineIRQ(); }
++
+     // Environment Interface
+     virtual void interrupt(bool state) = 0;
+     virtual void setBA(bool state) = 0;
+diff --git a/src/c64/c64.cpp b/src/c64/c64.cpp
+index b96881a..de624d0 100644
+--- a/src/c64/c64.cpp
++++ b/src/c64/c64.cpp
+@@ -148,6 +148,8 @@ void c64::setCiaModel(cia_model_t model)
+ 
+ void c64::setBaseSid(c64sid *s)
+ {
++    if (s != nullptr)
++        s->setInstrumentId(0, 0xd400);
+     sidBank.setSID(s);
+ }
+ 
+@@ -164,6 +166,9 @@ bool c64::addExtraSid(c64sid *s, int address)
+     if ((idx < 0x4) || ((idx > 0x7) && (idx < 0xe))) UNLIKELY
+         return false;
+ 
++    s->setInstrumentId(1 + static_cast<int>(extraSidBanks.size()),
++                       static_cast<uint16_t>(address));
++
+     // Add new SID bank
+     sidBankMap_t::iterator it = extraSidBanks.find(idx);
+     if (it != extraSidBanks.end())
+diff --git a/src/c64/c64cia.h b/src/c64/c64cia.h
+index 5e752f8..77f8ac5 100644
+--- a/src/c64/c64cia.h
++++ b/src/c64/c64cia.h
+@@ -30,6 +30,7 @@
+ #include "c64/c64env.h"
+ #include "sidendian.h"
+ #include "CIA/mos652x.h"
++#include "instrument.h"
+ 
+ #include "sidcxx11.h"
+ 
+@@ -52,6 +53,13 @@ private:
+ protected:
+     void interrupt(bool state) override
+     {
++        if (state) UNLIKELY
++        {
++            InstrumentSink *sink = getInstrumentSink();
++            if (sink != nullptr)
++                sink->ciaIrq(m_env.scheduler().getTime(EVENT_CLOCK_PHI1), 1,
++                             timerA.getLatch(), timerB.getLatch());
++        }
+         m_env.interruptIRQ(state);
+     }
+ 
+@@ -113,7 +121,13 @@ protected:
+     void interrupt(bool state) override
+     {
+         if (state)
++        {
++            InstrumentSink *sink = getInstrumentSink();
++            if (sink != nullptr) UNLIKELY
++                sink->ciaIrq(m_env.scheduler().getTime(EVENT_CLOCK_PHI1), 2,
++                             timerA.getLatch(), timerB.getLatch());
+             m_env.interruptNMI();
++        }
+     }
+ 
+ public:
+diff --git a/src/c64/c64sid.h b/src/c64/c64sid.h
+index 6e4a6b4..ab7d024 100644
+--- a/src/c64/c64sid.h
++++ b/src/c64/c64sid.h
+@@ -65,6 +65,10 @@ public:
+     uint8_t peek(uint_least16_t address) override { return read(address & 0x1f); }
+ 
+     void getStatus(uint8_t regs[0x20]) const { std::memcpy(regs, lastpoke, 0x20); }
++
++    /// Assign an instrumentation chip index and base address. No-op unless
++    /// the SID implementation forwards writes to the instrumentation sink.
++    virtual void setInstrumentId(int id, uint16_t base) { (void)id; (void)base; }
+ };
+ 
+ }
+diff --git a/src/c64/c64vic.h b/src/c64/c64vic.h
+index c46d47a..5ce02dc 100644
+--- a/src/c64/c64vic.h
++++ b/src/c64/c64vic.h
+@@ -30,6 +30,7 @@
+ #include "c64/c64env.h"
+ #include "sidendian.h"
+ #include "VIC_II/mos656x.h"
++#include "instrument.h"
+ 
+ #include "sidcxx11.h"
+ 
+@@ -49,6 +50,13 @@ private:
+ protected:
+     void interrupt(bool state) override
+     {
++        if (state) UNLIKELY
++        {
++            InstrumentSink *sink = getInstrumentSink();
++            if (sink != nullptr)
++                sink->vicIrq(m_env.scheduler().getTime(EVENT_CLOCK_PHI1),
++                             getRasterY(), getRasterLineIRQ());
++        }
+         m_env.interruptIRQ(state);
+     }
+ 
+diff --git a/src/instrument.cpp b/src/instrument.cpp
+new file mode 100644
+index 0000000..5ae4c16
+--- /dev/null
++++ b/src/instrument.cpp
+@@ -0,0 +1,23 @@
++/*
++ * This file is part of libsidplayfp, a SID player engine.
++ *
++ * Instrumentation hook (preframr-playroutine fork).
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "instrument.h"
++
++namespace libsidplayfp
++{
++
++static InstrumentSink *g_instrumentSink = nullptr;
++
++void setInstrumentSink(InstrumentSink *sink) { g_instrumentSink = sink; }
++
++InstrumentSink *getInstrumentSink() { return g_instrumentSink; }
++
++}
+diff --git a/src/instrument.h b/src/instrument.h
+new file mode 100644
+index 0000000..157e290
+--- /dev/null
++++ b/src/instrument.h
+@@ -0,0 +1,67 @@
++/*
++ * This file is part of libsidplayfp, a SID player engine.
++ *
++ * Instrumentation hook (preframr-playroutine fork).
++ *
++ * Provides a process-wide sink that receives byte-exact, cycle-stamped
++ * SID register writes plus IRQ/NMI machine-timing events. The library
++ * calls these from the emulation core only when a sink is installed, so
++ * stock behaviour is unchanged when no sink is set.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef LIBSIDPLAYFP_INSTRUMENT_H
++#define LIBSIDPLAYFP_INSTRUMENT_H
++
++#include <cstdint>
++
++#include "sidplayfp/siddefs.h"
++
++namespace libsidplayfp
++{
++
++/**
++ * Receives instrumentation events from the emulation core.
++ *
++ * All cycle values are absolute event-scheduler times expressed on the
++ * visible CPU clock (PHI2 for CPU/SID events, PHI1 for chip events); they
++ * share a single monotonic cycle axis.
++ */
++class InstrumentSink
++{
++public:
++    virtual ~InstrumentSink() {}
++
++    /// A write reaching a SID chip: register (0..0x1f) and value, with the
++    /// chip index and its base address (e.g. 0xd400).
++    virtual void sidWrite(int64_t cycle, int chip, uint16_t base,
++                          uint8_t reg, uint8_t value) = 0;
++
++    /// A CIA interrupt line was asserted. source: 1=CIA1 (IRQ), 2=CIA2 (NMI).
++    /// taLatch/tbLatch are the current timer A/B reload latches (period in
++    /// cycles) at assertion time.
++    virtual void ciaIrq(int64_t cycle, int source,
++                        uint16_t taLatch, uint16_t tbLatch) = 0;
++
++    /// A VIC-II raster interrupt line was asserted. rasterY is the current
++    /// raster line, rasterCmp the programmed compare line.
++    virtual void vicIrq(int64_t cycle, unsigned rasterY, unsigned rasterCmp) = 0;
++
++    /// The CPU vectored through an interrupt/BRK. kind is the low byte of the
++    /// vector address: 0xfe=IRQ, 0xfa=NMI, 0xfc=RST. pc is the handler entry.
++    virtual void cpuVector(int64_t cycle, uint8_t kind, uint16_t pc) = 0;
++};
++
++/// Install (or clear, with nullptr) the process-wide instrumentation sink.
++SID_EXTERN void setInstrumentSink(InstrumentSink *sink);
++
++/// Get the currently installed sink, or nullptr.
++SID_EXTERN InstrumentSink *getInstrumentSink();
++
++}
++
++#endif // LIBSIDPLAYFP_INSTRUMENT_H
+diff --git a/src/sidemu.cpp b/src/sidemu.cpp
+index 2ff4951..3699a79 100644
+--- a/src/sidemu.cpp
++++ b/src/sidemu.cpp
+@@ -22,6 +22,8 @@
+ 
+ #include "sidemu.h"
+ 
++#include "instrument.h"
++
+ namespace libsidplayfp
+ {
+ 
+@@ -56,6 +58,11 @@ void sidemu::writeReg(uint_least8_t addr, uint8_t data)
+         break;
+     }
+ 
++    InstrumentSink *sink = getInstrumentSink();
++    if (sink != nullptr && eventScheduler != nullptr) UNLIKELY
++        sink->sidWrite(eventScheduler->getTime(EVENT_CLOCK_PHI2),
++                       m_instrId, m_instrBase, addr, data);
++
+     write(addr, data);
+ }
+ 
+diff --git a/src/sidemu.h b/src/sidemu.h
+index 5421ad2..6592e61 100644
+--- a/src/sidemu.h
++++ b/src/sidemu.h
+@@ -74,12 +74,18 @@ protected:
+ 
+     std::string m_error;
+ 
++    /// Instrumentation identity (chip index and base address).
++    int m_instrId = 0;
++    uint16_t m_instrBase = 0xd400;
++
+ protected:
+     virtual void write(uint_least8_t addr, uint8_t data) = 0;
+ 
+     void writeReg(uint_least8_t addr, uint8_t data) override final;
+ 
+ public:
++    void setInstrumentId(int id, uint16_t base) override { m_instrId = id; m_instrBase = base; }
++
+     sidemu(sidbuilder *builder) :
+         m_builder(builder),
+         m_error("N/A")

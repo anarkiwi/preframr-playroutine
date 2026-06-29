@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "preframr_playroutine"
+version = "0.1.0"
+description = "numpy tooling for sidtrace SID register/IRQ oracle traces"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-xdist>=3", "pytest-cov>=4", "black>=24", "pylint>=3"]
+
+[tool.setuptools]
+packages = ["preframr_playroutine"]
+
+[tool.pytest.ini_options]
+addopts = "-n auto --cov=preframr_playroutine --cov-report=term-missing --cov-fail-under=85"
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+
+[tool.pylint.format]
+max-line-length = 120
+
+[tool.pylint."messages control"]
+disable = ["too-many-instance-attributes", "too-few-public-methods", "too-many-locals"]
