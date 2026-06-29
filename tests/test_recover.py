@@ -978,3 +978,166 @@ def test_analyze_includes_tuning_and_detune():
     assert "note_numbers" in result["tuning"]
     assert "source" in result["tuning"]
     assert "detune" in result and "detuned" in result["detune"]
+
+
+# -- _table_walk_scan optimization parity ---------------------------------
+
+from preframr_playroutine.recover import (  # noqa: E402
+    RecoverContext,
+    StateSequence,
+    _anchor_positions,
+    _bits_set,
+    _table_walk_scan,
+    _varying_bits,
+)
+
+
+def _ref_score_cursor(series, cur, ram, lo, hi, mask, n):
+    """Frozen pre-optimization copy of recover._score_cursor."""
+    span = hi - lo + 1
+    if int(cur.max()) >= span + 2:
+        return -1.0, 0
+    best_res, best_off = -1.0, 0
+    for off in (-2, -1, 0, 1, 2):
+        idx = cur + off
+        ok = (idx >= 0) & (lo + idx <= hi)
+        if int(ok.sum()) < n * 0.8:
+            continue
+        tv = ram[lo + np.clip(idx, 0, span - 1)]
+        if len(np.unique(tv[ok] & mask)) < 2:
+            continue
+        res = float(np.mean((series[ok] & mask) == (tv[ok] & mask)))
+        if res > best_res:
+            best_res, best_off = res, off
+    return best_res, best_off
+
+
+def _ref_table_walk_scan(series, ctx, min_res=0.8, max_bases=96):
+    """Frozen pre-optimization copy of recover._table_walk_scan."""
+    ram = ctx.ram
+    if ram is None or not ctx.cursor_cols:
+        return None
+    series = np.asarray(series, dtype=np.int64).ravel()
+    vbits = _varying_bits(series)
+    if _bits_set(vbits) < 2:
+        return None
+    grid = ctx.stateseq.grid.astype(np.int64)
+    n = len(series)
+    best = None
+    best_res = min_res
+    for mask in (0xFE, 0xFF):
+        if _bits_set(vbits & mask) < 2:
+            continue
+        anchor = _anchor_positions(series, ram & mask, mask)
+        if anchor is None:
+            continue
+        anchor_frame, positions = anchor
+        for j in ctx.cursor_cols:
+            cur = grid[:, j]
+            cmax = int(cur.max())
+            bases = positions - int(cur[anchor_frame])
+            bases = bases[(bases >= 0) & (bases + cmax < len(ram))]
+            for base in bases[:max_bases]:
+                res, off = _ref_score_cursor(series, cur, ram, int(base), int(base) + cmax, mask, n)
+                if res >= best_res:
+                    best_res = res
+                    best = (res, int(base), int(base) + cmax, int(ctx.stateseq.addrs[j]), off, mask)
+        if best is not None and best[0] >= 0.999:
+            break
+    if best is None:
+        return None
+    res, lo, hi, cursor, off, mask = best
+    return {
+        "type": "TABLE_WALK",
+        "base": int(lo),
+        "stride": 1,
+        "length": int(hi - lo + 1),
+        "loop": 0,
+        "table": ram[lo : hi + 1].copy(),
+        "mask": int(mask),
+        "cursor_addr": int(cursor),
+        "cursor_offset": int(off),
+        "residual": float(res),
+    }
+
+
+def _make_scan_ctx(rng):
+    """Synthetic RecoverContext exercising the no-read-log table-walk scan.
+
+    ``ram`` is mostly zero with a primary table plus duplicate decoy tables (to
+    force residual ties across bases) and sparse noise (to vary anchor counts).
+    """
+    ram = np.zeros(65536, dtype=np.uint8)
+    noise_pos = rng.integers(0, 65536, size=int(rng.integers(200, 1200)))
+    ram[noise_pos] = rng.integers(1, 256, size=len(noise_pos)).astype(np.uint8)
+    length = int(rng.integers(4, 24))
+    table = rng.integers(0, 256, size=length).astype(np.uint8)
+    base = int(rng.integers(0x1000, 0xF000))
+    ram[base : base + length] = table
+    for _ in range(int(rng.integers(0, 3))):
+        dbase = int(rng.integers(0x1000, 0xF000))
+        ram[dbase : dbase + length] = table
+    n = int(rng.integers(200, 700))
+    n_cols = int(rng.integers(3, 7))
+    cols, addrs = [], []
+    for _ in range(n_cols):
+        cmax = min(length - 1, int(rng.integers(2, length)))
+        cols.append(rng.integers(0, cmax + 1, size=n))
+        addrs.append(int(rng.integers(0xC000, 0xCFFF)))
+    grid = np.stack(cols, axis=1)
+    stateseq = StateSequence(ticks=np.arange(n), addrs=np.asarray(addrs, dtype=np.int64), grid=grid)
+    ctx = RecoverContext(
+        kind="auto",
+        stateseq=stateseq,
+        ram=ram,
+        tables=[],
+        cursor_cols=list(range(n_cols)),
+        note_on={},
+        all_on=[],
+        n_frames=n,
+        sampler=None,
+    )
+    return ctx, base, table, length
+
+
+def _series_from_walk(ctx, base, length, rng, noisy):
+    """Series = ram[base + cursor] & mask for a random cell/mask, maybe noised."""
+    grid = ctx.stateseq.grid.astype(np.int64)
+    j = int(rng.integers(0, grid.shape[1]))
+    cur = grid[:, j]
+    cur = np.clip(cur, 0, length - 1)
+    mask = int(rng.choice([0xFE, 0xFF]))
+    series = (ctx.ram[base + cur].astype(np.int64)) & mask
+    if noisy:
+        flip = rng.random(len(series)) < rng.uniform(0.1, 0.5)
+        series[flip] = rng.integers(0, 256, size=int(flip.sum()))
+    return series
+
+
+def _walk_eq(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    if set(a) != set(b):
+        return False
+    for key, val in a.items():
+        if key == "table":
+            if not np.array_equal(val, b[key]):
+                return False
+        elif val != b[key]:
+            return False
+    return True
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_table_walk_scan_parity(seed):
+    rng = np.random.default_rng(1000 + seed)
+    for _ in range(6):
+        ctx, base, table, length = _make_scan_ctx(rng)
+        noisy = bool(rng.integers(0, 2))
+        if rng.integers(0, 4) == 0:
+            series = rng.integers(0, 256, size=ctx.n_frames)  # fully random
+        else:
+            series = _series_from_walk(ctx, base, length, rng, noisy)
+        ref = _ref_table_walk_scan(series, ctx)
+        opt = _table_walk_scan(series, ctx)
+        assert _walk_eq(ref, opt), (seed, ref, opt)
