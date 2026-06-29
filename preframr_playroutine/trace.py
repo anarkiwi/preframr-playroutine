@@ -122,7 +122,9 @@ class Trace:
         events = load_events(bin_path)
         meta = {}
         if os.path.exists(json_path):
-            with open(json_path, encoding="utf-8") as handle:
+            # Tolerate non-UTF-8 metadata bytes defensively (the tracer escapes
+            # them, but older traces may contain raw Windows-1252 bytes).
+            with open(json_path, encoding="utf-8", errors="replace") as handle:
                 meta = json.load(handle)
         return cls(
             events,

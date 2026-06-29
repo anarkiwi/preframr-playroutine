@@ -2,8 +2,16 @@
 
 The whole module is skipped when the catalog is missing, the ``sidtrace`` binary
 is absent, or no tune can be fetched. Each tune is rendered for its full song
-length and analysed; recovery must classify at least one SID register, and a
-re-run must be byte-identical (determinism).
+length WITHOUT a RAM read log (exactly as CI renders), then analysed.
+
+``test_real_tune_perfect`` is the ratchet: it asserts *perfect* recovery for
+every fixture -- ``round_trip(trace)['overall'] == 1.0`` and zero ``XSTATE``
+registers -- and marks the tunes that do not yet meet that bar with
+``xfail(strict=True)``. When a recovery improvement makes an xfail tune perfect
+it flips to XPASS and CI fails until the marker is removed (the intended
+ratchet). ``test_real_tune_anchors`` independently pins the DMC and GoatTracker2
+register classifications against their reverse-engineering docs, guarding those
+specifics regardless of the perfect gate.
 """
 
 import os
@@ -32,11 +40,30 @@ def _ids(entry):
     return f"{entry.get('family', '?')}:{os.path.basename(entry['path'])}:{entry.get('subtune', 1)}"
 
 
-# DMC per-voice register strides: $D400 + 7*voice.
+def _key(entry):
+    return (entry.get("family"), os.path.basename(entry["path"]))
+
+
+# Fixtures that already round-trip PERFECTLY (overall == 1.0, no XSTATE register)
+# on a whole-song, no-reads render -- determined empirically, not guessed. Every
+# other fixture is xfail(strict=True): improve its recovery to perfect and remove
+# it here (CI XPASS-fails until you do).
+_PERFECT = {
+    ("DMC", "Doctagop.sid"),
+    ("Soundmonitor", "Only_3.sid"),
+    ("Soundmonitor", "Denarius.sid"),
+}
+
+# DMC / GoatTracker2 per-voice register strides: $D400 + 7*voice.
 _AD = (0xD405, 0xD40C, 0xD413)
 _SR = (0xD406, 0xD40D, 0xD414)
 _PW = (0xD402, 0xD403, 0xD409, 0xD40A, 0xD410, 0xD411)
 _CTRL = (0xD404, 0xD40B, 0xD412)
+
+# The two tunes pinned against their reverse-engineering docs.
+_ANCHORS = [
+    e for e in CATALOG if _key(e) in {("DMC", "Doctagop.sid"), ("GoatTracker2", "Raindrops.sid")}
+]
 
 
 def _types(result, addrs):
@@ -46,21 +73,13 @@ def _types(result, addrs):
 def _assert_register_classes(entry, trace, result):
     """Anchor recovery quality + round-trip fidelity on the DMC and GT2 tunes.
 
-    Only the two named tunes are checked against their reverse-engineering docs
-    (``re-trackers/DMC`` and ``re-trackers/GoatTracker2``); every other tune keeps
-    the generic ``classified >= 1`` assertion. Round-trip fidelity (regenerated
-    descriptor vs oracle) is the real correctness metric: the recovered registers
-    must reconstruct essentially exactly and the whole tune near-perfectly. The
-    thresholds (per-register >= 0.99, overall >= 0.95) leave headroom only for
-    registers not yet decomposed; on these tunes the recovered ones hit 1.0.
+    Both named tunes are checked against their reverse-engineering docs
+    (``re-trackers/DMC`` and ``re-trackers/GoatTracker2``). Round-trip fidelity
+    (regenerated descriptor vs oracle) is the real correctness metric: the
+    recovered registers must reconstruct essentially exactly (per-register
+    >= 0.99) and the whole tune near-perfectly (overall >= 0.95).
     """
     family = entry.get("family")
-    base = os.path.basename(entry["path"])
-    if not (
-        (family == "DMC" and base == "Doctagop.sid")
-        or (family == "GoatTracker2" and base == "Raindrops.sid")
-    ):
-        return
     fid = round_trip(trace)
 
     if family == "DMC":
@@ -112,31 +131,63 @@ def _run_sidtrace(sid_path, prefix, seconds, subtune):
     return Trace.load(prefix)
 
 
-@pytest.mark.parametrize("entry", CATALOG, ids=[_ids(e) for e in CATALOG])
-def test_real_tune(entry, tmp_path_factory):
-    if not fetchable(entry):
-        pytest.skip(f"tune not fetchable: {entry['path']}")
+def _render(entry, work):
+    """Render a fixture whole-song, no reads (CI conditions); return the trace."""
     sid = ensure_tune(entry)
-    seconds = entry["seconds"]
-    subtune = entry.get("subtune", 1)
-
-    work = tmp_path_factory.mktemp("hvsc")
-    prefix_a = str(work / "a")
-    trace = _run_sidtrace(sid, prefix_a, seconds, subtune)
-
+    prefix = str(work / "a")
+    trace = _run_sidtrace(sid, prefix, entry["seconds"], entry.get("subtune", 1))
     assert len(trace.events) > 0
     assert len(trace.ram_writes()) > 0
     assert len(trace.coverage_pcs()) > 0
     img = trace.ram_image()
     assert img is not None and len(img) == 65536
+    return sid, prefix, trace
+
+
+def _perfect_param(entry):
+    marks = []
+    if _key(entry) not in _PERFECT:
+        marks = [
+            pytest.mark.xfail(
+                strict=True,
+                reason="round_trip not yet perfect (overall<1.0 or XSTATE present)",
+            )
+        ]
+    return pytest.param(entry, marks=marks, id=_ids(entry))
+
+
+@pytest.mark.parametrize("entry", [_perfect_param(e) for e in CATALOG])
+def test_real_tune_perfect(entry, tmp_path_factory):
+    """Every fixture must recover PERFECTLY: overall == 1.0 and no XSTATE."""
+    if not fetchable(entry):
+        pytest.skip(f"tune not fetchable: {entry['path']}")
+    work = tmp_path_factory.mktemp("hvsc")
+    _sid, _prefix, trace = _render(entry, work)
 
     result = analyze(trace)
     classified = sum(v for k, v in result["summary"].items())
     assert classified >= 1
+    xstate = sorted(
+        a for a, d in result.items() if isinstance(a, int) and d.get("type") == "XSTATE"
+    )
+    rt = round_trip(trace)
+    assert not xstate, [hex(a) for a in xstate]
+    assert rt["overall"] == 1.0, (rt["overall"], rt["unmodeled"][:4])
+
+
+@pytest.mark.parametrize("entry", _ANCHORS, ids=[_ids(e) for e in _ANCHORS])
+def test_real_tune_anchors(entry, tmp_path_factory):
+    """Pin DMC/GT2 register classifications + per-register fidelity (non-xfail)."""
+    if not fetchable(entry):
+        pytest.skip(f"tune not fetchable: {entry['path']}")
+    work = tmp_path_factory.mktemp("hvsc")
+    sid, prefix_a, trace = _render(entry, work)
+
+    result = analyze(trace)
     _assert_register_classes(entry, trace, result)
 
     # Determinism: a second render is byte-identical across event + RAM streams.
     prefix_b = str(work / "b")
-    trace2 = _run_sidtrace(sid, prefix_b, seconds, subtune)
+    trace2 = _run_sidtrace(sid, prefix_b, entry["seconds"], entry.get("subtune", 1))
     assert np.array_equal(trace.events.view(np.uint8), trace2.events.view(np.uint8))
     assert np.array_equal(trace.ram_writes().view(np.uint8), trace2.ram_writes().view(np.uint8))

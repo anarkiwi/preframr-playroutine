@@ -1,20 +1,50 @@
 # preframr-playroutine
 
-Byte-exact, cycle-stamped SID instrumentation built on
+A **universal tracker playroutine** for the Commodore 64 SID, built on
 [libsidplayfp](https://github.com/libsidplayfp/libsidplayfp).
 
-`.sid` files are complete 6502 machine-language programs that perform music on
-a Commodore 64. This project plays them exactly as `sidplayfp` would — same
-cycle-accurate emulation of the CPU, CIA timers, VIC-II and SID — and emits a
-deterministic **oracle**: every value written to a SID chip and every IRQ/NMI
-event, each stamped with the absolute machine cycle. From that trace it
-recovers the *periodic update structure* of a tune (PAL/NTSC raster-driven vs
-CIA-timer driven, single- or multi-speed) and the per-frame register tables
-that table / sweep / arpeggio (BACC-style) players step through.
+`.sid` files are complete, idiosyncratic 6502 machine-language programs — every
+composer's player is different. This project plays each one exactly as
+`sidplayfp` would (cycle-accurate CPU / CIA / VIC-II / SID emulation), observes
+every bit of the running machine, and **decompiles the song into a common
+form**: each SID register's per-frame behaviour expressed in a small set of
+shared primitives — `CONST`, `SEQ` (sequencer-latched), `BACC` (bounded
+accumulator: vibrato / sweep), `TABLE_WALK` (table + cursor), and `COMPOSITE`
+(base + modulation + overrides) — plus the song's **periodic update structure**
+(PAL/NTSC raster vs CIA-timer, single/multi-speed) and **global tuning**. A
+single Python playroutine can then replay any song from that common IR using
+the shared primitives, independent of the original player.
 
-The emulator runs arbitrary code (unpacking, relocation, generative melody
-code); we don't try to decompile that. We capture what the program *does* to
-the hardware, periodically, so the structure can be recovered downstream.
+The correctness criterion is **lossless round-trip**: regenerate each register
+from its recovered IR and compare byte-for-byte to the oracle. `round_trip == 1.0`
+means the decompilation reproduces the original player exactly. Because the
+emulator logs every bit, every output is a function of observable state — so a
+register that doesn't yet round-trip is a *not-yet-modelled* primitive (a
+fixable gap that `round_trip` localises), never an unrecoverable one.
+
+The emulator also runs arbitrary code (unpacking, relocation, generative melody
+code); that's the *song data*, not the *generators*. We recover the per-register
+generator functions and replay the song data (note/sequencer events) through
+them.
+
+**Scope of generative tunes.** Some songs synthesise their melody
+algorithmically (e.g. *A Mind Is Born* by lft). We deliberately do **not** model
+the generating algorithm — only its **melodic output as notes**. The IR's note
+layer is the realised note-event stream (captured data); the modulation /
+generator layer is the recovered primitives. So a generative tune round-trips by
+replaying its observed note stream through recovered generators, not by
+re-deriving the melody.
+
+## Global tuning
+
+SID frequency registers are not notes: a note's pitch is `f_Hz = sidfreq ·
+cpu_hz / 2^24`, and each player's note→frequency table is calibrated to its own
+reference. Recovered across the fixture set, most tunes sit at A4 ≈ 440 Hz
+(clean 12-TET, sub-cent residual), but some are nearly a semitone off (several
+DMC / Future Composer tunes at A4 ≈ 423.8 Hz, −65 cents). So the common form
+carries a per-song tuning descriptor — reference A4, cents from A440, and
+temperament — recovered from the note→frequency table, so that a NOTE in the IR
+is an absolute pitch comparable across every tune.
 
 ## Program-state instrumentation (generator recovery)
 

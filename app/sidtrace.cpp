@@ -223,7 +223,9 @@ void jsonStr(std::string &o, const char *s) {
                 case '\r': o += "\\r"; break;
                 case '\t': o += "\\t"; break;
                 default:
-                    if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+                    // Escape control and non-ASCII bytes as \u00XX so the JSON
+                    // is valid UTF-8 (SID metadata strings are Windows-1252).
+                    if (c < 0x20 || c >= 0x7f) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); o += b; }
                     else o += static_cast<char>(c);
             }
         }
