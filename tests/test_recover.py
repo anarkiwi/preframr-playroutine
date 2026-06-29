@@ -16,6 +16,8 @@ from preframr_playroutine import (
     correlate_event_reset,
     detect_table_walk,
     fit_bacc,
+    reconstruct_register,
+    round_trip,
     segmented_bacc,
     state_sequence,
     voice_events,
@@ -551,3 +553,163 @@ def test_ram_writes_kind_filter():
     assert len(trace.ram_writes()) == 2
     assert len(trace.ram_writes(kind=WIN_IRQ)) == 1
     assert trace.ram_writes(kind=WIN_IRQ)["addr"][0] == 0x10
+
+
+# -- round-trip reconstruction --------------------------------------------
+
+
+def _ticks(n):
+    return np.array([_frame_cycle(i) for i in range(n)], dtype=np.uint64)
+
+
+def test_reconstruct_const_roundtrip():
+    n = 40
+    desc = {"type": "CONST", "value": 0x1F}
+    recon = reconstruct_register(desc, _ticks(n))
+    assert np.array_equal(recon, np.full(n, 0x1F))
+
+
+def test_reconstruct_seq_roundtrip():
+    # Event-latched series held between note changes.
+    series = np.array([0x00] * 5 + [0x21] * 7 + [0x41] * 8 + [0x11] * 10, dtype=np.int64)
+    frames = [0, 5, 12, 20]
+    values = [0x00, 0x21, 0x41, 0x11]
+    desc = {"type": "SEQ", "latch_frames": frames, "latch_values": values}
+    recon = reconstruct_register(desc, _ticks(len(series)))
+    assert np.array_equal(recon, series)
+
+
+def test_reconstruct_bacc_reflect_roundtrip():
+    # Reseeded reflecting triangle (no holds) regenerates exactly from seeds.
+    up = list(range(0, 41, 4))
+    down = list(range(36, 0, -4))
+    period = up + down  # length 20
+    n = len(period) * 6
+    series = np.array(period * 6, dtype=np.int64)
+    resets = list(range(0, n, len(period)))
+    seeds = [0] * len(resets)
+    desc = {
+        "type": "BACC",
+        "mode": "reflect",
+        "step": 4,
+        "lo": 0,
+        "hi": 40,
+        "resets": resets,
+        "seeds": seeds,
+        "byte_role": "full",
+    }
+    recon = reconstruct_register(desc, _ticks(n))
+    assert np.array_equal(recon, series)
+
+
+def test_reconstruct_bacc_saw_roundtrip():
+    n = 90
+    series = (np.arange(n) * 5) % 60
+    desc = {
+        "type": "BACC",
+        "mode": "saw",
+        "step": 5,
+        "lo": 0,
+        "hi": 55,
+        "modulus": 60,
+        "resets": [0],
+        "seeds": [0],
+        "byte_role": "full",
+    }
+    recon = reconstruct_register(desc, _ticks(n))
+    assert np.array_equal(recon, series)
+
+
+def test_reconstruct_table_walk_roundtrip():
+    table = np.array([0x41, 0x11, 0x21, 0x81], dtype=np.uint8)
+    cursor = np.tile([0, 1, 2, 3], 10).astype(np.int64)
+    desc = {
+        "type": "TABLE_WALK",
+        "base": 0x2000,
+        "stride": 1,
+        "table": table,
+        "mask": 0xFF,
+        "cursor": cursor,
+        "cursor_offset": 0,
+    }
+    recon = reconstruct_register(desc, _ticks(len(cursor)))
+    assert np.array_equal(recon, table[cursor % len(table)])
+
+
+def test_reconstruct_table_walk_masked_roundtrip():
+    table = np.array([0x41, 0x11, 0x21, 0x81], dtype=np.uint8)
+    cursor = np.tile([0, 1, 2, 3], 10).astype(np.int64)
+    desc = {
+        "type": "TABLE_WALK",
+        "base": 0x2000,
+        "stride": 1,
+        "table": table,
+        "mask": 0xFE,
+        "cursor": cursor,
+        "cursor_offset": 0,
+    }
+    recon = reconstruct_register(desc, _ticks(len(cursor)))
+    assert np.array_equal(recon, table[cursor % len(table)] & 0xFE)
+
+
+def test_reconstruct_composite_series_roundtrip():
+    n = 60
+    base = (np.arange(n) % 50).astype(np.int64)
+    mod = np.zeros(n, dtype=np.int64)
+    desc = {
+        "type": "COMPOSITE",
+        "byte_role": "full",
+        "width_mask": 0xFF,
+        "base": {"series": base},
+        "mod": {"series": mod},
+        "overrides": [],
+    }
+    recon = reconstruct_register(desc, _ticks(n))
+    assert np.array_equal(recon, base & 0xFF)
+
+
+def test_round_trip_composite_freq_from_trace():
+    # Real-trace-style COMPOSITE: FREQ = base_cell + accum_cell, with a $FFFF
+    # hard-restart override gated by a flag cell. round_trip must reconstruct it
+    # exactly from the recovered descriptor.
+    n = 80
+    note_len = 20
+    base_lo, base_hi = 0x10, 0x11
+    acc_lo, acc_hi = 0x12, 0x13
+    flag = 0x20
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        note = i // note_len
+        base16 = 0x0480 + note * 0x140
+        acc16 = (i % 5) * 6
+        forced = i % note_len == 1
+        freq = 0xFFFF if forced else (base16 + acc16) & 0xFFFF
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        ramwr.append(_ra(tick + 3, flag, 1 if forced else 0))
+        ramwr.append(_ra(tick + 4, base_lo, base16 & 0xFF))
+        ramwr.append(_ra(tick + 4, base_hi, (base16 >> 8) & 0xFF))
+        ramwr.append(_ra(tick + 5, acc_lo, acc16 & 0xFF))
+        ramwr.append(_ra(tick + 5, acc_hi, (acc16 >> 8) & 0xFF))
+        # gate so a voice/note structure exists (note-on each note)
+        gate = 0x41 if i % note_len else 0x40
+        recs.append(_ev(tick + 8, SID_WRITE, reg=4, value=gate, addr=0xD404, aux=0x1500))
+        recs.append(_ev(tick + 10, SID_WRITE, reg=0, value=freq & 0xFF, addr=0xD400, aux=0x1606))
+        recs.append(
+            _ev(tick + 10, SID_WRITE, reg=1, value=(freq >> 8) & 0xFF, addr=0xD401, aux=0x1609)
+        )
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = analyze(trace)
+    assert res[0xD400]["type"] == "COMPOSITE"
+    assert res[0xD401]["type"] == "COMPOSITE"
+    rt = round_trip(trace)
+    assert rt[0xD400] == 1.0
+    assert rt[0xD401] == 1.0
+
+
+def test_round_trip_reports_overall_and_unmodeled():
+    trace = _trace_with_register([0x0F] * 30, sid_addr=0xD418)
+    rt = round_trip(trace)
+    assert rt["overall"] == 1.0
+    assert rt["unmodeled"] == []

@@ -33,4 +33,5 @@ disable = [
     "too-many-locals",
     "too-many-arguments",
     "too-many-positional-arguments",
+    "too-many-lines",
 ]

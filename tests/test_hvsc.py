@@ -13,7 +13,7 @@ import subprocess
 import numpy as np
 import pytest
 
-from preframr_playroutine import Trace, analyze
+from preframr_playroutine import Trace, analyze, round_trip
 
 from _hvsc import ensure_tune, fetchable, load_catalog
 
@@ -43,17 +43,27 @@ def _types(result, addrs):
     return {a: result.get(a, {}).get("type") for a in addrs}
 
 
-def _assert_register_classes(entry, result):
-    """Anchor the recovery quality on the catalog's DMC and GT2 reference tunes.
+def _assert_register_classes(entry, trace, result):
+    """Anchor recovery quality + round-trip fidelity on the DMC and GT2 tunes.
 
     Only the two named tunes are checked against their reverse-engineering docs
     (``re-trackers/DMC`` and ``re-trackers/GoatTracker2``); every other tune keeps
-    the generic ``classified >= 1`` assertion.
+    the generic ``classified >= 1`` assertion. Round-trip fidelity (regenerated
+    descriptor vs oracle) is the real correctness metric: the recovered registers
+    must reconstruct essentially exactly and the whole tune near-perfectly. The
+    thresholds (per-register >= 0.99, overall >= 0.95) leave headroom only for
+    registers not yet decomposed; on these tunes the recovered ones hit 1.0.
     """
     family = entry.get("family")
     base = os.path.basename(entry["path"])
+    if not (
+        (family == "DMC" and base == "Doctagop.sid")
+        or (family == "GoatTracker2" and base == "Raindrops.sid")
+    ):
+        return
+    fid = round_trip(trace)
 
-    if family == "DMC" and base == "Doctagop.sid":
+    if family == "DMC":
         # dmc-generators.md: AD/SR per-note SEQ; PW 16-bit up/down BACC; CTRL a
         # waveform table walk (AND-ed with the gate mask). A sustained voice can
         # be a 1-entry waveform loop, presenting as a CONST CTRL -- allow it, but
@@ -68,14 +78,20 @@ def _assert_register_classes(entry, result):
         for addr, t in ctrl_types.items():
             assert t in ("TABLE_WALK", "CONST"), (hex(addr), t)
         assert "TABLE_WALK" in ctrl_types.values(), ctrl_types
+        for addr in _AD + _SR + _PW + _CTRL:
+            assert fid[addr] >= 0.99, (hex(addr), result[addr]["type"], fid[addr])
 
-    if family == "GoatTracker2" and base == "Raindrops.sid":
+    if family == "GoatTracker2":
         # goattracker2-generators.md: AD/SR per-note SEQ (+ hard restart); the
         # verified voice-1 PW is a 16-bit up BACC.
         for addr, t in _types(result, _AD + _SR).items():
             assert t in ("SEQ", "CONST"), (hex(addr), t)
         for addr, t in _types(result, (0xD409, 0xD40A)).items():
             assert t == "BACC", (hex(addr), t)
+        for addr in _AD + _SR + (0xD409, 0xD40A):
+            assert fid[addr] >= 0.99, (hex(addr), result[addr]["type"], fid[addr])
+
+    assert fid["overall"] >= 0.95, fid["overall"]
 
 
 def _run_sidtrace(sid_path, prefix, seconds, subtune):
@@ -117,7 +133,7 @@ def test_real_tune(entry, tmp_path_factory):
     result = analyze(trace)
     classified = sum(v for k, v in result["summary"].items())
     assert classified >= 1
-    _assert_register_classes(entry, result)
+    _assert_register_classes(entry, trace, result)
 
     # Determinism: a second render is byte-identical across event + RAM streams.
     prefix_b = str(work / "b")
