@@ -17,9 +17,11 @@ from preframr_playroutine import (
     detect_table_walk,
     fit_bacc,
     reconstruct_register,
+    recover_tuning,
     round_trip,
     segmented_bacc,
     state_sequence,
+    voice_detune,
     voice_events,
 )
 from preframr_playroutine.trace import CPU_VECTOR
@@ -854,3 +856,92 @@ def test_round_trip_reports_overall_and_unmodeled():
     rt = round_trip(trace)
     assert rt["overall"] == 1.0
     assert rt["unmodeled"] == []
+
+
+# -- global tuning + detune ------------------------------------------------
+
+_VOICE_REGS = {
+    0: (0xD400, 0xD401, 0xD404),
+    1: (0xD407, 0xD408, 0xD40B),
+    2: (0xD40E, 0xD40F, 0xD412),
+}
+
+
+def _sidfreq(midi, a4=440.0, cpu_hz=985248.444):
+    hz = a4 * 2.0 ** ((midi - 69) / 12.0)
+    return int(round(hz * (1 << 24) / cpu_hz)) & 0xFFFF
+
+
+def _held_notes_trace(voice_notes, voice_a4=None, note_len=8):
+    """Trace of sustained, gate-on notes per voice (16-bit freq held across frames)."""
+    voice_a4 = voice_a4 or {}
+    n_notes = max(len(v) for v in voice_notes.values())
+    recs = []
+    frame = 0
+    for ni in range(n_notes):
+        for fi in range(note_len):
+            tick = _frame_cycle(frame)
+            recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+            if fi == 0:
+                for voice, notes in voice_notes.items():
+                    if ni < len(notes):
+                        flo, fhi, fctl = _VOICE_REGS[voice]
+                        fv = _sidfreq(notes[ni], voice_a4.get(voice, 440.0))
+                        recs.append(
+                            _ev(tick + 10, SID_WRITE, reg=flo & 0x1F, value=fv & 0xFF, addr=flo)
+                        )
+                        recs.append(
+                            _ev(
+                                tick + 11,
+                                SID_WRITE,
+                                reg=fhi & 0x1F,
+                                value=(fv >> 8) & 0xFF,
+                                addr=fhi,
+                            )
+                        )
+                        recs.append(
+                            _ev(tick + 12, SID_WRITE, reg=fctl & 0x1F, value=0x11, addr=fctl)
+                        )
+            frame += 1
+    return _build_trace(recs)
+
+
+_SCALE = [48, 52, 55, 60, 64, 67, 72, 36, 79]
+
+
+def test_recover_tuning_a440():
+    tu = recover_tuning(_held_notes_trace({0: _SCALE}, voice_a4={0: 440.0}))
+    assert tu is not None
+    assert abs(tu["cents_from_a440"]) < 3.0
+    assert tu["residual_cents"] < 3.0
+    assert tu["temperament"] == "12-TET"
+
+
+def test_recover_tuning_detuned():
+    a4 = 440.0 * 2.0 ** (25.0 / 1200.0)
+    tu = recover_tuning(_held_notes_trace({0: _SCALE}, voice_a4={0: a4}))
+    assert abs(tu["cents_from_a440"] - 25.0) < 3.0
+
+
+def test_recover_tuning_insufficient():
+    assert recover_tuning(_held_notes_trace({0: [60]}, note_len=2)) is None
+
+
+def test_voice_detune_same_note_offset():
+    sharp = 440.0 * 2.0 ** (18.0 / 1200.0)
+    trace = _held_notes_trace({0: _SCALE, 1: _SCALE}, voice_a4={0: 440.0, 1: sharp})
+    det = voice_detune(trace)
+    assert det["detuned"] is True
+    assert 14.0 < det["median_cents"] < 22.0
+    assert "0-1" in det["pairs"]
+
+
+def test_voice_detune_unison_not_detuned():
+    trace = _held_notes_trace({0: _SCALE, 1: _SCALE}, voice_a4={0: 440.0, 1: 440.0})
+    assert voice_detune(trace)["detuned"] is False
+
+
+def test_analyze_includes_tuning_and_detune():
+    result = analyze(_held_notes_trace({0: _SCALE}))
+    assert result["tuning"] is not None and "a4_hz" in result["tuning"]
+    assert "detune" in result and "detuned" in result["detune"]

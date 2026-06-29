@@ -1758,4 +1758,115 @@ def analyze(trace, kind="auto") -> dict:
         out[int(a)] = res
         summary[res["type"]] = summary.get(res["type"], 0) + 1
     out["summary"] = summary
+    out["tuning"] = recover_tuning(trace, kind)
+    out["detune"] = voice_detune(trace, kind)
     return out
+
+
+# -- global tuning + detune (the note-space / pitch layer) ----------------
+
+
+def _sustained_freqs(trace, kind="auto") -> np.ndarray:
+    """Held (unchanged from the previous frame), gate-on per-voice 16-bit
+    frequencies -- the sustained note pitches, excluding vibrato/slide/arp
+    frames which move every frame.
+    """
+    _, fr = trace.register_frames(0, kind)
+    if len(fr) < 2:
+        return np.empty(0, dtype=np.int64)
+    out = []
+    for voice in range(3):
+        base = voice * 7
+        freq = fr[:, base].astype(np.int64) | (fr[:, base + 1].astype(np.int64) << 8)
+        gate = (fr[:, base + 4] & 1).astype(bool)
+        held = np.zeros(len(freq), dtype=bool)
+        held[1:] = freq[1:] == freq[:-1]
+        sel = gate & held & (freq > 0)
+        if np.any(sel):
+            out.append(freq[sel])
+    return np.concatenate(out) if out else np.empty(0, dtype=np.int64)
+
+
+def recover_tuning(trace, kind="auto"):
+    """Recover a song's global tuning (offset from A440 / 12-TET).
+
+    SID frequency maps to pitch as ``f_Hz = sidfreq * cpu_hz / 2**24``. A
+    reference A4 is fit to the sustained (held, gate-on) note frequencies by
+    minimising the median absolute deviation to a 12-TET semitone grid. Returns
+    ``{a4_hz, cents_from_a440, residual_cents, temperament, n_samples}`` or None
+    when there is too little sustained pitch data. This is offline-only: the
+    per-song note->frequency table already bakes the tuning in for replay, so it
+    costs nothing at runtime but makes the IR's note numbers absolute pitch,
+    comparable across tunes.
+
+    Frequency alone fixes tuning only modulo one semitone (which grid point is
+    "A" needs the note table), so ``cents_from_a440`` is the sub-semitone offset
+    in (-50, +50]: tunes that share an offset have aligning notes; those that
+    differ do not.
+    """
+    hz = float(trace.meta.get("cpu_hz", 985248.444))
+    freqs = _sustained_freqs(trace, kind)
+    f_hz = freqs.astype(np.float64) * hz / float(1 << 24)
+    f_hz = f_hz[(f_hz > 30.0) & (f_hz < 8000.0)]
+    if len(f_hz) < 16:
+        return None
+    # The grid-alignment cost is periodic every semitone, so frequency alone
+    # fixes the reference only modulo 100 cents (which note is "A" needs the note
+    # table). Search a single +/-50 cent window around A440 for the unique,
+    # A440-referenced sub-semitone offset.
+    a4 = np.linspace(440.0 * 2.0 ** (-50.0 / 1200.0), 440.0 * 2.0 ** (50.0 / 1200.0), 1001)
+    midi = 69.0 + 12.0 * np.log2(f_hz[None, :] / a4[:, None])
+    cents = np.abs(midi - np.round(midi)) * 100.0
+    err = np.median(cents, axis=1)
+    best = int(np.argmin(err))
+    ref = float(a4[best])
+    residual = float(err[best])
+    return {
+        "a4_hz": ref,
+        "cents_from_a440": float(np.log2(ref / 440.0) * 1200.0),
+        "residual_cents": residual,
+        "temperament": "12-TET" if residual < 5.0 else "non-TET",
+        "n_samples": int(len(f_hz)),
+    }
+
+
+def voice_detune(trace, kind="auto") -> dict:
+    """Recover per-voice detune: when two voices sound the same note, the small
+    constant frequency-space offset that makes them beat/chorus.
+
+    Returns ``{detuned, median_cents, pairs, n_frames}``. The offset is reported
+    relative to notes (cents) but is a frequency-space delta -- reconstruction
+    never quantises freq to a note, so round-trip stays exact across it.
+    """
+    hz = float(trace.meta.get("cpu_hz", 985248.444))
+    _, fr = trace.register_frames(0, kind)
+    empty = {"detuned": False, "median_cents": 0.0, "pairs": {}, "n_frames": int(len(fr))}
+    if len(fr) < 2:
+        return empty
+    vfreq = []
+    vgate = []
+    for voice in range(3):
+        base = voice * 7
+        freq = fr[:, base].astype(np.int64) | (fr[:, base + 1].astype(np.int64) << 8)
+        vfreq.append(freq.astype(np.float64) * hz / float(1 << 24))
+        vgate.append((fr[:, base + 4] & 1).astype(bool))
+    pairs = {}
+    all_offsets = []
+    for i in range(3):
+        for j in range(i + 1, 3):
+            both = vgate[i] & vgate[j] & (vfreq[i] > 30.0) & (vfreq[j] > 30.0)
+            if not np.any(both):
+                continue
+            cents = 1200.0 * np.log2(vfreq[i][both] / vfreq[j][both])
+            same_note = cents[np.abs(cents) < 50.0]
+            offset = same_note[np.abs(same_note) > 0.5]
+            if len(offset):
+                pairs[f"{i}-{j}"] = float(np.median(offset))
+                all_offsets.extend(np.abs(offset).tolist())
+    median = float(np.median(all_offsets)) if all_offsets else 0.0
+    return {
+        "detuned": bool(median > 1.0),
+        "median_cents": median,
+        "pairs": pairs,
+        "n_frames": int(len(fr)),
+    }

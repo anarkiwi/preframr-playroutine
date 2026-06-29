@@ -152,5 +152,26 @@
     "subtune": 1,
     "md5": "b29a726924eff64bc15ab44830994e04",
     "seconds": 136.5
+  },
+  {
+    "path": "MUSICIANS/H/Hubbard_Rob/Commando.sid",
+    "family": "Hubbard",
+    "subtune": 1,
+    "md5": "6d019ecba831a9f853675aac29a61c10",
+    "seconds": 235.594
+  },
+  {
+    "path": "MUSICIANS/J/Jammer/Grid_Runner.sid",
+    "family": "GoatTracker2",
+    "subtune": 1,
+    "md5": "851745982a24c7ba46c26a609fd4e24e",
+    "seconds": 313.16
+  },
+  {
+    "path": "MUSICIANS/L/Linus/Cauldron_II_Remix.sid",
+    "family": "GoatTracker2",
+    "subtune": 1,
+    "md5": "37894817fa201d0371228f4d5003f002",
+    "seconds": 286.0
   }
 ]
