@@ -28,9 +28,11 @@ from .recover import (
     detect_table_walk,
     fit_bacc,
     reconstruct_register,
+    recover_tuning,
     round_trip,
     segmented_bacc,
     state_sequence,
+    voice_detune,
     voice_events,
 )
 
@@ -64,4 +66,6 @@ __all__ = [
     "analyze",
     "reconstruct_register",
     "round_trip",
+    "recover_tuning",
+    "voice_detune",
 ]

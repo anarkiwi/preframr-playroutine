@@ -40,11 +40,14 @@ re-deriving the melody.
 SID frequency registers are not notes: a note's pitch is `f_Hz = sidfreq ·
 cpu_hz / 2^24`, and each player's note→frequency table is calibrated to its own
 reference. Recovered across the fixture set, most tunes sit at A4 ≈ 440 Hz
-(clean 12-TET, sub-cent residual), but some are nearly a semitone off (several
-DMC / Future Composer tunes at A4 ≈ 423.8 Hz, −65 cents). So the common form
-carries a per-song tuning descriptor — reference A4, cents from A440, and
-temperament — recovered from the note→frequency table, so that a NOTE in the IR
-is an absolute pitch comparable across every tune.
+(clean 12-TET, sub-cent residual), but a cluster (several DMC / Future Composer
+/ Music Assembler tunes) is a consistent ~35 cents off the A440 grid — about a
+third of a semitone — so their notes do **not** align with the A440 tunes
+(likely an NTSC-tuned table played at the PAL clock). So the common form carries
+a per-song tuning descriptor — the sub-semitone offset from A440 and the
+temperament — so that a NOTE in the IR is an absolute pitch comparable across
+every tune. (Frequency alone pins tuning only modulo one semitone; which grid
+point is "A" comes from the note table.)
 
 ## Program-state instrumentation (generator recovery)
 
