@@ -618,6 +618,56 @@ def _anchor_positions(series, ramm, mask, max_pos: int = 256):
     return best_frame, best_pos.astype(np.int64)
 
 
+def _score_cursor_bases(smask, cur, ramm, bases, cmax, n):
+    """Vectorized :func:`_score_cursor` over many bases sharing one cursor cell.
+
+    ``ramm`` is the image already masked (``ram & mask``, ``uint8``) and
+    ``smask`` is the series already masked (``uint8``). For a fixed cursor cell
+    ``lo = base`` and ``hi = base + cmax``, so ``span = cmax + 1`` is constant
+    across bases and the per-offset ``ok`` mask and table index are
+    base-independent. Per offset it builds one ``(span, 256)`` joint histogram of
+    (table-index, masked-series) over the kept frames, so every base's residual
+    is a small ``sum_c hist[c, tab[b, c]]`` gather instead of an ``(n_bases, n)``
+    compare. Returns ``(res, off)`` arrays whose ``k``-th entry equals
+    ``_score_cursor(series, cur, ram, bases[k], bases[k]+cmax, mask, n)`` (same
+    strict ``>`` offset tie-break: first offset attaining the max wins). The
+    ``cur.max() >= span + 2`` guard is ``cmax >= cmax + 3`` here, always false,
+    so it never excludes a base.
+    """
+    nb = len(bases)
+    best_res = np.full(nb, -1.0)
+    best_off = np.zeros(nb, dtype=np.int64)
+    if nb == 0:
+        return best_res, best_off
+    thresh = n * 0.8
+    span = cmax + 1
+    cols = np.arange(span)
+    # Candidate table per base: tab[b] == ramm[bases[b] : bases[b] + span].
+    tab = ramm[bases[:, None] + cols[None, :]]
+    for off in (-2, -1, 0, 1, 2):
+        idx = cur + off
+        ok = (idx >= 0) & (idx <= cmax)
+        n_ok = int(ok.sum())
+        if n_ok < thresh:
+            continue
+        # ``ok`` already constrains ``idx`` to ``[0, cmax]``, so the original
+        # ``clip(idx, 0, cmax)`` is the identity on the kept frames.
+        idx_ok = idx[ok]
+        # Joint (table-index, masked-series) histogram, shared across all bases.
+        hist = np.bincount(idx_ok * 256 + smask[ok], minlength=span * 256).reshape(span, 256)
+        # matches[b] == #frames where ramm[base+idx] == series&mask
+        #            == sum_c hist[c, tab[b, c]].
+        matches = hist[cols[None, :], tab].sum(axis=1)
+        res = matches / n_ok
+        present = np.nonzero(hist.sum(axis=1))[0]
+        vals = tab[:, present]
+        uniq_ok = vals.min(axis=1) != vals.max(axis=1)
+        upd = uniq_ok & (res > best_res)
+        best_off = np.where(upd, off, best_off)
+        best_res = np.where(upd, res, best_res)
+    return best_res, best_off
+
+
 def _table_walk_scan(series, ctx, min_res: float = 0.8, max_bases: int = 96):
     """No-read-log table walk: cursor state cell + static ``ram_image``.
 
@@ -642,20 +692,26 @@ def _table_walk_scan(series, ctx, min_res: float = 0.8, max_bases: int = 96):
     for mask in (0xFE, 0xFF):
         if _bits_set(vbits & mask) < 2:
             continue
-        anchor = _anchor_positions(series, ram & mask, mask)
+        ramm = ram & mask
+        anchor = _anchor_positions(series, ramm, mask)
         if anchor is None:
             continue
         anchor_frame, positions = anchor
+        smask = (series & mask).astype(ramm.dtype)
         for j in ctx.cursor_cols:
             cur = grid[:, j]
             cmax = int(cur.max())
             bases = positions - int(cur[anchor_frame])
-            bases = bases[(bases >= 0) & (bases + cmax < len(ram))]
-            for base in bases[:max_bases]:
-                res, off = _score_cursor(series, cur, ram, int(base), int(base) + cmax, mask, n)
+            bases = bases[(bases >= 0) & (bases + cmax < len(ram))][:max_bases]
+            if len(bases) == 0:
+                continue
+            res_vec, off_vec = _score_cursor_bases(smask, cur, ramm, bases, cmax, n)
+            addr = int(ctx.stateseq.addrs[j])
+            for base, res_b, off_b in zip(bases, res_vec, off_vec):
+                res = float(res_b)
                 if res >= best_res:
                     best_res = res
-                    best = (res, int(base), int(base) + cmax, int(ctx.stateseq.addrs[j]), off, mask)
+                    best = (res, int(base), int(base) + cmax, addr, int(off_b), mask)
         if best is not None and best[0] >= 0.999:
             break
     if best is None:
