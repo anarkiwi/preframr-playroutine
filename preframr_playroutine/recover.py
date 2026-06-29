@@ -329,18 +329,425 @@ def _cursor_like(cursor: np.ndarray) -> bool:
     return float(np.mean((d >= 0) & (d <= 4))) > 0.5
 
 
-def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None) -> dict:
+# -- feeder cells, segmentation, and the recovery context -----------------
+
+# Per-voice SID register layout: offset within the 7-register voice block.
+_FREQ_LO, _FREQ_HI, _PW_LO, _PW_HI, _CTRL, _AD, _SR = range(7)
+_LOHI_PARTNER = {_FREQ_LO: 1, _FREQ_HI: -1, _PW_LO: 1, _PW_HI: -1}
+
+RecoverContext = namedtuple(
+    "RecoverContext",
+    ["kind", "stateseq", "ram", "tables", "cursor_cols", "note_on", "all_on", "n_frames"],
+)
+
+
+def _voice_of(sid_addr: int):
+    """(voice, register-offset) for a per-voice SID register, else (None, None)."""
+    off = int(sid_addr) - 0xD400
+    if 0 <= off < 21:
+        return off // 7, off % 7
+    return None, None
+
+
+def _bits_set(mask: int) -> int:
+    """Population count of an 8-bit mask."""
+    return bin(int(mask) & 0xFF).count("1")
+
+
+def _varying_bits(series: np.ndarray) -> int:
+    """Bitmask of the bit positions that are not constant across ``series``."""
+    s = np.asarray(series, dtype=np.int64)
+    out = 0
+    for b in range(8):
+        col = (s >> b) & 1
+        if col.min() != col.max():
+            out |= 1 << b
+    return out
+
+
+def _note_on_frames(trace, voice, ctx_kind="auto") -> list:
+    """Frames where ``voice``'s CTRL gate bit transitions 0->1 (note-on)."""
+    if voice is None or voice not in CTRL_ADDRS:
+        return []
+    ctrl = _register_series(trace, CTRL_ADDRS[voice], ctx_kind)[1]
+    if len(ctrl) == 0:
+        return []
+    gate = (ctrl & 1).astype(np.int64)
+    return (np.nonzero(np.diff(gate) > 0)[0] + 1).tolist()
+
+
+def _best_feeder(series: np.ndarray, stateseq) -> tuple:
+    """Best state cell reproducing ``series`` directly (8-bit).
+
+    Returns ``(cell_addr, fraction)`` for the grid column whose value best
+    matches ``series``; ``(None, 0.0)`` if no cell is available. Prefilters by
+    value range so only plausible cells are scored.
+    """
+    s = np.asarray(series, dtype=np.int64)
+    if stateseq is None or stateseq.grid.shape[1] == 0 or len(s) == 0:
+        return None, 0.0
+    grid = stateseq.grid.astype(np.int64)
+    smin, smax = int(s.min()), int(s.max())
+    keep = (grid.max(axis=0) >= smin) & (grid.min(axis=0) <= smax)
+    if not np.any(keep):
+        return None, 0.0
+    cols = np.nonzero(keep)[0]
+    match = (grid[:, cols] == s[:, None]).mean(axis=0)
+    j = int(match.argmax())
+    return int(stateseq.addrs[cols[j]]), float(match[j])
+
+
+def _strip_holds(seg: np.ndarray) -> np.ndarray:
+    """Trim leading and trailing constant runs from a segment."""
+    i = 0
+    n = len(seg)
+    while i + 1 < n and seg[i] == seg[i + 1]:
+        i += 1
+    j = n
+    while j - 1 > i and seg[j - 1] == seg[j - 2]:
+        j -= 1
+    return seg[i:j]
+
+
+def segmented_bacc(series, reset_frames, min_residual: float = 0.6, min_segments: int = 3):
+    """Recover a note-reseeded bounded accumulator from a per-frame series.
+
+    The series is segmented at note-on ``reset_frames`` and at internal
+    discontinuities (the seed jumps), each segment is trimmed of its constant
+    hold runs and fitted with :func:`fit_bacc`. BACC is recovered when a
+    consistent step is found across a majority of fittable segments. Returns a
+    BACC dict (``step``/``mode``/``lo``/``hi``/``residual`` plus ``n_segments``/
+    ``n_fit``/``segmented=True``) or ``None``.
+    """
+    series = np.asarray(series, dtype=np.int64).ravel()
+    if len(series) < 8:
+        return None
+    cuts = set(int(x) for x in _discontinuities(series))
+    cuts.update(int(x) for x in reset_frames if 0 < int(x) < len(series))
+    bounds = [0] + sorted(cuts) + [len(series)]
+    fits = []
+    n_try = 0
+    for k in range(len(bounds) - 1):
+        seg = _strip_holds(series[bounds[k] : bounds[k + 1]])
+        if len(seg) < 4:
+            continue
+        n_try += 1
+        fit = fit_bacc(seg, min_residual=min_residual)
+        if fit is not None:
+            fits.append(fit)
+    if n_try < min_segments or len(fits) < min_segments:
+        return None
+    steps = {}
+    for fit in fits:
+        steps[fit["step"]] = steps.get(fit["step"], 0) + 1
+    step = max(steps, key=steps.get)
+    cnt = steps[step]
+    if cnt / len(fits) < 0.5 or len(fits) / n_try < 0.5:
+        return None
+    modal = [f for f in fits if f["step"] == step]
+    modes = {}
+    for fit in modal:
+        modes[fit["mode"]] = modes.get(fit["mode"], 0) + 1
+    return {
+        "type": "BACC",
+        "mode": max(modes, key=modes.get),
+        "step": int(step),
+        "lo": int(min(f["lo"] for f in modal)),
+        "hi": int(max(f["hi"] for f in modal)),
+        "residual": float(cnt / len(fits)),
+        "n_segments": int(n_try),
+        "n_fit": int(len(fits)),
+        "segmented": True,
+    }
+
+
+def _read_log_tables(trace, ram, max_span: int = 256, cap: int = 96) -> list:
+    """Candidate static tables from the RAM read log: ``(base, top, valueset)``.
+
+    Each read-PC that reads a contiguous, bounded address range is a likely
+    ``LDA table,X`` table walk; ``base`` is the lowest address read, ``top`` the
+    highest, and ``valueset`` the distinct bytes of that region in the image.
+    """
+    if ram is None:
+        return []
+    rd = trace.ram_reads()
+    if len(rd) == 0:
+        return []
+    pcs, inv = np.unique(rd["pc"], return_inverse=True)
+    out = []
+    for i in range(len(pcs)):
+        addrs = rd["addr"][inv == i]
+        if len(addrs) < 8:
+            continue
+        lo, hi = int(addrs.min()), int(addrs.max())
+        span = hi - lo + 1
+        if span < 2 or span > max_span or hi >= len(ram):
+            continue
+        out.append((lo, hi, frozenset(int(x) for x in np.unique(ram[lo : hi + 1]))))
+    # De-duplicate by (base, top); cap to bound the per-register search.
+    uniq = {(lo, hi): vs for lo, hi, vs in out}
+    return [(lo, hi, vs) for (lo, hi), vs in sorted(uniq.items())][:cap]
+
+
+def _cursor_columns(stateseq, cap: int = 128) -> list:
+    """Grid column indices whose per-frame series looks like a table cursor."""
+    if stateseq is None or stateseq.grid.shape[1] == 0:
+        return []
+    grid = stateseq.grid.astype(np.int64)
+    cols = []
+    for j in range(grid.shape[1]):
+        if _cursor_like(grid[:, j]):
+            cols.append(j)
+    return cols[:cap]
+
+
+def _score_cursor(series, cur, ram, lo, hi, mask, n):
+    """Best (residual, offset) reproducing ``series`` from ``ram[lo:hi]`` via cur.
+
+    Searches a small index offset (the cursor is read post-increment / with
+    loop markers, so the carry-forward value can lead/lag by a frame or two).
+    """
+    span = hi - lo + 1
+    if int(cur.max()) >= span + 2:
+        return -1.0, 0
+    best_res, best_off = -1.0, 0
+    for off in (-2, -1, 0, 1, 2):
+        idx = cur + off
+        ok = (idx >= 0) & (lo + idx <= hi)
+        if int(ok.sum()) < n * 0.8:
+            continue
+        tv = ram[lo + np.clip(idx, 0, span - 1)]
+        if len(np.unique(tv[ok] & mask)) < 2:
+            continue
+        res = float(np.mean((series[ok] & mask) == (tv[ok] & mask)))
+        if res > best_res:
+            best_res, best_off = res, off
+    return best_res, best_off
+
+
+def _table_walk_search(series, ctx, min_res: float = 0.82):
+    """Recover a (masked) table walk for ``series`` using the read-log tables.
+
+    For each candidate table whose byte set contains the register's values
+    (under an SID gate mask) and each cursor cell, search a small index offset
+    and pick the (base, cursor, offset, mask) with the highest reproduction
+    fraction. Returns a TABLE_WALK dict or ``None``.
+    """
+    series = np.asarray(series, dtype=np.int64).ravel()
+    ram = ctx.ram
+    if ram is None or not ctx.tables or not ctx.cursor_cols:
+        return None
+    vbits = _varying_bits(series)
+    if _bits_set(vbits) < 2:
+        return None
+    grid = ctx.stateseq.grid.astype(np.int64)
+    n = len(series)
+    best = None
+    best_res = min_res
+    for mask in (0xFE, 0xFF):
+        if _bits_set(vbits & mask) < 2:
+            continue
+        svals = {int(x) & mask for x in np.unique(series)}
+        for lo, hi, vset in ctx.tables:
+            if len(svals - {x & mask for x in vset}) > 1:
+                continue
+            for j in ctx.cursor_cols:
+                res, off = _score_cursor(series, grid[:, j], ram, lo, hi, mask, n)
+                if res >= best_res:
+                    best_res = res
+                    best = (res, lo, hi, int(ctx.stateseq.addrs[j]), off, mask)
+    if best is None:
+        return None
+    res, lo, hi, cursor, off, mask = best
+    return {
+        "type": "TABLE_WALK",
+        "base": int(lo),
+        "stride": 1,
+        "length": int(hi - lo + 1),
+        "loop": 0,
+        "table": ram[lo : hi + 1].copy(),
+        "mask": int(mask),
+        "cursor_addr": int(cursor),
+        "cursor_offset": int(off),
+        "residual": float(res),
+    }
+
+
+def _anchor_positions(series, ramm, mask, max_pos: int = 256):
+    """(anchor_frame, image positions) for the rarest masked register value.
+
+    Picks the masked value of ``series`` with the fewest occurrences in the
+    masked image ``ramm`` (so the value-scan yields few candidate bases), and
+    returns the first frame carrying it plus the image positions matching it.
+    """
+    sm = np.asarray(series, dtype=np.int64) & mask
+    uniq = np.unique(sm)
+    best_pos = None
+    best_frame = 0
+    best_count = max_pos + 1
+    for v in uniq:
+        pos = np.nonzero(ramm == int(v))[0]
+        if 0 < len(pos) < best_count:
+            best_count = len(pos)
+            best_pos = pos
+            best_frame = int(np.nonzero(sm == int(v))[0][0])
+    if best_pos is None or best_count > max_pos:
+        return None
+    return best_frame, best_pos.astype(np.int64)
+
+
+def _table_walk_scan(series, ctx, min_res: float = 0.8, max_bases: int = 96):
+    """No-read-log table walk: cursor state cell + static ``ram_image``.
+
+    Recovers ``CTRL[frame] == ram_image[base + cursor[frame]] & mask`` by
+    value-scanning the image for candidate bases (anchored on a rare register
+    value) for each cursor cell, under SID gate masks ``{0xFF, 0xFE}`` and the
+    same small index-offset search as the read-log path. This mirrors the
+    read-log recovery so a whole-song trace rendered without ``--reads`` still
+    recovers e.g. the DMC waveform table walk (``$18AD[$177A] & 0xFE``).
+    """
+    ram = ctx.ram
+    if ram is None or not ctx.cursor_cols:
+        return None
+    series = np.asarray(series, dtype=np.int64).ravel()
+    vbits = _varying_bits(series)
+    if _bits_set(vbits) < 2:
+        return None
+    grid = ctx.stateseq.grid.astype(np.int64)
+    n = len(series)
+    best = None
+    best_res = min_res
+    for mask in (0xFE, 0xFF):
+        if _bits_set(vbits & mask) < 2:
+            continue
+        anchor = _anchor_positions(series, ram & mask, mask)
+        if anchor is None:
+            continue
+        anchor_frame, positions = anchor
+        for j in ctx.cursor_cols:
+            cur = grid[:, j]
+            cmax = int(cur.max())
+            bases = positions - int(cur[anchor_frame])
+            bases = bases[(bases >= 0) & (bases + cmax < len(ram))]
+            for base in bases[:max_bases]:
+                res, off = _score_cursor(series, cur, ram, int(base), int(base) + cmax, mask, n)
+                if res >= best_res:
+                    best_res = res
+                    best = (res, int(base), int(base) + cmax, int(ctx.stateseq.addrs[j]), off, mask)
+        if best is not None and best[0] >= 0.999:
+            break
+    if best is None:
+        return None
+    res, lo, hi, cursor, off, mask = best
+    return {
+        "type": "TABLE_WALK",
+        "base": int(lo),
+        "stride": 1,
+        "length": int(hi - lo + 1),
+        "loop": 0,
+        "table": ram[lo : hi + 1].copy(),
+        "mask": int(mask),
+        "cursor_addr": int(cursor),
+        "cursor_offset": int(off),
+        "residual": float(res),
+    }
+
+
+def _seq_correlation(series, on_frames, n_frames, lag: int = 2) -> tuple:
+    """(fraction, n_changes): how strongly value changes align with note-ons."""
+    s = np.asarray(series, dtype=np.int64)
+    changes = np.nonzero(np.diff(s) != 0)[0] + 1
+    if len(changes) == 0:
+        return 1.0, 0
+    onset = np.zeros(n_frames, dtype=bool)
+    for f in on_frames:
+        for shift in range(-1, lag + 1):
+            g = f + shift
+            if 0 <= g < n_frames:
+                onset[g] = True
+    changes = changes[changes < n_frames]
+    if len(changes) == 0:
+        return 1.0, 0
+    return float(np.mean(onset[changes])), int(len(changes))
+
+
+def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContext:
+    """Precompute the per-trace recovery context once (shared by analyze)."""
+    if stateseq is None:
+        stateseq = state_sequence(trace, kind)
+    if ram is None:
+        ram = trace.ram_image()
+    tables = _read_log_tables(trace, ram)
+    cursor_cols = _cursor_columns(stateseq)
+    note_on = {v: _note_on_frames(trace, v, kind) for v in CTRL_ADDRS}
+    all_on = sorted({f for frames in note_on.values() for f in frames})
+    return RecoverContext(
+        kind=kind,
+        stateseq=stateseq,
+        ram=ram,
+        tables=tables,
+        cursor_cols=cursor_cols,
+        note_on=note_on,
+        all_on=all_on,
+        n_frames=len(stateseq.ticks),
+    )
+
+
+def _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx):
+    """Recover a BACC on the register or its 16-bit lo/hi partner.
+
+    Tries, in order: a global :func:`fit_bacc` (a non-reseeded accumulator), then
+    a note-segmented BACC (re-seeded per note); each on the register's own 8-bit
+    series and on the 16-bit lo/hi combination when the register is a freq/PW
+    byte. The 16-bit form is preferred when both fit.
+    """
+    resets = ctx.note_on.get(voice, []) if voice is not None else ctx.all_on
+    partner_off = _LOHI_PARTNER.get(reg_off)
+    combined = None
+    if partner_off is not None:
+        partner = _register_series(trace, sid_addr + partner_off, ctx.kind)[1]
+        if len(np.unique(partner)) > 1:
+            lo, hi = (series, partner) if partner_off == 1 else (partner, series)
+            combined = combine_lohi(lo, hi)
+
+    if combined is not None:
+        glob = fit_bacc(combined)
+        if glob is not None:
+            glob["width"] = 16
+            return glob
+    glob = fit_bacc(series)
+    if glob is not None:
+        return glob
+
+    best = segmented_bacc(series, resets)
+    if combined is not None:
+        cb = segmented_bacc(combined, resets)
+        if cb is not None and (best is None or cb["n_fit"] >= best["n_fit"]):
+            cb["width"] = 16
+            best = cb
+    return best
+
+
+def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx=None) -> dict:
     """Classify the generator producing a SID register's per-frame value.
 
     Returns a dict with ``type`` in {'BACC','TABLE_WALK','SEQ','XSTATE','CONST'},
-    the recovered parameters, and ``store_pcs`` (the store-site PCs that wrote
-    this register). Strategy: CONST, then BACC, then TABLE_WALK (over candidate
-    cursor cells from the state sequence + RAM image), else SEQ if the writes are
-    sparse (event-latched at note boundaries), else XSTATE.
+    the recovered parameters, ``store_pcs`` (the store-site PCs that wrote this
+    register), and (where recovered) the feeder ``cell_addr``, table walk
+    ``cursor_addr``/``table``/``mask``, and BACC segment info. Strategy, in
+    order: CONST -> (note-segmented, feeder-cell) BACC -> (read-log/image)
+    TABLE_WALK -> SEQ (note-gated event latch) -> XSTATE.
+
+    ``ctx`` is a precomputed :class:`RecoverContext` (built once by
+    :func:`analyze`); ``stateseq``/``ram`` are accepted for backwards
+    compatibility and seed a context when ``ctx`` is not given.
     """
-    ticks, series, wr = _register_series(trace, sid_addr, kind)
+    if ctx is None:
+        ctx = _build_context(trace, kind, stateseq, ram)
+    ticks, series, wr = _register_series(trace, sid_addr, ctx.kind)
     pcs = sorted({int(p) for p in wr["aux"]}) if len(wr) else []
     result = {"addr": int(sid_addr), "store_pcs": pcs, "n_writes": int(len(wr))}
+    voice, reg_off = _voice_of(sid_addr)
 
     if len(ticks) == 0 or len(wr) == 0:
         result.update(type="CONST", value=None)
@@ -349,30 +756,53 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None) -> 
         result.update(type="CONST", value=int(wr["value"][0]))
         return result
 
-    bacc = fit_bacc(series)
+    feeder, ffrac = _best_feeder(series, ctx.stateseq)
+    if feeder is not None and ffrac >= 0.5:
+        result["cell_addr"] = feeder
+        result["cell_frac"] = round(ffrac, 4)
+
+    on_frames = ctx.note_on.get(voice, []) if voice is not None else ctx.all_on
+    # AD / SR are envelope registers: every player writes them once per note (or
+    # re-blits a per-note shadow). They are event-latched SEQ, never a per-frame
+    # accumulator or table walk -- short-circuit so a per-frame re-blit cannot
+    # over-fit a spurious BACC/TABLE_WALK.
+    if reg_off in (_AD, _SR):
+        seq_frac, n_changes = _seq_correlation(series, on_frames, ctx.n_frames)
+        result.update(type="SEQ", seq_frac=round(seq_frac, 4), n_changes=int(n_changes))
+        return result
+
+    bacc = _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx)
     if bacc is not None:
         result.update(bacc)
         return result
 
-    if ram is None:
-        ram = trace.ram_image()
-    if stateseq is None:
-        stateseq = state_sequence(trace, kind)
-    if ram is not None:
-        for j, cell in enumerate(stateseq.addrs):
-            cursor = stateseq.grid[:, j].astype(np.int64)
-            if not _cursor_like(cursor):
-                continue
-            tw = detect_table_walk(cursor, ram, value_series=series)
-            if tw is not None and tw["base"] is not None and tw["residual"] >= 0.8:
-                result.update(tw)
-                result["cursor_addr"] = int(cell)
-                return result
+    return _classify_walk_or_seq(series, wr, on_frames, ctx, result)
 
-    if len(wr) / max(1, len(ticks)) < 0.5:
-        result.update(type="SEQ")
-    else:
-        result.update(type="XSTATE")
+
+def _classify_walk_or_seq(series, wr, on_frames, ctx, result) -> dict:
+    """Resolve a per-frame register as TABLE_WALK, else SEQ / XSTATE."""
+    seq_frac, n_changes = _seq_correlation(series, on_frames, ctx.n_frames)
+    result["seq_frac"] = round(seq_frac, 4)
+    result["n_changes"] = int(n_changes)
+    note_gated = n_changes <= 1 or (seq_frac >= 0.85 and n_changes <= 2.5 * max(1, len(on_frames)))
+    sparse = n_changes <= max(8, 0.15 * ctx.n_frames)
+    # A register written on (almost) every frame is a per-frame generator even
+    # when its value is held; one written only once per note is an event-latched
+    # SEQ write. Gate the per-frame table-walk search on the write density (not
+    # the change density), so a held-waveform CTRL is still recovered as a
+    # TABLE_WALK while per-note AD/SR/RES/VOL stay SEQ.
+    per_frame = len(wr) >= 0.5 * max(1, ctx.n_frames)
+    if per_frame:
+        tw = _table_walk_search(series, ctx)
+        if tw is None and not ctx.tables:
+            tw = _table_walk_scan(series, ctx)
+        if tw is not None:
+            result.pop("seq_frac", None)
+            result.pop("n_changes", None)
+            result.update(tw)
+            return result
+
+    result.update(type="SEQ" if (note_gated or sparse or not per_frame) else "XSTATE")
     return result
 
 
@@ -464,12 +894,11 @@ def analyze(trace, kind="auto") -> dict:
     """
     writes = trace.sid_writes()
     addrs = np.unique(writes["addr"]) if len(writes) else np.empty(0, dtype=np.uint16)
-    stateseq = state_sequence(trace, kind)
-    ram = trace.ram_image()
+    ctx = _build_context(trace, kind)
     out: dict = {}
     summary: dict = {}
     for a in addrs:
-        res = classify_register(trace, int(a), kind, stateseq=stateseq, ram=ram)
+        res = classify_register(trace, int(a), kind, ctx=ctx)
         out[int(a)] = res
         summary[res["type"]] = summary.get(res["type"], 0) + 1
     out["summary"] = summary

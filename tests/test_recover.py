@@ -16,6 +16,7 @@ from preframr_playroutine import (
     correlate_event_reset,
     detect_table_walk,
     fit_bacc,
+    segmented_bacc,
     state_sequence,
     voice_events,
 )
@@ -207,6 +208,134 @@ def test_state_sequence_explicit_addrs():
     ss = state_sequence(trace, addrs=[0xC000])
     assert list(ss.addrs) == [0xC000]
     assert ss.grid[2, 0] == 42
+
+
+# -- segmented BACC / feeder cells / read-log table walk ------------------
+
+
+def _note_reseeded_triangle(notes, note_len):
+    """Reflecting triangle reseeded to 0x10 at the start of every note."""
+    up = list(range(0x10, 0x41, 6))  # 0x10..0x40
+    down = list(range(0x3A, 0x10, -6))  # 0x3a..0x16
+    one = (up + down)[:note_len]
+    return (one * notes)[: notes * note_len]
+
+
+def test_segmented_bacc_recovers_reseeded_step():
+    vals = np.array(_note_reseeded_triangle(6, 13), dtype=np.int64)
+    resets = list(range(0, len(vals), 13))
+    fit = segmented_bacc(vals, resets)
+    assert fit is not None
+    assert fit["type"] == "BACC"
+    assert fit["step"] == 6
+    assert fit["segmented"] is True
+    assert fit["n_fit"] >= 3
+    # The same series with no resets has discontinuities at each note edge that
+    # defeat a single global accumulator fit.
+    assert fit_bacc(vals) is None
+
+
+def test_classify_bacc_note_reseeded_feeder_cell():
+    cell = 0x1750  # DMC PW-lo accumulator cell, mirrored to $D402.
+    note_len = 13
+    vals = _note_reseeded_triangle(6, note_len)
+    recs = []
+    ramwr = []
+    for i, v in enumerate(vals):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        ctrl = 0x40 if (i % note_len) == note_len - 1 else 0x41
+        recs.append(_ev(tick + 8, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1500))
+        recs.append(_ev(tick + 12, SID_WRITE, reg=2, value=int(v), addr=0xD402, aux=0x1388))
+        ramwr.append(_ra(tick + 10, cell, int(v)))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = classify_register(trace, 0xD402)
+    assert res["type"] == "BACC"
+    assert res["step"] == 6
+    assert res["cell_addr"] == cell  # feeder state cell recovered
+
+
+def test_classify_table_walk_readlog_mask():
+    ram = np.zeros(65536, dtype=np.uint8)
+    base = 0x18AD
+    table = np.array([0x41, 0x11, 0x21, 0x81], dtype=np.uint8)
+    ram[base : base + len(table)] = table
+    cursor_cell = 0x177A
+    n = 64
+    recs = []
+    ramwr = []
+    ramrd = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        cur = i % len(table)
+        gate_off = (i % 10) < 3  # force the gate bit off ~30% of frames
+        ctrl = int(table[cur]) & (0xFE if gate_off else 0xFF)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        recs.append(_ev(tick + 14, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1628))
+        ramwr.append(_ra(tick + 6, cursor_cell, cur))
+        ramrd.append(_ra(tick + 8, base + cur, int(table[cur])))  # LDA table,X
+    evs = np.array(recs, dtype=EVENT_DTYPE)
+    evs.sort(order="cycle", kind="stable")
+    trace = Trace.from_events(
+        evs,
+        PAL_META,
+        ramwr=np.array(ramwr, dtype=RAMACCESS_DTYPE),
+        ramrd=np.array(ramrd, dtype=RAMACCESS_DTYPE),
+        ram=ram,
+    )
+    res = classify_register(trace, 0xD404)
+    assert res["type"] == "TABLE_WALK"
+    assert res["base"] == base
+    assert res["mask"] == 0xFE  # the gate bit is masked out
+    assert res["cursor_addr"] == cursor_cell
+    assert np.array_equal(res["table"], table)
+
+
+def test_classify_table_walk_noread_image_mask():
+    # Same masked waveform table walk, but WITHOUT a read log: recovery must use
+    # the cursor state cell + ram_image scan and still recover base/mask/cursor.
+    ram = np.zeros(65536, dtype=np.uint8)
+    base = 0x18AD
+    table = np.array([0x41, 0x11, 0x21, 0x81], dtype=np.uint8)
+    ram[base : base + len(table)] = table
+    cursor_cell = 0x177A
+    n = 64
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        cur = i % len(table)
+        gate_off = (i % 10) < 3
+        ctrl = int(table[cur]) & (0xFE if gate_off else 0xFF)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        recs.append(_ev(tick + 14, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1628))
+        ramwr.append(_ra(tick + 6, cursor_cell, cur))
+    trace = _build_trace(recs, ram_writes=ramwr, ram=ram)  # no ramrd -> scan path
+    assert len(trace.ram_reads()) == 0
+    res = classify_register(trace, 0xD404)
+    assert res["type"] == "TABLE_WALK"
+    assert res["base"] == base
+    assert res["mask"] == 0xFE
+    assert res["cursor_addr"] == cursor_cell
+    assert np.array_equal(res["table"], table)
+
+
+def test_classify_per_note_ad_cell_seq():
+    n = 80
+    note_len = 16
+    recs = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        if i % note_len == 0:
+            recs.append(_ev(tick + 6, SID_WRITE, reg=4, value=0x41, addr=0xD404, aux=0x1500))
+            ad = (0x10 + (i // note_len) * 0x11) & 0xFF
+            recs.append(_ev(tick + 8, SID_WRITE, reg=5, value=ad, addr=0xD405, aux=0x1230))
+        elif i % note_len == note_len - 1:
+            recs.append(_ev(tick + 6, SID_WRITE, reg=4, value=0x40, addr=0xD404, aux=0x1500))
+    trace = _build_trace(recs)
+    res = classify_register(trace, 0xD405)
+    assert res["type"] == "SEQ"  # AD written once per note -> event-latched
 
 
 # -- classify_register ----------------------------------------------------

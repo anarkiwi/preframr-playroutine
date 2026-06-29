@@ -32,6 +32,52 @@ def _ids(entry):
     return f"{entry.get('family', '?')}:{os.path.basename(entry['path'])}:{entry.get('subtune', 1)}"
 
 
+# DMC per-voice register strides: $D400 + 7*voice.
+_AD = (0xD405, 0xD40C, 0xD413)
+_SR = (0xD406, 0xD40D, 0xD414)
+_PW = (0xD402, 0xD403, 0xD409, 0xD40A, 0xD410, 0xD411)
+_CTRL = (0xD404, 0xD40B, 0xD412)
+
+
+def _types(result, addrs):
+    return {a: result.get(a, {}).get("type") for a in addrs}
+
+
+def _assert_register_classes(entry, result):
+    """Anchor the recovery quality on the catalog's DMC and GT2 reference tunes.
+
+    Only the two named tunes are checked against their reverse-engineering docs
+    (``re-trackers/DMC`` and ``re-trackers/GoatTracker2``); every other tune keeps
+    the generic ``classified >= 1`` assertion.
+    """
+    family = entry.get("family")
+    base = os.path.basename(entry["path"])
+
+    if family == "DMC" and base == "Doctagop.sid":
+        # dmc-generators.md: AD/SR per-note SEQ; PW 16-bit up/down BACC; CTRL a
+        # waveform table walk (AND-ed with the gate mask). A sustained voice can
+        # be a 1-entry waveform loop, presenting as a CONST CTRL -- allow it, but
+        # require at least one active voice to recover as a real TABLE_WALK. The
+        # whole-song fixture renders without --reads, so this exercises the
+        # image-based scan (cursor state cell + ram_image, masked) path.
+        for addr, t in _types(result, _AD + _SR).items():
+            assert t in ("SEQ", "CONST"), (hex(addr), t)
+        for addr, t in _types(result, _PW).items():
+            assert t == "BACC", (hex(addr), t)
+        ctrl_types = _types(result, _CTRL)
+        for addr, t in ctrl_types.items():
+            assert t in ("TABLE_WALK", "CONST"), (hex(addr), t)
+        assert "TABLE_WALK" in ctrl_types.values(), ctrl_types
+
+    if family == "GoatTracker2" and base == "Raindrops.sid":
+        # goattracker2-generators.md: AD/SR per-note SEQ (+ hard restart); the
+        # verified voice-1 PW is a 16-bit up BACC.
+        for addr, t in _types(result, _AD + _SR).items():
+            assert t in ("SEQ", "CONST"), (hex(addr), t)
+        for addr, t in _types(result, (0xD409, 0xD40A)).items():
+            assert t == "BACC", (hex(addr), t)
+
+
 def _run_sidtrace(sid_path, prefix, seconds, subtune):
     subprocess.run(
         [
@@ -71,6 +117,7 @@ def test_real_tune(entry, tmp_path_factory):
     result = analyze(trace)
     classified = sum(v for k, v in result["summary"].items())
     assert classified >= 1
+    _assert_register_classes(entry, result)
 
     # Determinism: a second render is byte-identical across event + RAM streams.
     prefix_b = str(work / "b")

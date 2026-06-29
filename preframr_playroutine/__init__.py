@@ -19,6 +19,7 @@ from .trace import (
     load_events,
 )
 from .recover import (
+    RecoverContext,
     StateSequence,
     analyze,
     classify_register,
@@ -26,6 +27,7 @@ from .recover import (
     correlate_event_reset,
     detect_table_walk,
     fit_bacc,
+    segmented_bacc,
     state_sequence,
     voice_events,
 )
@@ -48,8 +50,10 @@ __all__ = [
     "decode_voices",
     "load_events",
     "StateSequence",
+    "RecoverContext",
     "state_sequence",
     "fit_bacc",
+    "segmented_bacc",
     "combine_lohi",
     "detect_table_walk",
     "classify_register",
