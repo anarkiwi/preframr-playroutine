@@ -12,7 +12,7 @@ ARG LIBRESIDFP_REF=8498ac9470a10c4aada3916e2abfc44ca3d0f25d
 #-----------------------------------------------------------------------------
 # Stage 1: build instrumented libsidplayfp and the sidtrace tool.
 #-----------------------------------------------------------------------------
-FROM ubuntu:24.04 AS builder
+FROM ubuntu:26.04 AS builder
 ARG LIBSIDPLAYFP_REF
 ARG LIBRESIDFP_REF
 ENV DEBIAN_FRONTEND=noninteractive
