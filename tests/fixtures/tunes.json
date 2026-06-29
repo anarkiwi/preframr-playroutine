@@ -1,0 +1,149 @@
+[
+  {
+    "path": "MUSICIANS/G/Gop/Doctagop.sid",
+    "family": "DMC",
+    "subtune": 1,
+    "md5": "9be721f75df73f4c8b5133a51b9c2748",
+    "seconds": 123.0
+  },
+  {
+    "path": "MUSICIANS/B/Bayliss_Richard/Guns_n_Ghosts.sid",
+    "family": "DMC",
+    "subtune": 1,
+    "md5": "4e9d91063524fda55f2fb7a67a1d3a4c",
+    "seconds": 215.0
+  },
+  {
+    "path": "MUSICIANS/P/Praiser/In_My_Head.sid",
+    "family": "DMC",
+    "subtune": 1,
+    "md5": "feadcf6cdc4734c28c15c0d3a15c2007",
+    "seconds": 119.0
+  },
+  {
+    "path": "MUSICIANS/P/Proton/Raindrops.sid",
+    "family": "GoatTracker2",
+    "subtune": 1,
+    "md5": "319ecb71f33b7e67e00d5555e1f16b9a",
+    "seconds": 194.097
+  },
+  {
+    "path": "MUSICIANS/S/Sage/Tunnelbound.sid",
+    "family": "GoatTracker2",
+    "subtune": 1,
+    "md5": "7ff1d7eec1f657cb39cea04725584f31",
+    "seconds": 187.0
+  },
+  {
+    "path": "MUSICIANS/L/Linus/Day_6_in_Kleve_Hades.sid",
+    "family": "GoatTracker2",
+    "subtune": 1,
+    "md5": "47864b291ee0263ee72c2d571738c98e",
+    "seconds": 192.0
+  },
+  {
+    "path": "MUSICIANS/D/Dr_Rox/Let_It_Bee.sid",
+    "family": "MusicAssembler",
+    "subtune": 1,
+    "md5": "e3bfadf1e49aedd687f25365c7138cb4",
+    "seconds": 225.0
+  },
+  {
+    "path": "MUSICIANS/M/Mateus/Pozitronic.sid",
+    "family": "MusicAssembler",
+    "subtune": 1,
+    "md5": "205a0a1465f8fec7527679bc7ae2ff65",
+    "seconds": 185.0
+  },
+  {
+    "path": "MUSICIANS/V/Valentine/Torpedo.sid",
+    "family": "MusicAssembler",
+    "subtune": 1,
+    "md5": "cfe8ce8f25ac7eef581daf448cfc9240",
+    "seconds": 199.184
+  },
+  {
+    "path": "MUSICIANS/I/Image/Tune_06.sid",
+    "family": "FutureComposer",
+    "subtune": 1,
+    "md5": "eb205ff02d975df98686343bb100be51",
+    "seconds": 103.0
+  },
+  {
+    "path": "MUSICIANS/T/Tel_Jeroen/Hawkeye.sid",
+    "family": "FutureComposer",
+    "subtune": 12,
+    "md5": "0661cdf186a50239fdc67e3d53f345cb",
+    "seconds": 135.0
+  },
+  {
+    "path": "MUSICIANS/F/Furniss_Matt/Manchester_United.sid",
+    "family": "FutureComposer",
+    "subtune": 1,
+    "md5": "ecf0b904fd2dc13270def24fb4b2d638",
+    "seconds": 133.0
+  },
+  {
+    "path": "MUSICIANS/D/DRAX/Worktunes/24th_Amaranth_Grand_Prix_3.sid",
+    "family": "JCH_NewPlayer",
+    "subtune": 1,
+    "md5": "22eacaeb70be3e50554faed4fcc47f7e",
+    "seconds": 12.0
+  },
+  {
+    "path": "MUSICIANS/H/Hultink_Gerard/Dreams.sid",
+    "family": "JCH_NewPlayer",
+    "subtune": 1,
+    "md5": "31b408913b0afb38b821e7b74a28c916",
+    "seconds": 163.853
+  },
+  {
+    "path": "MUSICIANS/M/Mitch_and_Dane/Dane/Blackout.sid",
+    "family": "JCH_NewPlayer",
+    "subtune": 1,
+    "md5": "9e27099f6da4afbf56c14c86863dfb5d",
+    "seconds": 176.0
+  },
+  {
+    "path": "MUSICIANS/J/JAP/Only_3.sid",
+    "family": "Soundmonitor",
+    "subtune": 1,
+    "md5": "50ee96574a3a0484ab9797eea2d30b45",
+    "seconds": 49.355
+  },
+  {
+    "path": "MUSICIANS/C/Clarke_Peter/Denarius.sid",
+    "family": "Soundmonitor",
+    "subtune": 1,
+    "md5": "c7626041fb9a64398965f963e33caa23",
+    "seconds": 123.0
+  },
+  {
+    "path": "MUSICIANS/G/Gray_Matt/Tom_Tom.sid",
+    "family": "Soundmonitor",
+    "subtune": 1,
+    "md5": "8355ef0db4127505cdf27e7babcf28fc",
+    "seconds": 173.0
+  },
+  {
+    "path": "MUSICIANS/F/F7sus4/Stargazer.sid",
+    "family": "defMON",
+    "subtune": 1,
+    "md5": "21f56326b924bd30e80dfba7d365f4e5",
+    "seconds": 184.5
+  },
+  {
+    "path": "MUSICIANS/I/Ilkke/Vacuole.sid",
+    "family": "defMON",
+    "subtune": 1,
+    "md5": "bbc74a60a8cd59e87c4d7a8958c26a12",
+    "seconds": 232.0
+  },
+  {
+    "path": "MUSICIANS/D/Demsky_Martin/Wasps.sid",
+    "family": "defMON",
+    "subtune": 1,
+    "md5": "4d80f60d3363e3cfae47d29eceef0e80",
+    "seconds": 145.674
+  }
+]

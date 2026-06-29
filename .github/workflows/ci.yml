@@ -28,5 +28,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build image
         run: docker build -t preframr-playroutine:ci .
-      - name: Run full test suite (incl. end-to-end oracle)
-        run: docker run --rm preframr-playroutine:ci -q
+      - name: Run full test suite (incl. end-to-end oracle + HVSC real tunes)
+        # The container has python + the package + the sidtrace binary. Give it
+        # network + the HVSC base URL so tests/test_hvsc.py downloads and traces
+        # the real tunes from tests/fixtures/tunes.json.
+        run: >
+          docker run --rm
+          -e HVSC_BASE_URL=https://hvsc.c64.org/download/C64Music
+          preframr-playroutine:ci -q

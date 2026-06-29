@@ -26,6 +26,23 @@ EVENT_DTYPE = np.dtype(
     ]
 )
 
+# RAM access log layout (v2). Must match RAMACCESS_DTYPE in app/sidtrace.cpp.
+# 16 bytes: cycle<u8, pc<u2, addr<u2, value u1, kind u1, pad<u2.
+RAMACCESS_DTYPE = np.dtype(
+    [
+        ("cycle", "<u8"),
+        ("pc", "<u2"),
+        ("addr", "<u2"),
+        ("value", "u1"),
+        ("kind", "u1"),
+        ("pad", "<u2"),
+    ]
+)
+
+# Play-window kinds (the ``kind`` field of RAMACCESS records and coverage scope).
+WIN_IRQ = 0
+WIN_NMI = 1
+
 # Event types.
 SID_WRITE = 0
 CIA_IRQ = 1
@@ -47,41 +64,122 @@ def load_events(path: str) -> np.ndarray:
     return np.fromfile(path, dtype=EVENT_DTYPE)
 
 
-def _resolve(prefix: str) -> tuple[str, str]:
-    """Return (bin_path, json_path) from a prefix, .bin or .json path."""
+def _resolve(prefix: str) -> tuple[str, str, str]:
+    """Return (bin_path, json_path, base) from a prefix, .bin or .json path."""
     if prefix.endswith(".bin"):
         base = prefix[:-4]
     elif prefix.endswith(".json"):
         base = prefix[:-5]
     else:
         base = prefix
-    return base + ".bin", base + ".json"
+    return base + ".bin", base + ".json", base
+
+
+def _load_ramacc(path: str) -> np.ndarray:
+    """Load a RAMACCESS log if present, else an empty array."""
+    if os.path.exists(path):
+        return np.fromfile(path, dtype=RAMACCESS_DTYPE)
+    return np.empty(0, dtype=RAMACCESS_DTYPE)
+
+
+def _load_bytes(path: str) -> np.ndarray | None:
+    """Load a raw uint8 blob if present, else None."""
+    if os.path.exists(path):
+        return np.fromfile(path, dtype=np.uint8)
+    return None
 
 
 class Trace:
     """A loaded oracle trace: structured events plus metadata."""
 
-    def __init__(self, events: np.ndarray, meta: dict):
+    def __init__(
+        self,
+        events: np.ndarray,
+        meta: dict,
+        ramwr: np.ndarray | None = None,
+        ramrd: np.ndarray | None = None,
+        coverage: np.ndarray | None = None,
+        ram: np.ndarray | None = None,
+    ):
         self.events = events
         self.meta = meta
+        self._ramwr = ramwr if ramwr is not None else np.empty(0, dtype=RAMACCESS_DTYPE)
+        self._ramrd = ramrd if ramrd is not None else np.empty(0, dtype=RAMACCESS_DTYPE)
+        self._coverage = coverage  # raw 8192-byte bitmap or None
+        self._ram = ram  # 65536-byte image or None
 
     # -- loading -----------------------------------------------------------
 
     @classmethod
     def load(cls, prefix: str) -> "Trace":
-        """Load a trace from a prefix, ``.bin`` or ``.json`` path."""
-        bin_path, json_path = _resolve(prefix)
+        """Load a trace from a prefix, ``.bin`` or ``.json`` path.
+
+        Also loads the v2 sidecars when present (``<base>.ramwr.bin``,
+        ``<base>.ramrd.bin``, ``<base>.cov.bin``, ``<base>.ram``); absent files
+        yield empty arrays / None.
+        """
+        bin_path, json_path, base = _resolve(prefix)
         events = load_events(bin_path)
         meta = {}
         if os.path.exists(json_path):
             with open(json_path, encoding="utf-8") as handle:
                 meta = json.load(handle)
-        return cls(events, meta)
+        return cls(
+            events,
+            meta,
+            ramwr=_load_ramacc(base + ".ramwr.bin"),
+            ramrd=_load_ramacc(base + ".ramrd.bin"),
+            coverage=_load_bytes(base + ".cov.bin"),
+            ram=_load_bytes(base + ".ram"),
+        )
 
     @classmethod
-    def from_events(cls, events: np.ndarray, meta: dict | None = None) -> "Trace":
-        """Build a trace directly from an event array (e.g. for tests)."""
-        return cls(events, meta or {})
+    def from_events(cls, events: np.ndarray, meta: dict | None = None, **kwargs) -> "Trace":
+        """Build a trace directly from arrays (e.g. for tests).
+
+        Optional keyword args ``ramwr``, ``ramrd``, ``coverage``, ``ram`` seed
+        the v2 sidecar data.
+        """
+        return cls(events, meta or {}, **kwargs)
+
+    # -- v2 selectors ------------------------------------------------------
+
+    def ram_writes(self, kind: int | None = None) -> np.ndarray:
+        """RAM write log (RAMACCESS), optionally filtered by play-window kind."""
+        arr = self._ramwr
+        if kind is not None:
+            arr = arr[arr["kind"] == kind]
+        return arr
+
+    def ram_reads(self, kind: int | None = None) -> np.ndarray:
+        """RAM read log (RAMACCESS), optionally filtered by play-window kind."""
+        arr = self._ramrd
+        if kind is not None:
+            arr = arr[arr["kind"] == kind]
+        return arr
+
+    def coverage_pcs(self) -> np.ndarray:
+        """Executed PCs (uint16, sorted ascending).
+
+        Decoded from the 8192-byte coverage bitmap via ``np.unpackbits`` with
+        little-endian bit order, so the bit index equals the PC: byte ``b`` bit
+        ``i`` (LSB first) corresponds to ``PC = 8*b + i``.
+        """
+        cov = self._coverage
+        if cov is None or len(cov) == 0:
+            return np.empty(0, dtype=np.uint16)
+        bits = np.unpackbits(cov.astype(np.uint8), bitorder="little")
+        return np.nonzero(bits)[0].astype(np.uint16)
+
+    def ram_image(self) -> np.ndarray | None:
+        """The 65536-byte C64 RAM image (uint8), or None when absent/malformed."""
+        if self._ram is None or len(self._ram) != 65536:
+            return None
+        return self._ram
+
+    def sid_write_pc(self) -> np.ndarray:
+        """Store-site PC (the ``aux`` column) of every SID write."""
+        return self.sid_writes()["aux"]
 
     # -- selectors ---------------------------------------------------------
 

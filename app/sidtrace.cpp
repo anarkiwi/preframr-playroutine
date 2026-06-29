@@ -1,19 +1,18 @@
 /*
- * sidtrace - byte-exact, cycle-stamped SID register + IRQ/NMI tracer.
+ * sidtrace - byte-exact, cycle-stamped SID register + IRQ/NMI tracer with
+ * program-state instrumentation for generator recovery.
  *
  * Part of preframr-playroutine. Built on libsidplayfp (GPL-2.0-or-later);
  * this program is therefore distributed under the GNU General Public License
  * version 2 or later.
  *
- * It plays a .sid tune exactly as sidplayfp would (same cycle-accurate C64
- * emulation) and emits two artifacts:
- *   <prefix>.bin   flat array of fixed 16-byte little-endian event records
- *                  (numpy: np.fromfile(path, dtype=preframr_playroutine.EVENT_DTYPE))
- *   <prefix>.json  metadata sidecar describing the tune, timing and schema.
- *
- * The .bin stream is the oracle: every value written to a SID chip, every
- * CIA/VIC interrupt-line assertion, and every CPU interrupt vector-through,
- * each stamped with the absolute event-scheduler cycle.
+ * Plays a .sid exactly as sidplayfp would and emits (see docs/INSTRUMENTATION.md):
+ *   <prefix>.bin       SID writes (now PC-tagged) + interrupts + CPU vectors
+ *   <prefix>.ramwr.bin RAM write log (accumulators, table cursors, SMC)
+ *   <prefix>.ramrd.bin RAM read log (only with --reads)
+ *   <prefix>.cov.bin   executed-PC bitmap over play windows
+ *   <prefix>.ram       64K RAM image (relocated player code + static tables)
+ *   <prefix>.json      metadata sidecar
  */
 
 #include <cstdint>
@@ -34,10 +33,9 @@
 
 namespace {
 
-// Event record, 16 bytes, fields little-endian. Must match EVENT_DTYPE in
-// the Python package.
+// Event record, 16 bytes, fields little-endian. Must match EVENT_DTYPE.
 enum EventType : uint8_t {
-    EV_SID_WRITE  = 0,  // chip=sid index, reg=0..0x1f, value, addr=full SID addr
+    EV_SID_WRITE  = 0,  // chip=sid index, reg=0..0x1f, value, addr=full SID addr, aux=store-site PC
     EV_CIA_IRQ    = 1,  // chip=1 CIA1(IRQ)/2 CIA2(NMI), addr=timerA latch, aux=timerB latch
     EV_VIC_IRQ    = 2,  // addr=raster compare line, aux=current raster line
     EV_CPU_VECTOR = 3,  // value=vector kind (0xfe IRQ,0xfa NMI,0xfc RST), addr=handler PC
@@ -53,56 +51,111 @@ struct Record {
     uint16_t addr;
     uint16_t aux;
 };
+struct RamRec {
+    uint64_t cycle;
+    uint16_t pc;
+    uint16_t addr;
+    uint8_t  value;
+    uint8_t  kind;
+    uint16_t pad;
+};
 #pragma pack(pop)
 static_assert(sizeof(Record) == 16, "Record must be 16 bytes");
+static_assert(sizeof(RamRec) == 16, "RamRec must be 16 bytes");
 
 class TraceSink : public libsidplayfp::InstrumentSink {
 public:
-    explicit TraceSink(FILE *f) : m_file(f) { m_buf.reserve(BUF_RECS); }
+    TraceSink(FILE *ev, FILE *ramwr, FILE *ramrd, bool wantReads, uint8_t windowMask)
+        : m_ev(ev), m_ramwr(ramwr), m_ramrd(ramrd),
+          m_wantReads(wantReads), m_windowMask(windowMask) {
+        m_evbuf.reserve(BUF);
+        m_wrbuf.reserve(BUF);
+        m_rdbuf.reserve(BUF);
+        std::memset(m_cov, 0, sizeof(m_cov));
+    }
 
     void sidWrite(int64_t cycle, int chip, uint16_t base,
-                  uint8_t reg, uint8_t value) override {
-        push({static_cast<uint64_t>(cycle), EV_SID_WRITE,
-              static_cast<uint8_t>(chip), reg, value,
-              static_cast<uint16_t>(base + reg), 0});
+                  uint8_t reg, uint8_t value, uint16_t pc) override {
+        pushEv({static_cast<uint64_t>(cycle), EV_SID_WRITE,
+                static_cast<uint8_t>(chip), reg, value,
+                static_cast<uint16_t>(base + reg), pc});
     }
 
     void ciaIrq(int64_t cycle, int source, uint16_t taLatch, uint16_t tbLatch) override {
-        push({static_cast<uint64_t>(cycle), EV_CIA_IRQ,
-              static_cast<uint8_t>(source), 0, 0, taLatch, tbLatch});
+        pushEv({static_cast<uint64_t>(cycle), EV_CIA_IRQ,
+                static_cast<uint8_t>(source), 0, 0, taLatch, tbLatch});
     }
 
     void vicIrq(int64_t cycle, unsigned rasterY, unsigned rasterCmp) override {
-        push({static_cast<uint64_t>(cycle), EV_VIC_IRQ, 3, 0, 0,
-              static_cast<uint16_t>(rasterCmp), static_cast<uint16_t>(rasterY)});
+        pushEv({static_cast<uint64_t>(cycle), EV_VIC_IRQ, 3, 0, 0,
+                static_cast<uint16_t>(rasterCmp), static_cast<uint16_t>(rasterY)});
     }
 
     void cpuVector(int64_t cycle, uint8_t kind, uint16_t pc) override {
-        push({static_cast<uint64_t>(cycle), EV_CPU_VECTOR, 0, 0, kind, pc, 0});
+        pushEv({static_cast<uint64_t>(cycle), EV_CPU_VECTOR, 0, 0, kind, pc, 0});
     }
+
+    void ramWrite(int64_t cycle, uint16_t pc, uint16_t addr, uint8_t value, uint8_t kind) override {
+        if (!windowWanted(kind) || m_ramwr == nullptr) return;
+        m_wrbuf.push_back({static_cast<uint64_t>(cycle), pc, addr, value, kind, 0});
+        ++m_nwr;
+        if (m_wrbuf.size() >= BUF) flushBuf(m_wrbuf, m_ramwr);
+    }
+
+    void ramRead(int64_t cycle, uint16_t pc, uint16_t addr, uint8_t value, uint8_t kind) override {
+        if (!windowWanted(kind) || m_ramrd == nullptr) return;
+        m_rdbuf.push_back({static_cast<uint64_t>(cycle), pc, addr, value, kind, 0});
+        ++m_nrd;
+        if (m_rdbuf.size() >= BUF) flushBuf(m_rdbuf, m_ramrd);
+    }
+
+    void cpuExec(uint16_t pc, uint8_t kind) override {
+        if (!windowWanted(kind)) return;
+        m_cov[pc >> 3] |= static_cast<uint8_t>(1u << (pc & 7));
+    }
+
+    bool wantReads() const override { return m_wantReads; }
 
     void flush() {
-        if (!m_buf.empty()) {
-            std::fwrite(m_buf.data(), sizeof(Record), m_buf.size(), m_file);
-            m_buf.clear();
-        }
+        if (!m_evbuf.empty()) { std::fwrite(m_evbuf.data(), sizeof(Record), m_evbuf.size(), m_ev); m_evbuf.clear(); }
+        flushBuf(m_wrbuf, m_ramwr);
+        flushBuf(m_rdbuf, m_ramrd);
     }
 
-    uint64_t count() const { return m_count; }
+    void writeCoverage(FILE *f) const { std::fwrite(m_cov, 1, sizeof(m_cov), f); }
+
+    uint64_t evCount() const { return m_nev; }
+    uint64_t wrCount() const { return m_nwr; }
+    uint64_t rdCount() const { return m_nrd; }
+    unsigned coverageCount() const {
+        unsigned n = 0;
+        for (unsigned char b : m_cov) n += __builtin_popcount(b);
+        return n;
+    }
 
 private:
-    static const size_t BUF_RECS = 65536;
+    static const size_t BUF = 65536;
 
-    void push(const Record &r) {
-        m_buf.push_back(r);
-        ++m_count;
-        if (m_buf.size() >= BUF_RECS)
-            flush();
+    bool windowWanted(uint8_t kind) const { return (m_windowMask & (1u << kind)) != 0; }
+
+    void pushEv(const Record &r) {
+        m_evbuf.push_back(r);
+        ++m_nev;
+        if (m_evbuf.size() >= BUF) { std::fwrite(m_evbuf.data(), sizeof(Record), m_evbuf.size(), m_ev); m_evbuf.clear(); }
     }
 
-    FILE *m_file;
-    std::vector<Record> m_buf;
-    uint64_t m_count = 0;
+    static void flushBuf(std::vector<RamRec> &buf, FILE *f) {
+        if (f != nullptr && !buf.empty()) std::fwrite(buf.data(), sizeof(RamRec), buf.size(), f);
+        buf.clear();
+    }
+
+    FILE *m_ev, *m_ramwr, *m_ramrd;
+    bool m_wantReads;
+    uint8_t m_windowMask;
+    std::vector<Record> m_evbuf;
+    std::vector<RamRec> m_wrbuf, m_rdbuf;
+    uint8_t m_cov[8192];
+    uint64_t m_nev = 0, m_nwr = 0, m_nrd = 0;
 };
 
 struct Options {
@@ -116,26 +169,32 @@ struct Options {
     bool forceSid = false;
     SidConfig::sid_model_t sidmodel = SidConfig::MOS6581;
     std::string kernal, basic, chargen;
-    // Fixed power-on delay for byte-exact determinism. libsidplayfp's default
-    // (DEFAULT_POWER_ON_DELAY > MAX_POWER_ON_DELAY) draws a random delay from a
-    // wall-clock-time-seeded RNG, which would make the cycle timeline differ
-    // run to run. Pinning it (<= MAX_POWER_ON_DELAY) skips that path entirely.
-    unsigned powerOnDelay = 0;
+    unsigned powerOnDelay = 0;   // fixed for byte-exact determinism (see README)
+    bool reads = false;
+    bool ramwrites = true;
+    bool coverage = true;
+    bool ramimage = true;
+    uint8_t windowMask = 0x3;    // bit0=IRQ, bit1=NMI; default both
+    double ramDumpSeconds = 0.0; // dump RAM image at first play window after init
 };
 
 void usage(const char *argv0) {
     std::fprintf(stderr,
         "usage: %s [options] <file.sid>\n"
-        "  --song N         subtune (1-based; 0=tune default)\n"
-        "  --seconds S      emulated seconds to trace (default 10)\n"
-        "  --out PREFIX     output prefix (writes PREFIX.bin, PREFIX.json)\n"
-        "  --frequency HZ   SID sampling frequency (default 48000)\n"
-        "  --model M        force c64 model: pal|ntsc|old-ntsc|drean|palm\n"
-        "  --sid M          force sid model: 6581|8580\n"
+        "  --song N            subtune (1-based; 0=tune default)\n"
+        "  --seconds S         emulated seconds to trace (default 10)\n"
+        "  --out PREFIX        output prefix\n"
+        "  --frequency HZ      SID sampling frequency (default 48000)\n"
+        "  --model M           force c64 model: pal|ntsc|old-ntsc|drean|palm\n"
+        "  --sid M             force sid model: 6581|8580\n"
         "  --power-on-delay N  fixed power-on delay cycles for determinism (default 0)\n"
-        "  --kernal PATH    KERNAL ROM (8192 bytes; needed for most RSID)\n"
-        "  --basic PATH     BASIC ROM (8192 bytes)\n"
-        "  --chargen PATH   CHARGEN ROM (4096 bytes)\n",
+        "  --window W          play-window source: irq|nmi|both (default both)\n"
+        "  --reads             also emit the RAM read log (large)\n"
+        "  --no-ramwrites      do not emit the RAM write log\n"
+        "  --no-coverage       do not emit the PC coverage bitmap\n"
+        "  --no-ram            do not dump the RAM image\n"
+        "  --ram-dump-seconds S  emulated time to capture the RAM image (default 0)\n"
+        "  --kernal/--basic/--chargen PATH   ROM images (RSID needs KERNAL)\n",
         argv0);
 }
 
@@ -181,7 +240,6 @@ const char *clockName(SidTuneInfo::clock_t c) {
     }
 }
 
-// Nominal CPU clock (Hz) for the effective C64 model.
 double cpuHz(SidConfig::c64_model_t m) {
     switch (m) {
         case SidConfig::NTSC:
@@ -223,6 +281,18 @@ int main(int argc, char **argv) {
             else { std::fprintf(stderr, "unknown sid %s\n", m.c_str()); return 2; }
         }
         else if (a == "--power-on-delay") opt.powerOnDelay = std::strtoul(next("--power-on-delay").c_str(), nullptr, 10);
+        else if (a == "--window") {
+            std::string w = next("--window");
+            if (w == "irq") opt.windowMask = 0x1;
+            else if (w == "nmi") opt.windowMask = 0x2;
+            else if (w == "both") opt.windowMask = 0x3;
+            else { std::fprintf(stderr, "unknown window %s\n", w.c_str()); return 2; }
+        }
+        else if (a == "--reads") opt.reads = true;
+        else if (a == "--no-ramwrites") opt.ramwrites = false;
+        else if (a == "--no-coverage") opt.coverage = false;
+        else if (a == "--no-ram") opt.ramimage = false;
+        else if (a == "--ram-dump-seconds") opt.ramDumpSeconds = std::strtod(next("--ram-dump-seconds").c_str(), nullptr);
         else if (a == "--kernal") opt.kernal = next("--kernal");
         else if (a == "--basic") opt.basic = next("--basic");
         else if (a == "--chargen") opt.chargen = next("--chargen");
@@ -257,11 +327,8 @@ int main(int argc, char **argv) {
 
     ReSIDfpBuilder builder("residfp");
 
-    // Configure BEFORE load(). load() runs the power-on warm-up using the
-    // engine's current config; if we configured after load(), that warm-up
-    // would already have run with the default (random, time-seeded)
-    // powerOnDelay, leaving a random absolute-cycle baseline. Setting the
-    // fixed powerOnDelay first makes the single warm-up deterministic.
+    // Configure BEFORE load() so the single power-on warm-up uses the fixed
+    // (deterministic) powerOnDelay rather than the default random one.
     SidConfig cfg = engine.config();
     cfg.frequency = opt.frequency;
     cfg.samplingMethod = SidConfig::INTERPOLATE;
@@ -270,14 +337,12 @@ int main(int argc, char **argv) {
     if (opt.forceC64) cfg.defaultC64Model = opt.c64model;
     cfg.forceSidModel = opt.forceSid;
     if (opt.forceSid) cfg.defaultSidModel = opt.sidmodel;
-    // Force a deterministic power-on delay (see Options::powerOnDelay).
     cfg.powerOnDelay = static_cast<uint_least16_t>(opt.powerOnDelay & SidConfig::MAX_POWER_ON_DELAY);
 
     if (!engine.config(cfg)) {
         std::fprintf(stderr, "engine config failed: %s\n", engine.error());
         return 1;
     }
-
     if (!engine.load(&tune)) {
         std::fprintf(stderr, "engine load failed: %s\n", engine.error());
         return 1;
@@ -286,49 +351,77 @@ int main(int argc, char **argv) {
     const SidTuneInfo *ti = tune.getInfo();
     const SidInfo &si = engine.info();
 
-    // Effective C64 model (mirrors libsidplayfp model selection).
     SidConfig::c64_model_t eff = cfg.defaultC64Model;
     if (!opt.forceC64) {
         switch (ti->clockSpeed()) {
             case SidTuneInfo::CLOCK_NTSC: eff = SidConfig::NTSC; break;
             case SidTuneInfo::CLOCK_PAL:  eff = SidConfig::PAL;  break;
-            default: break; // ANY/UNKNOWN keep default
+            default: break;
         }
     }
     const double hz = cpuHz(eff);
 
     const std::string binPath = opt.prefix + ".bin";
+    const std::string ramwrPath = opt.prefix + ".ramwr.bin";
+    const std::string ramrdPath = opt.prefix + ".ramrd.bin";
+    const std::string covPath = opt.prefix + ".cov.bin";
+    const std::string ramPath = opt.prefix + ".ram";
     const std::string jsonPath = opt.prefix + ".json";
 
     FILE *bin = std::fopen(binPath.c_str(), "wb");
     if (!bin) { std::fprintf(stderr, "cannot open %s\n", binPath.c_str()); return 1; }
+    FILE *ramwr = opt.ramwrites ? std::fopen(ramwrPath.c_str(), "wb") : nullptr;
+    FILE *ramrd = opt.reads ? std::fopen(ramrdPath.c_str(), "wb") : nullptr;
 
-    TraceSink sink(bin);
+    TraceSink sink(bin, ramwr, ramrd, opt.reads, opt.windowMask);
     libsidplayfp::setInstrumentSink(&sink);
 
     const uint_least32_t targetMs = static_cast<uint_least32_t>(opt.seconds * 1000.0 + 0.5);
+    const uint_least32_t dumpMs = static_cast<uint_least32_t>(opt.ramDumpSeconds * 1000.0 + 0.5);
     const unsigned CHUNK = 10000;
     bool ok = true;
+    bool ramDumped = false;
+    std::vector<uint8_t> ramImg(0x10000);
+    uint64_t ramDumpCycle = 0;
+
     while (engine.timeMs() < targetMs) {
         if (engine.play(CHUNK) < 0) {
             std::fprintf(stderr, "play error: %s\n", engine.error());
             ok = false;
             break;
         }
+        if (!ramDumped && engine.timeMs() >= dumpMs) {
+            engine.getRam(ramImg.data());
+            ramDumped = true;
+            ramDumpCycle = static_cast<uint64_t>(engine.timeMs());
+        }
     }
+    if (!ramDumped) { engine.getRam(ramImg.data()); ramDumpCycle = static_cast<uint64_t>(engine.timeMs()); }
 
     libsidplayfp::setInstrumentSink(nullptr);
     sink.flush();
     std::fclose(bin);
+    if (ramwr) std::fclose(ramwr);
+    if (ramrd) std::fclose(ramrd);
 
-    // Metadata sidecar.
+    if (opt.coverage) {
+        FILE *cov = std::fopen(covPath.c_str(), "wb");
+        if (cov) { sink.writeCoverage(cov); std::fclose(cov); }
+    }
+    if (opt.ramimage) {
+        FILE *rf = std::fopen(ramPath.c_str(), "wb");
+        if (rf) { std::fwrite(ramImg.data(), 1, ramImg.size(), rf); std::fclose(rf); }
+    }
+
     auto info = [&](unsigned i) -> const char * {
         return (i < ti->numberOfInfoStrings()) ? ti->infoString(i) : "";
     };
+    const char *windowStr = opt.windowMask == 0x1 ? "irq" : opt.windowMask == 0x2 ? "nmi" : "both";
+
     std::string j = "{\n";
-    j += "  \"schema_version\": 1,\n";
+    j += "  \"schema_version\": 2,\n";
     j += "  \"record_size\": 16,\n";
-    j += "  \"num_records\": " + std::to_string(sink.count()) + ",\n";
+    j += "  \"num_records\": " + std::to_string(sink.evCount()) + ",\n";
     j += "  \"bin\": "; jsonStr(j, binPath.c_str()); j += ",\n";
     j += "  \"input\": "; jsonStr(j, opt.input.c_str()); j += ",\n";
     j += "  \"title\": "; jsonStr(j, info(0)); j += ",\n";
@@ -348,16 +441,28 @@ int main(int argc, char **argv) {
     j += "  \"num_sids\": " + std::to_string(si.numberOfSIDs()) + ",\n";
     j += "  \"sid_count\": " + std::to_string(ti->sidChips()) + ",\n";
     j += "  \"sid_base\": [";
-    for (int i = 0; i < ti->sidChips(); ++i) {
-        if (i) j += ", ";
-        j += std::to_string(ti->sidChipBase(i));
-    }
+    for (int i = 0; i < ti->sidChips(); ++i) { if (i) j += ", "; j += std::to_string(ti->sidChipBase(i)); }
     j += "],\n";
     j += "  \"seconds\": " + std::to_string(opt.seconds) + ",\n";
     j += "  \"frequency\": " + std::to_string(opt.frequency) + ",\n";
     j += "  \"power_on_delay\": " + std::to_string(opt.powerOnDelay & SidConfig::MAX_POWER_ON_DELAY) + ",\n";
     j += "  \"deterministic\": true,\n";
-    j += "  \"event_types\": {\"SID_WRITE\": 0, \"CIA_IRQ\": 1, \"VIC_IRQ\": 2, \"CPU_VECTOR\": 3}\n";
+    j += "  \"window\": "; jsonStr(j, windowStr); j += ",\n";
+    j += "  \"reads_enabled\": "; j += (opt.reads ? "true" : "false"); j += ",\n";
+    j += "  \"ram_dump_cycle\": " + std::to_string(ramDumpCycle) + ",\n";
+    j += "  \"num_ram_writes\": " + std::to_string(sink.wrCount()) + ",\n";
+    j += "  \"num_ram_reads\": " + std::to_string(sink.rdCount()) + ",\n";
+    j += "  \"coverage_count\": " + std::to_string(sink.coverageCount()) + ",\n";
+    j += "  \"artifacts\": {";
+    j += "\"sidwr\": "; jsonStr(j, binPath.c_str());
+    if (opt.ramwrites) { j += ", \"ramwr\": "; jsonStr(j, ramwrPath.c_str()); }
+    if (opt.reads)     { j += ", \"ramrd\": "; jsonStr(j, ramrdPath.c_str()); }
+    if (opt.coverage)  { j += ", \"cov\": "; jsonStr(j, covPath.c_str()); }
+    if (opt.ramimage)  { j += ", \"ram\": "; jsonStr(j, ramPath.c_str()); }
+    j += "},\n";
+    j += "  \"ramacc_fields\": [\"cycle\", \"pc\", \"addr\", \"value\", \"kind\", \"pad\"],\n";
+    j += "  \"event_types\": {\"SID_WRITE\": 0, \"CIA_IRQ\": 1, \"VIC_IRQ\": 2, \"CPU_VECTOR\": 3},\n";
+    j += "  \"window_kinds\": {\"IRQ\": 0, \"NMI\": 1}\n";
     j += "}\n";
 
     FILE *jf = std::fopen(jsonPath.c_str(), "wb");
@@ -365,7 +470,9 @@ int main(int argc, char **argv) {
     std::fwrite(j.data(), 1, j.size(), jf);
     std::fclose(jf);
 
-    std::fprintf(stderr, "%s: %llu records -> %s (%s)\n", opt.input.c_str(),
-                 static_cast<unsigned long long>(sink.count()), binPath.c_str(), jsonPath.c_str());
+    std::fprintf(stderr, "%s: %llu events, %llu ramwr, cov=%u -> %s\n", opt.input.c_str(),
+                 static_cast<unsigned long long>(sink.evCount()),
+                 static_cast<unsigned long long>(sink.wrCount()),
+                 sink.coverageCount(), binPath.c_str());
     return ok ? 0 : 1;
 }
