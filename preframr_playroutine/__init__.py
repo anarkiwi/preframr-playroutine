@@ -27,6 +27,8 @@ from .recover import (
     correlate_event_reset,
     detect_table_walk,
     fit_bacc,
+    reconstruct_register,
+    round_trip,
     segmented_bacc,
     state_sequence,
     voice_events,
@@ -60,4 +62,6 @@ __all__ = [
     "correlate_event_reset",
     "voice_events",
     "analyze",
+    "reconstruct_register",
+    "round_trip",
 ]

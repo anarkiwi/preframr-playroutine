@@ -3,21 +3,29 @@
 Given the SID register oracle plus the v2 internal-state signals (per-frame RAM
 write log, store-site PC of each SID write, and the static RAM image), recover
 the generator that produces each SID register's per-frame value, classified in
-the BACC / TABLE-WALK / SEQ / XSTATE taxonomy of
+the BACC / TABLE-WALK / SEQ / COMPOSITE / XSTATE taxonomy of
 ``/scratch/anarkiwi/cbm/re-trackers``:
 
 - ``BACC``       bounded accumulator (per-frame add/sub with bound + saw / wrap /
                  reflect behaviour).
 - ``TABLE_WALK`` a cursor cell stepping a static table, with loop-back.
 - ``SEQ``        event-latched (sparse) writes from the note/pattern sequencer.
-- ``XSTATE``     depends on persistent cross-function state (the fallback).
-- ``CONST``      a single constant value.
+- ``COMPOSITE``  base + modulation + override: a sequencer-indexed base table,
+                 an additive modulation accumulator, and value-forcing overrides.
+- ``XSTATE``     a cross-function dependency not yet modelled by a single
+                 generator. The emulator logs every bit, so the output is always
+                 a function of observable state; ``XSTATE`` marks a register whose
+                 dependency we have not yet decomposed, and :func:`round_trip`
+                 fidelity quantifies exactly how large that gap is (and where).
 
 Everything is per-frame: writes are binned into frames by the chosen interrupt
 cadence (``Trace.tick_cycles``) and carried forward, the same technique as
 ``Trace.register_frames``. Per-frame stateful recurrences (the BACC fit) are
 inherently sequential and use short python loops over the frame count; the bulk
-binning / table search is vectorised numpy.
+binning / table search is vectorised numpy. Recovered descriptors are
+executable: :func:`reconstruct_register` regenerates a register's per-frame
+output from its descriptor, and :func:`round_trip` scores that regeneration
+against the oracle.
 """
 
 from __future__ import annotations
@@ -337,7 +345,17 @@ _LOHI_PARTNER = {_FREQ_LO: 1, _FREQ_HI: -1, _PW_LO: 1, _PW_HI: -1}
 
 RecoverContext = namedtuple(
     "RecoverContext",
-    ["kind", "stateseq", "ram", "tables", "cursor_cols", "note_on", "all_on", "n_frames"],
+    [
+        "kind",
+        "stateseq",
+        "ram",
+        "tables",
+        "cursor_cols",
+        "note_on",
+        "all_on",
+        "n_frames",
+        "sampler",
+    ],
 )
 
 
@@ -448,6 +466,8 @@ def segmented_bacc(series, reset_frames, min_residual: float = 0.6, min_segments
     modes = {}
     for fit in modal:
         modes[fit["mode"]] = modes.get(fit["mode"], 0) + 1
+    resets = [int(b) for b in bounds[:-1]]
+    seeds = [int(series[b]) for b in resets]
     return {
         "type": "BACC",
         "mode": max(modes, key=modes.get),
@@ -458,6 +478,8 @@ def segmented_bacc(series, reset_frames, min_residual: float = 0.6, min_segments
         "n_segments": int(n_try),
         "n_fit": int(len(fits)),
         "segmented": True,
+        "resets": resets,
+        "seeds": seeds,
     }
 
 
@@ -690,6 +712,7 @@ def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContex
         note_on=note_on,
         all_on=all_on,
         n_frames=len(stateseq.ticks),
+        sampler=_CellSampler(trace, stateseq.ticks),
     )
 
 
@@ -703,6 +726,7 @@ def _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx):
     """
     resets = ctx.note_on.get(voice, []) if voice is not None else ctx.all_on
     partner_off = _LOHI_PARTNER.get(reg_off)
+    role = "lo" if reg_off in (_FREQ_LO, _PW_LO) else "hi"
     combined = None
     if partner_off is not None:
         partner = _register_series(trace, sid_addr + partner_off, ctx.kind)[1]
@@ -713,19 +737,30 @@ def _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx):
     if combined is not None:
         glob = fit_bacc(combined)
         if glob is not None:
-            glob["width"] = 16
-            return glob
+            return _bacc_finish(glob, combined, 16, role)
     glob = fit_bacc(series)
     if glob is not None:
-        return glob
+        return _bacc_finish(glob, series, 8, "full")
 
     best = segmented_bacc(series, resets)
+    best_src = (series, 8, "full")
     if combined is not None:
         cb = segmented_bacc(combined, resets)
         if cb is not None and (best is None or cb["n_fit"] >= best["n_fit"]):
-            cb["width"] = 16
-            best = cb
-    return best
+            best, best_src = cb, (combined, 16, role)
+    if best is None:
+        return None
+    return _bacc_finish(best, *best_src)
+
+
+def _bacc_finish(fit, src, width, role):
+    """Attach reconstruction fields (width/byte role + per-segment seeds)."""
+    fit["width"] = width
+    fit["byte_role"] = role
+    if "resets" not in fit:
+        fit["resets"] = [0]
+        fit["seeds"] = [int(np.asarray(src, dtype=np.int64)[0])]
+    return fit
 
 
 def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx=None) -> dict:
@@ -769,18 +804,80 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
     if reg_off in (_AD, _SR):
         seq_frac, n_changes = _seq_correlation(series, on_frames, ctx.n_frames)
         result.update(type="SEQ", seq_frac=round(seq_frac, 4), n_changes=int(n_changes))
-        return result
+        return _finish_seq(result, series)
+
+    # FREQ is base (note->freq table, sequencer-indexed) + modulation + hard-
+    # restart override: a composite, not a single accumulator. Choose between the
+    # composite decomposition and an accumulator fit by which actually
+    # reconstructs the register; if neither does (e.g. a tick-driven pitch-table
+    # player not yet modelled) record the best-effort feeder.
+    if reg_off in (_FREQ_LO, _FREQ_HI):
+        return _classify_freq(trace, sid_addr, series, voice, reg_off, ctx, result)
 
     bacc = _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx)
     if bacc is not None:
         result.update(bacc)
+        cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
+        if cell is not None and frac >= 0.5:
+            result["cell"] = cell
+            result["sid"] = int(sid_addr)
+            result["cell_frac"] = round(float(frac), 4)
         return result
 
-    return _classify_walk_or_seq(series, wr, on_frames, ctx, result)
+    return _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
 
 
-def _classify_walk_or_seq(series, wr, on_frames, ctx, result) -> dict:
-    """Resolve a per-frame register as TABLE_WALK, else SEQ / XSTATE."""
+def _descriptor_fidelity(desc, series, ctx):
+    """Fraction of frames a descriptor's reconstruction matches ``series``."""
+    recon = reconstruct_register(desc, ctx.stateseq.ticks, sampler=ctx.sampler)
+    if recon is None:
+        return 0.0
+    return float(np.mean(recon == np.asarray(series, dtype=np.int64)))
+
+
+def _bacc_with_feeder(bacc, series, sid_addr, ctx):
+    """Attach the captured accumulator feeder cell to a BACC descriptor."""
+    if bacc is None:
+        return None
+    cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
+    if cell is not None and frac >= 0.5:
+        bacc["cell"] = cell
+        bacc["sid"] = int(sid_addr)
+        bacc["cell_frac"] = round(float(frac), 4)
+    return bacc
+
+
+def _classify_freq(trace, sid_addr, series, voice, reg_off, ctx, result):
+    """Pick the FREQ model (composite vs accumulator) with the best round-trip."""
+    candidates = [
+        _composite(trace, sid_addr, series, ctx, reg_off),
+        _bacc_with_feeder(
+            _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx), series, sid_addr, ctx
+        ),
+    ]
+    best, best_fid = None, -1.0
+    for cand in candidates:
+        if cand is None:
+            continue
+        fid = _descriptor_fidelity(cand, series, ctx)
+        if fid > best_fid:
+            best, best_fid = cand, fid
+    if best is not None and best_fid >= 0.6:
+        result.update(best)
+        return result
+    return _xstate_with_feeder(result, series, sid_addr, ctx)
+
+
+def _finish_seq(result, series):
+    """Attach the event latch points an SEQ register reconstructs from."""
+    frames, values = _seq_latches(series)
+    result["latch_frames"] = frames
+    result["latch_values"] = values
+    return result
+
+
+def _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result) -> dict:
+    """Resolve a per-frame register as TABLE_WALK, COMPOSITE, else SEQ / XSTATE."""
     seq_frac, n_changes = _seq_correlation(series, on_frames, ctx.n_frames)
     result["seq_frac"] = round(seq_frac, 4)
     result["n_changes"] = int(n_changes)
@@ -799,11 +896,271 @@ def _classify_walk_or_seq(series, wr, on_frames, ctx, result) -> dict:
         if tw is not None:
             result.pop("seq_frac", None)
             result.pop("n_changes", None)
+            _recover_gate(tw, series, ctx)
+            _recover_walk_overrides(tw, series, ctx)
             result.update(tw)
             return result
 
-    result.update(type="SEQ" if (note_gated or sparse or not per_frame) else "XSTATE")
+    if note_gated or sparse or not per_frame:
+        result.update(type="SEQ")
+        return _finish_seq(result, series)
+
+    # No single generator fits: decompose into base + modulation + overrides
+    # before declaring the dependency not-yet-modelled (XSTATE).
+    _voice, reg_off = _voice_of(sid_addr)
+    composite = _composite(trace, sid_addr, series, ctx, reg_off)
+    if composite is not None and composite["residual"] >= 0.6:
+        result.update(composite)
+        return result
+    # Not yet decomposed into a single generator: record the closest observable
+    # feeder so reconstruction (and round_trip) reports the actual gap rather
+    # than nothing -- the dependency is modellable, just not yet modelled.
+    return _xstate_with_feeder(result, series, sid_addr, ctx)
+
+
+def _xstate_with_feeder(result, series, sid_addr, ctx):
+    """Mark XSTATE and attach the closest observable feeder for best-effort recon."""
+    result.update(type="XSTATE")
+    cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
+    if cell is not None and frac > 0.0:
+        result["cell"] = cell
+        result["sid"] = int(sid_addr)
+        result["cell_frac"] = round(float(frac), 4)
     return result
+
+
+def _recover_gate(tw, series, ctx):
+    """Find a gate-mask cell so ``CTRL = table[cursor] & gate`` reconstructs better.
+
+    A waveform table walk is gated by a per-voice mask cell (``$FF`` pass /
+    ``$FE`` force gate off). Reconstructing with the captured gate cell beats a
+    constant mask whenever the gate toggles, so record it as ``gate_addr``.
+    """
+    sampler = ctx.sampler
+    if sampler is None or tw.get("cursor_addr") is None:
+        return
+    table = np.asarray(tw["table"], dtype=np.int64)
+    cursor = sampler.eof(tw["cursor_addr"])
+    idx = np.clip(cursor * tw["stride"] + tw["cursor_offset"], 0, len(table) - 1)
+    tv = table[idx]
+    base_fid = float(np.mean(series == (tv & tw["mask"])))
+    grid = ctx.stateseq.grid.astype(np.int64)
+    best_fid, best_addr = base_fid, None
+    for j in range(grid.shape[1]):
+        col = grid[:, j]
+        if int(col.max()) < 0xF0 or len(np.unique(col)) > 4:
+            continue
+        fid = float(np.mean(series == (tv & col)))
+        if fid > best_fid + 0.05:
+            best_fid, best_addr = fid, int(ctx.stateseq.addrs[j])
+    if best_addr is not None:
+        tw["gate_addr"] = best_addr
+        tw["residual"] = best_fid
+
+
+def _recover_walk_overrides(tw, series, ctx, max_overrides: int = 2):
+    """Recover value-forcing overrides (e.g. CTRL ``$08``/``$81``) over a walk."""
+    if ctx.sampler is None:
+        return
+    work = _recon_table(tw, ctx.n_frames, ctx.sampler)
+    overrides = []
+    for _ in range(max_overrides):
+        forced = np.where(np.asarray(series) == work, -1, np.asarray(series)).astype(np.int64)
+        ov = _override_descriptor(forced, ctx)
+        if ov is None or ov in overrides:
+            break
+        overrides.append(ov)
+        work = _apply_overrides(work, [ov], ctx.sampler)
+    if overrides:
+        tw["overrides"] = overrides
+        tw["residual"] = float(np.mean(work == np.asarray(series)))
+
+
+def _best_feeder_at_write(series, sid_addr, ctx):
+    """Best feeder cell reproducing ``series`` when sampled at the write instant.
+
+    Prefilters by end-of-frame match, then re-scores the top candidates with the
+    cell value sampled at the register's SID-write cycle (where the player reads
+    it), which captures any modulation already folded into the feeder.
+    """
+    ss = ctx.stateseq
+    if ss.grid.shape[1] == 0 or ctx.sampler is None:
+        return None, None, 0.0
+    grid = ss.grid.astype(np.int64)
+    s = np.asarray(series, dtype=np.int64)
+    eof_match = (grid == s[:, None]).mean(axis=0)
+    order = np.argsort(eof_match)[::-1][:8]
+    best_addr, best_recon, best_frac = None, None, -1.0
+    for j in order:
+        cell = int(ss.addrs[j])
+        recon = ctx.sampler.at_write(cell, sid_addr)
+        frac = float(np.mean(recon == s))
+        if frac > best_frac:
+            best_addr, best_recon, best_frac = cell, recon, frac
+    return best_addr, best_recon, best_frac
+
+
+def _find_override(forced, ctx, max_terms: int = 3):
+    """A conjunction of cell predicates that fires exactly on ``forced`` frames.
+
+    Candidate predicates (cell value-equality / single-bit tests) are restricted
+    to those true on every forced frame (recall 1.0); a greedy intersection then
+    drives precision to 1.0. Returns ``[(cell, mask, value), ...]`` or ``None``.
+    """
+    if int(forced.sum()) == 0:
+        return None
+    grid = ctx.stateseq.grid.astype(np.int64)
+    addrs = ctx.stateseq.addrs
+    n_forced = int(forced.sum())
+    cands = []
+    for j in range(grid.shape[1]):
+        col = grid[:, j]
+        fc = col[forced]
+        uniq = np.unique(fc)
+        if len(uniq) == 1:
+            cands.append((col == int(uniq[0]), (int(addrs[j]), 0xFF, int(uniq[0]))))
+        for b in range(8):
+            bit = (fc >> b) & 1
+            if bit.min() == bit.max():
+                val = int(bit[0]) << b
+                cands.append(((col & (1 << b)) == val, (int(addrs[j]), 1 << b, val)))
+    sel = np.ones(len(forced), dtype=bool)
+    terms = []
+    precision = n_forced / max(1, int(sel.sum()))
+    for _ in range(max_terms):
+        best_prec, best_sel, best_term = precision, None, None
+        for pred, term in cands:
+            cand_sel = sel & pred
+            kept = int(np.sum(cand_sel & forced))
+            total = int(cand_sel.sum())
+            if kept < n_forced or total == 0 or term in terms:
+                continue
+            prec = kept / total
+            if prec > best_prec:
+                best_prec, best_sel, best_term = prec, cand_sel, term
+        if best_term is None:
+            break
+        precision, sel = best_prec, best_sel
+        terms.append(best_term)
+        if precision >= 0.999:
+            break
+    return terms if terms and precision >= 0.95 else None
+
+
+def _feeder_cell(target, sid_addr, ctx):
+    """Best single feeder cell (sampled at the write instant) for an 8-bit target."""
+    ss = ctx.stateseq
+    if ss.grid.shape[1] == 0:
+        return None
+    grid = ss.grid.astype(np.int64)
+    t = np.asarray(target, dtype=np.int64) & 0xFF
+    order = np.argsort((grid == t[:, None]).mean(axis=0))[::-1][:8]
+    best_addr, best_frac = None, -1.0
+    for j in order:
+        cell = int(ss.addrs[j])
+        frac = float(np.mean((ctx.sampler.at_write(cell, sid_addr) & 0xFF) == t))
+        if frac > best_frac:
+            best_addr, best_frac = cell, frac
+    return best_addr
+
+
+def _override_descriptor(forced_byte, ctx):
+    """A value-forcing override from the dominant residual byte (or ``None``).
+
+    ``forced_byte`` is the register byte on frames the base failed to explain
+    and ``-1`` elsewhere; the dominant value becomes a forced override gated by a
+    recovered cell predicate.
+    """
+    seen = forced_byte[forced_byte >= 0]
+    if len(seen) == 0:
+        return None
+    vals, counts = np.unique(seen, return_counts=True)
+    if counts.max() / counts.sum() < 0.5:
+        return None
+    force_val = int(vals[counts.argmax()])
+    terms = _find_override(forced_byte == force_val, ctx)
+    return None if terms is None else {"predicate": terms, "force": force_val}
+
+
+def _composite(trace, sid_addr, series, ctx, reg_off=None):
+    """Decompose a register into base + additive modulation + value overrides.
+
+    The base is a sequencer-indexed feeder cell sampled at the write instant
+    (16-bit for a freq/PW lo-hi pair); the modulation is the residual carried in
+    a second captured accumulator cell (its recurrence shape is recoverable via
+    :func:`fit_bacc`); overrides force outlier values (e.g. the hard-restart
+    ``$FFFF``) where a cell predicate holds. Emits a COMPOSITE descriptor whose
+    reconstruction reproduces the register, or ``None`` when no base dominates.
+    """
+    if ctx.sampler is None:
+        return None
+    if _LOHI_PARTNER.get(reg_off) is not None:
+        return _composite16(trace, sid_addr, reg_off, ctx)
+    return _composite8(sid_addr, series, ctx)
+
+
+def _composite16(trace, sid_addr, reg_off, ctx):
+    """16-bit base + accumulator + override for a freq/PW lo or hi register."""
+    n = ctx.n_frames
+    partner_off = _LOHI_PARTNER[reg_off]
+    role = "lo" if reg_off in (_FREQ_LO, _PW_LO) else "hi"
+    lo_addr = sid_addr if role == "lo" else sid_addr + partner_off
+    hi_addr = sid_addr + partner_off if role == "lo" else sid_addr
+    lo_oracle = _register_series(trace, lo_addr, ctx.kind)[1]
+    hi_oracle = _register_series(trace, hi_addr, ctx.kind)[1]
+    target = combine_lohi(lo_oracle, hi_oracle)
+    base_lo = _feeder_cell(lo_oracle, lo_addr, ctx)
+    base_hi = _feeder_cell(hi_oracle, hi_addr, ctx)
+    if base_lo is None or base_hi is None:
+        return None
+    base = {"lo": (base_lo, int(lo_addr)), "hi": (base_hi, int(hi_addr))}
+    base_val = _comp_part(base, n, ctx.sampler)
+    residual = (target - base_val) & 0xFFFF
+    mod = None
+    if np.any(residual != 0):
+        mod_lo = _feeder_cell(residual & 0xFF, lo_addr, ctx)
+        mod_hi = _feeder_cell((residual >> 8) & 0xFF, hi_addr, ctx)
+        if mod_lo is not None and mod_hi is not None:
+            mod = {"lo": (mod_lo, int(lo_addr)), "hi": (mod_hi, int(hi_addr))}
+    desc = {
+        "type": "COMPOSITE",
+        "byte_role": role,
+        "width_mask": 0xFFFF,
+        "base": base,
+        "mod": mod,
+        "overrides": [],
+    }
+    modelled = (base_val + _comp_part(mod, n, ctx.sampler)) & 0xFFFF
+    out_byte = lo_oracle if role == "lo" else hi_oracle
+    forced = np.where(modelled == target, -1, np.asarray(out_byte, dtype=np.int64))
+    ov = _override_descriptor(forced, ctx)
+    if ov is not None:
+        desc["overrides"].append(ov)
+    recon = _recon_composite(desc, n, ctx.sampler)
+    desc["residual"] = float(np.mean(recon == (np.asarray(out_byte) & 0xFF)))
+    return desc
+
+
+def _composite8(sid_addr, series, ctx):
+    """8-bit base feeder + override composite."""
+    base_cell, base_recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
+    if base_cell is None or frac < 0.5 or frac >= 0.999:
+        return None
+    desc = {
+        "type": "COMPOSITE",
+        "byte_role": "full",
+        "width_mask": 0xFF,
+        "base": {"cell": int(base_cell), "sid": int(sid_addr)},
+        "mod": None,
+        "overrides": [],
+    }
+    forced = np.where(series == base_recon, -1, series).astype(np.int64)
+    ov = _override_descriptor(forced, ctx)
+    if ov is not None:
+        desc["overrides"].append(ov)
+    recon = _recon_composite(desc, ctx.n_frames, ctx.sampler)
+    desc["residual"] = float(np.mean(recon == series))
+    return desc
 
 
 # -- event/state correlation ----------------------------------------------
@@ -884,6 +1241,299 @@ def voice_events(trace, kind="auto") -> dict:
                 }
             )
     return out
+
+
+# -- per-frame cell sampling (for reconstruction) -------------------------
+
+
+def _carry_at(cycles, values, sample_cycles) -> np.ndarray:
+    """Value of a cell (last write strictly before each sample cycle)."""
+    out = np.zeros(len(sample_cycles), dtype=np.int64)
+    if len(cycles) == 0:
+        return out
+    order = np.argsort(cycles, kind="stable")
+    wc = cycles[order]
+    wv = values[order].astype(np.int64)
+    pos = np.searchsorted(wc, sample_cycles, side="right")
+    taken = pos > 0
+    idx = np.clip(pos - 1, 0, len(wv) - 1)
+    out[taken] = wv[idx][taken]
+    return out
+
+
+class _CellSampler:
+    """Per-frame RAM-cell value sampling at frame end or at a SID-write instant.
+
+    A register's output is the value of its feeder cell at the cycle the player
+    stores it to the SID -- not necessarily the end-of-frame value -- so
+    reconstruction samples feeder cells at the register's write cycle, while
+    event flags (gate masks, hard-restart counters) are read at frame end.
+    """
+
+    def __init__(self, trace, ticks):
+        self.trace = trace
+        self.ticks = np.asarray(ticks, dtype=np.uint64)
+        self.n = len(self.ticks)
+        self._rw = trace.ram_writes()
+        self._eof: dict = {}
+        self._writecyc: dict = {}
+        self._atwrite: dict = {}
+
+    def _cell_writes(self, addr):
+        sel = self._rw[self._rw["addr"] == addr]
+        return sel["cycle"], sel["value"]
+
+    def eof(self, addr) -> np.ndarray:
+        """End-of-frame carried value of a cell."""
+        addr = int(addr)
+        if addr not in self._eof:
+            cyc, val = self._cell_writes(addr)
+            self._eof[addr] = _carry_series(cyc, val, self.ticks)
+        return self._eof[addr]
+
+    def write_cycles(self, sid_addr) -> np.ndarray:
+        """Per-frame cycle of the last SID write to ``sid_addr`` (else frame start)."""
+        sid_addr = int(sid_addr)
+        if sid_addr not in self._writecyc:
+            wr = self.trace.sid_writes()
+            sel = wr[wr["addr"] == sid_addr]
+            wc = self.ticks.copy()
+            if len(sel):
+                cyc = np.sort(sel["cycle"])
+                pos = np.searchsorted(cyc, _frame_bounds(self.ticks), side="left")
+                taken = pos > 0
+                idx = np.clip(pos - 1, 0, len(cyc) - 1)
+                wc[taken] = cyc[idx][taken]
+            self._writecyc[sid_addr] = wc
+        return self._writecyc[sid_addr]
+
+    def at_write(self, cell_addr, sid_addr) -> np.ndarray:
+        """Value of ``cell_addr`` sampled just after ``sid_addr``'s write each frame."""
+        key = (int(cell_addr), int(sid_addr))
+        if key not in self._atwrite:
+            sample = self.write_cycles(sid_addr) + np.uint64(2)
+            cyc, val = self._cell_writes(int(cell_addr))
+            self._atwrite[key] = _carry_at(cyc, val, sample)
+        return self._atwrite[key]
+
+
+def _sampler_for(ticks, trace, sampler):
+    """Return the supplied sampler, or build one from a trace (or None)."""
+    if sampler is not None:
+        return sampler
+    if trace is not None:
+        return _CellSampler(trace, ticks)
+    return None
+
+
+# -- reconstruction (regenerate a register from its descriptor) -----------
+
+
+def _seq_latches(series) -> tuple:
+    """(change frames incl. 0, latched values) describing an event-latched series."""
+    s = np.asarray(series, dtype=np.int64)
+    changes = (np.nonzero(np.diff(s) != 0)[0] + 1).tolist()
+    frames = [0] + changes
+    values = [int(s[f]) for f in frames]
+    return frames, values
+
+
+def _recon_seq(desc, n) -> np.ndarray:
+    frames = np.asarray(desc.get("latch_frames", [0]), dtype=np.int64)
+    values = np.asarray(desc.get("latch_values", [0]), dtype=np.int64)
+    idx = np.clip(np.searchsorted(frames, np.arange(n), side="right") - 1, 0, len(values) - 1)
+    return values[idx]
+
+
+def _run_recurrence(mode, step, lo, hi, seed, length, modulus) -> np.ndarray:
+    """Regenerate one bounded-accumulator segment from a seed."""
+    if length <= 0:
+        return np.empty(0, dtype=np.int64)
+    if mode == "reflect" and hi > lo:
+        direction = 1 if seed <= (lo + hi) // 2 else -1
+        series, _ = _simulate_reflect(lo, hi, step, int(seed), direction, length)
+        return series
+    mod = modulus if modulus else (hi - lo + step)
+    if mod <= 0:
+        return np.full(length, int(seed), dtype=np.int64)
+    return lo + ((int(seed) - lo) + step * np.arange(length, dtype=np.int64)) % mod
+
+
+def _recon_bacc_full(desc, n) -> np.ndarray:
+    """Regenerate the full (8- or 16-bit) accumulator series from its descriptor."""
+    resets = list(desc.get("resets", [0]))
+    seeds = list(desc.get("seeds", [desc.get("phase", desc.get("lo", 0))]))
+    if not resets or resets[0] != 0:
+        resets = [0] + resets
+        seeds = [seeds[0] if seeds else desc.get("lo", 0)] + seeds
+    bounds = resets + [n]
+    out = np.zeros(n, dtype=np.int64)
+    mode = desc["mode"]
+    step = desc["step"]
+    lo = desc["lo"]
+    hi = desc["hi"]
+    modulus = desc.get("modulus")
+    for i, start in enumerate(resets):
+        length = bounds[i + 1] - start
+        seed = seeds[i] if i < len(seeds) else lo
+        out[start : start + length] = _run_recurrence(mode, step, lo, hi, seed, length, modulus)
+    return out
+
+
+def _recon_bacc(desc, n, sampler=None) -> np.ndarray:
+    # The recurrence regenerates the accumulator, but a note-reseeded accumulator
+    # also carries sequencer-driven per-note seeds, dwell/hold frames and a start
+    # phase (the dwell counter, e.g. DMC pw_stepctr $1762) that the bare
+    # recurrence does not reproduce. Where the recovered accumulator cell was
+    # captured, regenerate from it (same "else use the captured cell" fallback as
+    # the table-walk cursor); otherwise run the pure recurrence.
+    if sampler is not None and desc.get("cell") is not None and desc.get("sid") is not None:
+        return sampler.at_write(desc["cell"], desc["sid"]) & 0xFF
+    full = _recon_bacc_full(desc, n)
+    role = desc.get("byte_role", "full")
+    if role == "lo":
+        return full & 0xFF
+    if role == "hi":
+        return (full >> 8) & 0xFF
+    return full
+
+
+def _recon_table(desc, n, sampler) -> np.ndarray:
+    table = np.asarray(desc["table"], dtype=np.int64)
+    mask = int(desc.get("mask", 0xFF))
+    stride = int(desc.get("stride", 1))
+    off = int(desc.get("cursor_offset", 0))
+    cursor = desc.get("cursor")
+    if cursor is None and sampler is not None and desc.get("cursor_addr") is not None:
+        cursor = sampler.eof(desc["cursor_addr"])
+    if cursor is None:
+        return np.zeros(n, dtype=np.int64)
+    idx = np.clip(np.asarray(cursor, dtype=np.int64) * stride + off, 0, len(table) - 1)
+    out = table[idx]
+    gate_addr = desc.get("gate_addr")
+    if gate_addr is not None and sampler is not None:
+        out = out & sampler.eof(gate_addr)
+    else:
+        out = out & mask
+    return _apply_overrides(out, desc.get("overrides", []), sampler)
+
+
+def _apply_overrides(out, overrides, sampler) -> np.ndarray:
+    """Force values where each override's cell-predicate conjunction holds."""
+    if not overrides or sampler is None:
+        return out
+    n = len(out)
+    for ov in overrides:
+        sel = np.ones(n, dtype=bool)
+        for cell, cmask, cval in ov.get("predicate", []):
+            sel &= (sampler.eof(cell) & cmask) == cval
+        out = np.where(sel, int(ov["force"]), out)
+    return out
+
+
+def _comp_part(part, n, sampler) -> np.ndarray:
+    """Per-frame value of a composite part (8-bit cell or 16-bit lo/hi cell pair)."""
+    if part is None:
+        return np.zeros(n, dtype=np.int64)
+    if "series" in part:
+        return np.asarray(part["series"], dtype=np.int64)
+    if sampler is None:
+        return np.zeros(n, dtype=np.int64)
+    if "lo" in part:
+        lo = sampler.at_write(part["lo"][0], part["lo"][1])
+        hi = sampler.at_write(part["hi"][0], part["hi"][1])
+        return combine_lohi(lo, hi)
+    return sampler.at_write(part["cell"], part["sid"])
+
+
+def _recon_composite(desc, n, sampler) -> np.ndarray:
+    total = _comp_part(desc.get("base"), n, sampler) + _comp_part(desc.get("mod"), n, sampler)
+    total = total & int(desc.get("width_mask", 0xFF))
+    role = desc.get("byte_role", "full")
+    if role == "lo":
+        out = total & 0xFF
+    elif role == "hi":
+        out = (total >> 8) & 0xFF
+    else:
+        out = total
+    return _apply_overrides(out, desc.get("overrides", []), sampler)
+
+
+def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndarray:
+    """Regenerate a register's per-frame output from its recovered descriptor.
+
+    Executes the descriptor produced by :func:`classify_register`:
+    ``CONST`` -> a constant; ``SEQ`` -> latched values held between note events;
+    ``BACC`` -> the recurrence re-run (reset at the recovered note-on seeds);
+    ``TABLE_WALK`` -> ``table[base + cursor*stride] & mask`` (gate-masked by a
+    captured cell when one was recovered); ``COMPOSITE`` -> base + modulation +
+    overrides. Cell-referencing descriptors read those cells from ``trace`` (or a
+    shared ``sampler``); ``XSTATE`` has no single-generator model yet and returns
+    ``None``.
+    """
+    n = len(ticks)
+    kind = descriptor.get("type")
+    if kind == "CONST":
+        value = descriptor.get("value")
+        return np.full(n, 0 if value is None else int(value), dtype=np.int64)
+    if kind == "SEQ":
+        return _recon_seq(descriptor, n)
+    smp = _sampler_for(ticks, trace, sampler)
+    builders = {"BACC": _recon_bacc, "TABLE_WALK": _recon_table, "COMPOSITE": _recon_composite}
+    if kind in builders:
+        return builders[kind](descriptor, n, smp)
+    # XSTATE: not yet modelled -- best effort is the closest observable feeder
+    # cell sampled at the write instant (or nothing if none was recorded).
+    if kind == "XSTATE" and smp is not None and descriptor.get("cell") is not None:
+        return smp.at_write(descriptor["cell"], descriptor["sid"]) & 0xFF
+    return None  # no model yet for this descriptor
+
+
+def round_trip(trace, kind="auto") -> dict:
+    """Score every recovered register descriptor against the oracle.
+
+    Returns ``{addr: fidelity, ..., 'overall': fidelity, 'unmodeled': [...]}``
+    where ``fidelity`` is the fraction of frames whose reconstruction equals the
+    oracle's per-frame register value, ``overall`` is frame-weighted across all
+    written registers, and ``unmodeled`` lists registers below 1.0 (with an
+    example mismatch frame range) so the remaining gap is actionable.
+    """
+    result = analyze(trace, kind)
+    ticks = trace.tick_cycles(kind)
+    n = len(ticks)
+    sampler = _CellSampler(trace, ticks)
+    fid: dict = {}
+    matched_total = 0
+    frames_total = 0
+    unmodeled = []
+    for addr, desc in result.items():
+        if not isinstance(addr, int):
+            continue
+        oracle = _register_series(trace, addr, kind)[1]
+        recon = reconstruct_register(desc, ticks, sampler=sampler)
+        if recon is None:
+            fidelity = 0.0
+            mism = np.arange(n)
+        else:
+            eq = recon == oracle
+            fidelity = float(np.mean(eq)) if n else 1.0
+            mism = np.nonzero(~eq)[0]
+        fid[addr] = fidelity
+        matched_total += int(round(fidelity * n))
+        frames_total += n
+        if fidelity < 1.0:
+            example = [int(mism[0]), int(mism[-1])] if len(mism) else []
+            unmodeled.append(
+                {
+                    "addr": addr,
+                    "type": desc.get("type"),
+                    "fidelity": round(fidelity, 4),
+                    "example_frames": example,
+                }
+            )
+    fid["overall"] = (matched_total / frames_total) if frames_total else 1.0
+    fid["unmodeled"] = sorted(unmodeled, key=lambda d: d["fidelity"])
+    return fid
 
 
 def analyze(trace, kind="auto") -> dict:
