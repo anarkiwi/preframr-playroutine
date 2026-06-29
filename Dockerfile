@@ -60,7 +60,7 @@ RUN g++ -O2 -std=c++17 \
 #-----------------------------------------------------------------------------
 # Stage 2: python tooling + tests on top of the runtime library.
 #-----------------------------------------------------------------------------
-FROM python:3.12-slim AS test
+FROM python:3.14-slim AS test
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install --no-install-recommends -yq \
         libgcrypt20 libgomp1 ca-certificates && \
