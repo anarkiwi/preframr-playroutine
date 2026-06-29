@@ -30,7 +30,7 @@ index d3cad84..0eca5c9 100644
       * Get PB6/PB7 Flipflop state.
       *
 diff --git a/src/c64/CPU/mos6510.cpp b/src/c64/CPU/mos6510.cpp
-index 10bec1a..38dd670 100644
+index 10bec1a..f51a614 100644
 --- a/src/c64/CPU/mos6510.cpp
 +++ b/src/c64/CPU/mos6510.cpp
 @@ -24,6 +24,7 @@
@@ -41,18 +41,126 @@ index 10bec1a..38dd670 100644
  
  #include "opcodes.h"
  
-@@ -305,6 +306,11 @@ void MOS6510::IRQHiRequest()
+@@ -264,6 +265,26 @@ void MOS6510::fetchNextOpcode()
+         cpu_debug->instrStartPC = Register_ProgramCounter;
+     }
+ 
++    // Instrumentation: record the executing instruction PC, maintain the
++    // play-window (open at interrupt entry, closes when the handler returns and
++    // the stack pointer rises back above the entry frame), and accumulate PC
++    // coverage for instructions executed inside a window.
++    m_instrCurPC = Register_ProgramCounter;
++    {
++        InstrumentSink *sink = getInstrumentSink();
++        if (sink != nullptr) UNLIKELY
++        {
++            setInstrumentCurrentPC(m_instrCurPC);
++            if (m_instrInPlay)
++            {
++                if (Register_StackPointer > m_instrEntrySP)
++                    m_instrInPlay = false;
++                else
++                    sink->cpuExec(m_instrCurPC, m_instrWindowKind);
++            }
++        }
++    }
++
+     rdyOnThrowAwayRead = false;
+ 
+     cycleCount = cpuRead(Register_ProgramCounter) << 3;
+@@ -305,6 +326,21 @@ void MOS6510::IRQHiRequest()
  {
      endian_16hi8(Register_ProgramCounter, cpuRead(Cycle_EffectiveAddress + 1));
      flags.setI(true);
 +
++    const uint8_t vectorKind = endian_16lo8(Cycle_EffectiveAddress);
++
 +    InstrumentSink *sink = getInstrumentSink();
 +    if (sink != nullptr) UNLIKELY
 +        sink->cpuVector(eventScheduler.getTime(EVENT_CLOCK_PHI2),
-+                        endian_16lo8(Cycle_EffectiveAddress), Register_ProgramCounter);
++                        vectorKind, Register_ProgramCounter);
++
++    // Open a play window for IRQ ($fffe) and NMI ($fffa) vectors (not RST).
++    if (vectorKind == 0xfe || vectorKind == 0xfa)
++    {
++        m_instrInPlay = true;
++        m_instrEntrySP = Register_StackPointer;
++        m_instrWindowKind = (vectorKind == 0xfa) ? 1 : 0;
++    }
  }
  
  /**
+@@ -566,6 +602,19 @@ void MOS6510::FetchHighEffAddrY2()
+ void MOS6510::FetchEffAddrDataByte()
+ {
+     Cycle_Data = cpuRead(Cycle_EffectiveAddress);
++
++    if (m_instrInPlay) UNLIKELY
++    {
++        if (((Cycle_EffectiveAddress & 0xff00) != 0x0100)
++            && ((Cycle_EffectiveAddress & 0xf000) != 0xd000))
++        {
++            InstrumentSink *sink = getInstrumentSink();
++            if (sink != nullptr && sink->wantReads())
++                sink->ramRead(eventScheduler.getTime(EVENT_CLOCK_PHI2),
++                              m_instrCurPC, Cycle_EffectiveAddress, Cycle_Data,
++                              m_instrWindowKind);
++        }
++    }
+ }
+ 
+ /**
+diff --git a/src/c64/CPU/mos6510.h b/src/c64/CPU/mos6510.h
+index 91fb40e..6ecee1f 100644
+--- a/src/c64/CPU/mos6510.h
++++ b/src/c64/CPU/mos6510.h
+@@ -31,6 +31,7 @@
+ #include "flags.h"
+ #include "EventCallback.h"
+ #include "EventScheduler.h"
++#include "instrument.h"
+ 
+ #ifdef HAVE_CONFIG_H
+ #  include "config.h"
+@@ -165,6 +166,13 @@ private:
+     uint8_t Register_X;
+     uint8_t Register_Y;
+ 
++    // Instrumentation: play-window tracking. A window is open while executing
++    // inside an interrupt handler (the per-frame player work).
++    uint_least16_t m_instrCurPC = 0;   ///< PC of the instruction being executed
++    uint8_t m_instrEntrySP = 0;        ///< stack pointer at interrupt entry
++    uint8_t m_instrWindowKind = 0;     ///< 0=IRQ, 1=NMI
++    bool m_instrInPlay = false;        ///< true while inside a play window
++
+     /// Table of CPU opcode implementations
+     struct ProcessorCycle instrTable[0x101 << 3];
+ 
+@@ -324,7 +332,23 @@ public:
+ 
+     inline uint8_t cpuRead(uint_least16_t addr) { return dataBus.cpuRead(addr); }
+ 
+-    inline void cpuWrite(uint_least16_t addr, uint8_t data) { dataBus.cpuWrite(addr, data); }
++    inline void cpuWrite(uint_least16_t addr, uint8_t data)
++    {
++        if (m_instrInPlay) UNLIKELY
++        {
++            // Exclude the stack page and the IO area ($Dxxx; SID writes are
++            // logged separately). Everything else (zero page, data, and the
++            // code region for self-modifying code) is recorded.
++            if (((addr & 0xff00) != 0x0100) && ((addr & 0xf000) != 0xd000))
++            {
++                InstrumentSink *sink = getInstrumentSink();
++                if (sink != nullptr)
++                    sink->ramWrite(eventScheduler.getTime(EVENT_CLOCK_PHI2),
++                                   m_instrCurPC, addr, data, m_instrWindowKind);
++            }
++        }
++        dataBus.cpuWrite(addr, data);
++    }
+ 
+     void reset();
+ 
 diff --git a/src/c64/VIC_II/mos656x.h b/src/c64/VIC_II/mos656x.h
 index 4bc2c1d..46fea70 100644
 --- a/src/c64/VIC_II/mos656x.h
@@ -176,10 +284,10 @@ index c46d47a..5ce02dc 100644
  
 diff --git a/src/instrument.cpp b/src/instrument.cpp
 new file mode 100644
-index 0000000..5ae4c16
+index 0000000..e6690b3
 --- /dev/null
 +++ b/src/instrument.cpp
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,28 @@
 +/*
 + * This file is part of libsidplayfp, a SID player engine.
 + *
@@ -197,18 +305,23 @@ index 0000000..5ae4c16
 +{
 +
 +static InstrumentSink *g_instrumentSink = nullptr;
++static uint16_t g_instrumentCurrentPC = 0;
 +
 +void setInstrumentSink(InstrumentSink *sink) { g_instrumentSink = sink; }
 +
 +InstrumentSink *getInstrumentSink() { return g_instrumentSink; }
 +
++void setInstrumentCurrentPC(uint16_t pc) { g_instrumentCurrentPC = pc; }
++
++uint16_t getInstrumentCurrentPC() { return g_instrumentCurrentPC; }
++
 +}
 diff --git a/src/instrument.h b/src/instrument.h
 new file mode 100644
-index 0000000..157e290
+index 0000000..3984ed4
 --- /dev/null
 +++ b/src/instrument.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,91 @@
 +/*
 + * This file is part of libsidplayfp, a SID player engine.
 + *
@@ -248,9 +361,9 @@ index 0000000..157e290
 +    virtual ~InstrumentSink() {}
 +
 +    /// A write reaching a SID chip: register (0..0x1f) and value, with the
-+    /// chip index and its base address (e.g. 0xd400).
++    /// chip index and its base address (e.g. 0xd400), plus the store-site PC.
 +    virtual void sidWrite(int64_t cycle, int chip, uint16_t base,
-+                          uint8_t reg, uint8_t value) = 0;
++                          uint8_t reg, uint8_t value, uint16_t pc) = 0;
 +
 +    /// A CIA interrupt line was asserted. source: 1=CIA1 (IRQ), 2=CIA2 (NMI).
 +    /// taLatch/tbLatch are the current timer A/B reload latches (period in
@@ -265,6 +378,24 @@ index 0000000..157e290
 +    /// The CPU vectored through an interrupt/BRK. kind is the low byte of the
 +    /// vector address: 0xfe=IRQ, 0xfa=NMI, 0xfc=RST. pc is the handler entry.
 +    virtual void cpuVector(int64_t cycle, uint8_t kind, uint16_t pc) = 0;
++
++    /// A CPU write to memory inside a play window. pc is the storing
++    /// instruction, kind the window kind (0=IRQ, 1=NMI). Includes writes to the
++    /// player's code region (self-modifying code); the tracer filters address
++    /// ranges it does not care about.
++    virtual void ramWrite(int64_t cycle, uint16_t pc, uint16_t addr,
++                          uint8_t value, uint8_t kind) {}
++
++    /// A CPU operand data read inside a play window. Only emitted when
++    /// wantReads() returns true.
++    virtual void ramRead(int64_t cycle, uint16_t pc, uint16_t addr,
++                         uint8_t value, uint8_t kind) {}
++
++    /// An instruction executed inside a play window (for PC coverage).
++    virtual void cpuExec(uint16_t pc, uint8_t kind) {}
++
++    /// Whether the read log is wanted (gates the per-read overhead).
++    virtual bool wantReads() const { return false; }
 +};
 +
 +/// Install (or clear, with nullptr) the process-wide instrumentation sink.
@@ -273,11 +404,49 @@ index 0000000..157e290
 +/// Get the currently installed sink, or nullptr.
 +SID_EXTERN InstrumentSink *getInstrumentSink();
 +
++/// Current CPU instruction PC, maintained by the CPU core so that SID writes
++/// (emitted from the SID emulation) can be attributed to their store site.
++/// Library-internal (not exported); only meaningful while a sink is installed.
++void setInstrumentCurrentPC(uint16_t pc);
++uint16_t getInstrumentCurrentPC();
++
 +}
 +
 +#endif // LIBSIDPLAYFP_INSTRUMENT_H
+diff --git a/src/player.cpp b/src/player.cpp
+index c887043..d06ccb6 100644
+--- a/src/player.cpp
++++ b/src/player.cpp
+@@ -238,6 +238,13 @@ void Player::buffers(short** buffers) const
+     }
+ }
+ 
++void Player::getRam(uint8_t *dst)
++{
++    sidmemory &mem = m_c64.getMemInterface();
++    for (int i = 0; i < 0x10000; i++)
++        dst[i] = mem.readMemByte(static_cast<uint_least16_t>(i));
++}
++
+ int Player::play(unsigned int cycles)
+ {
+     // Make sure a tune is loaded
+diff --git a/src/player.h b/src/player.h
+index ab30df1..e329ad9 100644
+--- a/src/player.h
++++ b/src/player.h
+@@ -156,6 +156,9 @@ public:
+ 
+     uint_least16_t getCia1TimerA() const { return m_c64.getCia1TimerA(); }
+ 
++    /// Copy the 64K C64 system RAM into dst (instrumentation).
++    void getRam(uint8_t *dst);
++
+     bool getSidStatus(unsigned int sidNum, uint8_t regs[32]);
+ 
+     unsigned int installedSIDs() const { return m_chips.size(); }
 diff --git a/src/sidemu.cpp b/src/sidemu.cpp
-index 2ff4951..3699a79 100644
+index 2ff4951..8e340da 100644
 --- a/src/sidemu.cpp
 +++ b/src/sidemu.cpp
 @@ -22,6 +22,8 @@
@@ -296,7 +465,7 @@ index 2ff4951..3699a79 100644
 +    InstrumentSink *sink = getInstrumentSink();
 +    if (sink != nullptr && eventScheduler != nullptr) UNLIKELY
 +        sink->sidWrite(eventScheduler->getTime(EVENT_CLOCK_PHI2),
-+                       m_instrId, m_instrBase, addr, data);
++                       m_instrId, m_instrBase, addr, data, getInstrumentCurrentPC());
 +
      write(addr, data);
  }
@@ -324,3 +493,38 @@ index 5421ad2..6592e61 100644
      sidemu(sidbuilder *builder) :
          m_builder(builder),
          m_error("N/A")
+diff --git a/src/sidplayfp/sidplayfp.cpp b/src/sidplayfp/sidplayfp.cpp
+index c04cfc4..3fa7639 100644
+--- a/src/sidplayfp/sidplayfp.cpp
++++ b/src/sidplayfp/sidplayfp.cpp
+@@ -61,6 +61,11 @@ int sidplayfp::play(unsigned int cycles)
+     return sidplayer.play(cycles);
+ }
+ 
++void sidplayfp::getRam(uint8_t *dst)
++{
++    sidplayer.getRam(dst);
++}
++
+ bool sidplayfp::reset()
+ {
+     return sidplayer.reset();
+diff --git a/src/sidplayfp/sidplayfp.h b/src/sidplayfp/sidplayfp.h
+index 8a3120d..b0c6a1f 100644
+--- a/src/sidplayfp/sidplayfp.h
++++ b/src/sidplayfp/sidplayfp.h
+@@ -216,6 +216,14 @@ public:
+      */
+     uint_least16_t getCia1TimerA() const;
+ 
++    /**
++     * Copy the 64K C64 system RAM into dst (instrumentation; for dumping the
++     * relocated player image and static tables).
++     *
++     * @param dst a 65536-byte buffer.
++     */
++    void getRam(uint8_t *dst);
++
+     /**
+      * Get the SID registers programmed value.
+      *

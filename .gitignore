@@ -8,3 +8,6 @@ dist/
 *.bin
 *.json
 !preframr_playroutine/**
+!tests/fixtures/tunes.json
+# HVSC tune cache (downloaded on demand by tests/_hvsc.py).
+tests/.hvsc_cache/

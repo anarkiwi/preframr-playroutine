@@ -88,3 +88,37 @@ def test_determinism(tmp_path):
         t1.events.view(np.uint8).reshape(-1, 16),
         t2.events.view(np.uint8).reshape(-1, 16),
     )
+    # Determinism must cover the v2 RAM-write stream too.
+    assert np.array_equal(
+        t1.ram_writes().view(np.uint8),
+        t2.ram_writes().view(np.uint8),
+    )
+
+
+def test_v2_artifacts_present(tmp_path):
+    trace = _run(tmp_path, speed=0)
+    # RAM write log: the player INCs/loads $FB each frame, so it must be non-empty.
+    assert len(trace.ram_writes()) > 0
+    # Executed-PC coverage of the play window.
+    pcs = trace.coverage_pcs()
+    assert len(pcs) > 0
+    assert pcs.dtype == np.uint16
+    assert np.all(np.diff(pcs.astype(np.int64)) > 0)  # sorted, unique
+    # RAM image dump.
+    img = trace.ram_image()
+    assert img is not None
+    assert len(img) == 65536
+    # Store-site PC of each SID write.
+    pc_col = trace.sid_write_pc()
+    assert len(pc_col) == len(trace.sid_writes())
+    assert np.any(pc_col != 0)
+
+
+def test_v2_analyze_classifies(tmp_path):
+    from preframr_playroutine import analyze
+
+    trace = _run(tmp_path, speed=0, seconds=2.0)
+    result = analyze(trace)
+    # At least one SID register classified, with a generator-type summary.
+    assert result["summary"]
+    assert sum(result["summary"].values()) >= 1

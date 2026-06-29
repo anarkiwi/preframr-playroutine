@@ -16,14 +16,41 @@ The emulator runs arbitrary code (unpacking, relocation, generative melody
 code); we don't try to decompile that. We capture what the program *does* to
 the hardware, periodically, so the structure can be recovered downstream.
 
+## Program-state instrumentation (generator recovery)
+
+The register oracle says *what* a tune wrote; recovering the per-register
+**generators** (bounded accumulators, sweeps, table-walks, and their
+cross-dependencies — the BACC / TABLE-WALK / SEQ / XSTATE taxonomy) needs the
+internal program state that produced those writes. While the CPU runs inside an
+interrupt handler (a "play window"), `sidtrace` additionally captures, all
+cycle-stamped and tagged with the window kind (IRQ/NMI) so frames can be binned
+flexibly:
+
+- the **store-site PC** of every SID write (which code wrote which register),
+- a **RAM-write log** — accumulators, table cursors, counters, and
+  self-modifying-code immediates (the raw per-frame `stateseq`),
+- an **executed-PC coverage** bitmap (the player's code, for disassembly),
+- a **64K RAM image** (relocated player code + static tables),
+- optionally a **RAM-read log** (`--reads`) for direct table-walk capture.
+
+The `preframr_playroutine.recover` module turns these into a per-frame state
+sequence, derives voice/note events, and classifies each SID register's
+generator (`fit_bacc`, `detect_table_walk`, `correlate_event_reset`,
+`analyze`). The captured cells and store-site PCs match published manual
+reverse-engineering of real players exactly (e.g. the DMC freq accumulator
+`$1735/$1738`, PW `$1750`, wave cursor `$177a`, and the FREQ/PW/CTRL store sites
+`$160d/$161c/$162b`). See [`docs/INSTRUMENTATION.md`](docs/INSTRUMENTATION.md)
+for the full binary contract.
+
 ## Components
 
 | Path | What |
 | --- | --- |
-| `patches/instrument.patch` | Minimal hooks added to a pinned libsidplayfp: SID register writes, CIA/VIC interrupt-line assertions, and CPU interrupt vector-throughs, all cycle-stamped via the event scheduler. |
-| `app/sidtrace.cpp` | CLI that plays a tune and writes the oracle (`.bin`) + metadata (`.json`). |
-| `preframr_playroutine/` | numpy package that loads the oracle and recovers timing + register frames. |
-| `Dockerfile` | Multi-stage build: instrumented libsidplayfp + `sidtrace`, then a python test image. |
+| `patches/instrument.patch` | Hooks added to a pinned libsidplayfp: SID-register writes (PC-tagged), CIA/VIC interrupt-line assertions, CPU interrupt vectors, and play-window-scoped RAM access + PC coverage, all cycle-stamped via the event scheduler. |
+| `app/sidtrace.cpp` | CLI that plays a tune and writes the oracle + program-state artifacts (`.bin`, `.ramwr.bin`, `.cov.bin`, `.ram`, `.json`). |
+| `preframr_playroutine/` | numpy package: `trace` (load the artifacts) and `recover` (generator recovery). |
+| `docs/INSTRUMENTATION.md` | The authoritative binary/format contract between the tracer and the python tooling. |
+| `Dockerfile` | Multi-stage build: reSIDfp + instrumented libsidplayfp + `sidtrace`, then a python test image. |
 
 The C++ tracer and the libsidplayfp patch are derivative of libsidplayfp and
 are licensed **GPL-2.0-or-later**. The python tooling under
