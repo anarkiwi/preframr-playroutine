@@ -909,12 +909,43 @@ def _held_notes_trace(voice_notes, voice_a4=None, note_len=8):
 _SCALE = [48, 52, 55, 60, 64, 67, 72, 36, 79]
 
 
+def _chromatic_pitch_table(base_midi, n, a4=440.0):
+    """Clean chromatic note->freq ladder as ``(lo, hi)`` uint8 arrays."""
+    pitch = np.array([_sidfreq(base_midi + k, a4) for k in range(n)], dtype=np.int64)
+    lo = (pitch & 0xFF).astype(np.uint8)
+    hi = ((pitch >> 8) & 0xFF).astype(np.uint8)
+    return lo, hi
+
+
 def test_recover_tuning_a440():
     tu = recover_tuning(_held_notes_trace({0: _SCALE}, voice_a4={0: 440.0}))
     assert tu is not None
     assert abs(tu["cents_from_a440"]) < 3.0
     assert tu["residual_cents"] < 3.0
     assert tu["temperament"] == "12-TET"
+    assert tu["note_numbers"] == sorted(set(_SCALE))
+    assert tu["note_range"] == [36, 79]
+    assert tu["source"] == "live_freq"
+
+
+def test_recover_tuning_note_table_source():
+    trace = _held_notes_trace({0: _SCALE}, voice_a4={0: 440.0})
+    lo, hi = _chromatic_pitch_table(36, 44)
+    tu = recover_tuning(trace, note_tables=[(lo, hi)])
+    assert tu["source"] == "note_table"
+    assert abs(tu["cents_from_a440"]) < 3.0
+    assert tu["temperament"] == "12-TET"
+    assert tu["note_numbers"] == sorted(set(_SCALE))
+
+
+def test_recover_tuning_note_table_nonchromatic_fallback():
+    trace = _held_notes_trace({0: _SCALE}, voice_a4={0: 440.0})
+    pitch = _pitch_table(64)
+    lo = (pitch & 0xFF).astype(np.uint8)
+    hi = ((pitch >> 8) & 0xFF).astype(np.uint8)
+    tu = recover_tuning(trace, note_tables=[(lo, hi)])
+    assert tu["source"] == "live_freq"
+    assert abs(tu["cents_from_a440"]) < 3.0
 
 
 def test_recover_tuning_detuned():
@@ -944,4 +975,6 @@ def test_voice_detune_unison_not_detuned():
 def test_analyze_includes_tuning_and_detune():
     result = analyze(_held_notes_trace({0: _SCALE}))
     assert result["tuning"] is not None and "a4_hz" in result["tuning"]
+    assert "note_numbers" in result["tuning"]
+    assert "source" in result["tuning"]
     assert "detune" in result and "detuned" in result["detune"]

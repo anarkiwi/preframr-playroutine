@@ -1758,7 +1758,12 @@ def analyze(trace, kind="auto") -> dict:
         out[int(a)] = res
         summary[res["type"]] = summary.get(res["type"], 0) + 1
     out["summary"] = summary
-    out["tuning"] = recover_tuning(trace, kind)
+    note_tables = [
+        (res["lo_table"], res["hi_table"])
+        for res in out.values()
+        if isinstance(res, dict) and res.get("type") == "PITCHWALK"
+    ]
+    out["tuning"] = recover_tuning(trace, kind, note_tables=note_tables)
     out["detune"] = voice_detune(trace, kind)
     return out
 
@@ -1787,14 +1792,56 @@ def _sustained_freqs(trace, kind="auto") -> np.ndarray:
     return np.concatenate(out) if out else np.empty(0, dtype=np.int64)
 
 
-def recover_tuning(trace, kind="auto"):
+def _fit_a4(f_hz):
+    """Grid-search a +/-50 cent window around A440 for the reference A4 that best
+    aligns ``f_hz`` to a 12-TET semitone grid. Returns ``(ref_hz, residual_cents)``.
+
+    The grid-alignment cost is periodic every semitone, so frequency alone fixes
+    the reference only modulo 100 cents (which note is "A" needs the note table).
+    The single +/-50 cent window yields the unique A440-referenced sub-semitone
+    offset.
+    """
+    a4 = np.linspace(440.0 * 2.0 ** (-50.0 / 1200.0), 440.0 * 2.0 ** (50.0 / 1200.0), 1001)
+    midi = 69.0 + 12.0 * np.log2(f_hz[None, :] / a4[:, None])
+    cents = np.abs(midi - np.round(midi)) * 100.0
+    err = np.median(cents, axis=1)
+    best = int(np.argmin(err))
+    return float(a4[best]), float(err[best])
+
+
+def _table_freqs(note_tables, hz):
+    """Chromatic frequency ladder(s) from PITCHWALK note tables.
+
+    Each ``(lo, hi)`` uint8 pair becomes 16-bit entries -> Hz; entries are kept in
+    (30, 8000) Hz and made strictly increasing (zeros/dupes dropped). Returns the
+    concatenated, sorted, unique musical frequencies.
+    """
+    out = []
+    for lo, hi in note_tables:
+        lo_i = np.asarray(lo).astype(np.int64)
+        hi_i = np.asarray(hi).astype(np.int64)
+        tab16 = lo_i | (hi_i << 8)
+        tf = tab16.astype(np.float64) * hz / float(1 << 24)
+        tf = tf[(tf > 30.0) & (tf < 8000.0)]
+        out.append(np.unique(tf))
+    if not out:
+        return np.empty(0, dtype=np.float64)
+    return np.unique(np.concatenate(out))
+
+
+def recover_tuning(trace, kind="auto", note_tables=None):
     """Recover a song's global tuning (offset from A440 / 12-TET).
 
     SID frequency maps to pitch as ``f_Hz = sidfreq * cpu_hz / 2**24``. A
     reference A4 is fit to the sustained (held, gate-on) note frequencies by
-    minimising the median absolute deviation to a 12-TET semitone grid. Returns
-    ``{a4_hz, cents_from_a440, residual_cents, temperament, n_samples}`` or None
-    when there is too little sustained pitch data. This is offline-only: the
+    minimising the median absolute deviation to a 12-TET semitone grid. When
+    ``note_tables`` (a list of ``(lo_table, hi_table)`` uint8 arrays from PITCHWALK
+    FREQ descriptors) supplies a denser chromatic ladder, the reference is fit over
+    those table frequencies instead (``source == "note_table"``); the fit falls
+    back to the live frequencies (``source == "live_freq"``) when a table is not
+    chromatic (worse residual) or too short. Returns ``{a4_hz, cents_from_a440,
+    residual_cents, temperament, n_samples, source, note_numbers, note_range}`` or
+    None when there is too little sustained pitch data. This is offline-only: the
     per-song note->frequency table already bakes the tuning in for replay, so it
     costs nothing at runtime but makes the IR's note numbers absolute pitch,
     comparable across tunes.
@@ -1810,23 +1857,27 @@ def recover_tuning(trace, kind="auto"):
     f_hz = f_hz[(f_hz > 30.0) & (f_hz < 8000.0)]
     if len(f_hz) < 16:
         return None
-    # The grid-alignment cost is periodic every semitone, so frequency alone
-    # fixes the reference only modulo 100 cents (which note is "A" needs the note
-    # table). Search a single +/-50 cent window around A440 for the unique,
-    # A440-referenced sub-semitone offset.
-    a4 = np.linspace(440.0 * 2.0 ** (-50.0 / 1200.0), 440.0 * 2.0 ** (50.0 / 1200.0), 1001)
-    midi = 69.0 + 12.0 * np.log2(f_hz[None, :] / a4[:, None])
-    cents = np.abs(midi - np.round(midi)) * 100.0
-    err = np.median(cents, axis=1)
-    best = int(np.argmin(err))
-    ref = float(a4[best])
-    residual = float(err[best])
+    ref, residual = _fit_a4(f_hz)
+    source = "live_freq"
+    if note_tables:
+        tab_f = _table_freqs(note_tables, hz)
+        if len(tab_f) >= 16:
+            t_ref, t_res = _fit_a4(tab_f)
+            if t_res <= residual:
+                ref, residual, source = t_ref, t_res, "note_table"
+    # Absolute MIDI note numbers of the sounded notes under the winning reference.
+    sounded = np.round(69.0 + 12.0 * np.log2(f_hz / ref)).astype(int)
+    note_numbers = sorted({int(m) for m in sounded})
+    note_range = [note_numbers[0], note_numbers[-1]] if note_numbers else None
     return {
         "a4_hz": ref,
         "cents_from_a440": float(np.log2(ref / 440.0) * 1200.0),
         "residual_cents": residual,
         "temperament": "12-TET" if residual < 5.0 else "non-TET",
         "n_samples": int(len(f_hz)),
+        "source": source,
+        "note_numbers": note_numbers,
+        "note_range": note_range,
     }
 
 
