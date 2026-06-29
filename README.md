@@ -27,6 +27,48 @@ code); that's the *song data*, not the *generators*. We recover the per-register
 generator functions and replay the song data (note/sequencer events) through
 them.
 
+## Current status
+
+Built and merged (PRs #2/#7/#8/#9/#10):
+
+- **Oracle + instrumentation.** Deterministic, byte-exact tracer (`sidtrace`) on
+  patched libsidplayfp: cycle-stamped SID writes (PC-tagged), CIA/VIC interrupts,
+  CPU vectors, play-window-scoped RAM read/write logs, PC coverage, RAM image.
+- **Recovery primitives.** `CONST`, `SEQ`, `BACC`, `TABLE_WALK`, `COMPOSITE`,
+  `PITCHWALK`, plus the note/pitch layer (`recover_tuning`, `voice_detune`).
+- **Lossless gate.** `reconstruct_register` + `round_trip` regenerate each
+  register from its IR and score it byte-for-byte against the oracle.
+- **25 HVSC fixtures** (3× the top-6 trackers + 3 defMON + A Mind Is Born +
+  Commando/Grid Runner/Cauldron II), whole-song, parallel, with an **xfail
+  ratchet**: every fixture must round-trip perfectly with zero XSTATE; the
+  not-yet-perfect ones are `xfail(strict=True)`, so the gap can only shrink (a
+  fix XPASS-fails CI until its marker is removed).
+
+In flight (this branch): `recover_tuning` + `voice_detune` + the
+Commando/Grid Runner/Cauldron II fixtures (validating).
+
+**Round-trip landscape** (whole-song): 3 perfect (Doctagop, Only_3, Denarius);
+most tunes 0.96–1.0; weakest are Commando 0.77 (Hubbard's hand-coded player),
+the FutureComposer (~0.90) and defMON (~0.84–0.92) FREQ cases, plus filter /
+CTRL stragglers on JCH.
+
+## Next steps
+
+1. **Drive the xfail set to zero** (biggest round-trip gaps first): Commando /
+   other bespoke players; the FutureComposer vibrato/portamento residual (try
+   recovering it from the already-logged self-modifying-code immediate writes
+   before adding any observable); the defMON FREQ cases; the per-tune
+   filter-cutoff (`$D416`) and CTRL stragglers.
+2. **Absolute tuning anchor.** `recover_tuning` is currently modulo a semitone;
+   pin the octave/semitone from the note table so A4 is fully absolute.
+3. **6502 reference replayer** (assemble the IR with the in-build `xa65`, run it
+   under the emulator, round-trip against the oracle) — proves on-platform
+   practicality.
+4. **Performance.** `_table_walk_scan` dominates analysis time on long JCH tunes;
+   optimise it to keep CI time bounded as fixtures grow.
+
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for detail.
+
 **Scope of generative tunes.** Some songs synthesise their melody
 algorithmically (e.g. *A Mind Is Born* by lft). We deliberately do **not** model
 the generating algorithm — only its **melodic output as notes**. The IR's note
