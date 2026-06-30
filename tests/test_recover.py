@@ -539,6 +539,50 @@ def test_classify_bacc_held_seed_prelude_before_cell_write():
     assert rt[0xD402] == 1.0
 
 
+def test_classify_bacc_output_then_compute_latency_feeder():
+    # defMON output-then-compute: each call writes SID from a self-modified operand
+    # (current value) then computes the NEXT value into the feeder cell, so the
+    # cell's end-of-frame value LEADS the register by one call while the value read
+    # at the write instant is exact. A leading held-seed prelude precedes the first
+    # cell write. The feeder must still be recovered (its end-of-frame match to the
+    # register is ~0; it matches the one-call-shifted register) and round-trip
+    # exactly once the prelude fills the pre-modulation hold.
+    cell = 0x1023
+    seed = 0xD3
+    note_len = 8
+    predwell = 11
+    steps = [19, 19, 18, 19, 18, 19]  # per-note stride varies: recurrence mis-fits
+    ramp = [(0x90 - st * t) & 0xFF for st in steps for t in range(note_len)]
+    # The held seed runs through frame ``predwell`` inclusive; the cell is written
+    # only once per modulating frame, late (after the SID store) with the NEXT
+    # value, so its end-of-frame value leads the register by one call and the value
+    # read at the write instant lags to the current one.
+    values = [seed] * (predwell + 1) + ramp
+    recs = []
+    ramwr = []
+    for i, v in enumerate(values):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        if i < predwell:
+            ctrl = 0x40  # gate off during the held-seed pre-dwell
+        else:
+            j = i - predwell
+            ctrl = 0x40 if (j % note_len) == note_len - 1 else 0x41
+            nxt = values[i + 1] if i + 1 < len(values) else v
+            ramwr.append(_ra(tick + 40, cell, int(nxt)))  # next value, late -> leads eof
+        recs.append(_ev(tick + 8, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1500))
+        recs.append(_ev(tick + 12, SID_WRITE, reg=2, value=int(v), addr=0xD402, aux=0x1388))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = classify_register(trace, 0xD402)
+    assert res["type"] == "BACC"
+    assert res["cell"] == cell  # the one-call-latency feeder is recovered
+    # The first cell write is late in its frame, so the held-seed prelude must
+    # extend one frame past the cell's first-write frame (the first-live handoff).
+    assert res["prelude_end"] == predwell + 1
+    rt = round_trip(trace)
+    assert rt[0xD402] == 1.0
+
+
 def test_classify_table_walk():
     ram = np.zeros(65536, dtype=np.uint8)
     base = 0x2200
@@ -1108,6 +1152,116 @@ def test_and_ctrl_recovers_wave_gate():
     assert rt[0xD404] == 1.0
 
 
+def test_and_ctrl_recovers_wave_gate_with_onset_overrides():
+    # CTRL = wave AND gate, but every note-onset frame forces a control byte the
+    # shadow never carries ($08 = test/gate-off), gated by an onset cell. The AND
+    # pair reproduces the steady frames; the onset frames are recovered as a
+    # value-forcing override, so CTRL reconstructs byte-exact (the DMC case).
+    rng = np.random.default_rng(11)
+    n = 72
+    wave_cell, gate_cell, onset_cell = 0x30, 0x31, 0x32
+    waveforms = [0x11, 0x21, 0x41, 0x81]
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        wave = waveforms[i % len(waveforms)]
+        gate = 0xFF if rng.integers(0, 2) else 0xFE
+        onset = i % 12 == 0
+        ctrl = 0x08 if onset else (wave & gate)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, wave_cell, wave))
+        ramwr.append(_ra(tick + 5, gate_cell, gate))
+        ramwr.append(_ra(tick + 6, onset_cell, 9 if onset else 0))
+        recs.append(_ev(tick + 10, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1500))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = analyze(trace)
+    assert res[0xD404]["type"] == "AND", res[0xD404]["type"]
+    assert res[0xD404]["overrides"], res[0xD404]
+    rt = round_trip(trace)
+    assert rt[0xD404] == 1.0
+
+
+def _ctx_with_cells(cell_series, sid_addr=0xD404, reg_values=None):
+    """A RecoverContext over a trace that writes each named cell every frame."""
+    from preframr_playroutine.recover import _build_context
+
+    n = len(next(iter(cell_series.values())))
+    if reg_values is None:
+        reg_values = [i % 7 for i in range(n)]
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        for addr, series in cell_series.items():
+            ramwr.append(_ra(tick + 4, addr, int(series[i])))
+        recs.append(
+            _ev(
+                tick + 10,
+                SID_WRITE,
+                reg=sid_addr & 0x1F,
+                value=int(reg_values[i]),
+                addr=sid_addr,
+                aux=0x1500,
+            )
+        )
+    trace = _build_trace(recs, ram_writes=ramwr)
+    return _build_context(trace)
+
+
+def test_find_override_value_membership():
+    # A force gated by a cell holding one of a few values that no single
+    # equality/bit test can isolate ({2,5,7} vs the rest): _find_override must
+    # recover a membership term, and _apply_overrides must evaluate it.
+    from preframr_playroutine.recover import _find_override, _apply_overrides
+
+    n = 40
+    wave = np.empty(n, dtype=np.int64)
+    forced = np.zeros(n, dtype=bool)
+    member = [2, 5, 7]
+    other = [0, 1, 3, 4, 6]
+    for i in range(n):
+        if i % 4 == 0:
+            wave[i] = member[(i // 4) % 3]
+            forced[i] = True
+        else:
+            wave[i] = other[i % len(other)]
+    ctx = _ctx_with_cells({0x30: wave})
+    terms = _find_override(forced, ctx)
+    assert terms is not None
+    assert any(t[1] == "in" and set(t[2]) == set(member) for t in terms), terms
+    out = np.zeros(n, dtype=np.int64)
+    ov = {"predicate": terms, "force": 0x99}
+    applied = _apply_overrides(out, [ov], ctx.sampler)
+    assert np.array_equal(applied == 0x99, forced)
+
+
+def test_override_descriptor_uses_membership_predicate():
+    # A composite-style residual force gated by a cell holding one of a few values
+    # (the per-voice waveform shadow that flags hard-restart): _override_descriptor
+    # recovers it via a membership predicate, and _apply_overrides replays it.
+    from preframr_playroutine.recover import _apply_overrides, _override_descriptor
+
+    n = 48
+    wave = np.empty(n, dtype=np.int64)
+    forced = np.full(n, -1, dtype=np.int64)
+    member = [0x41, 0x49, 0x89]
+    other = [0x00, 0x09]
+    for i in range(n):
+        if i % 4 == 0:
+            wave[i] = member[(i // 4) % 3]
+            forced[i] = 0  # forced to value 0
+        else:
+            wave[i] = other[i % len(other)]
+    ctx = _ctx_with_cells({0x30: wave})
+    ov = _override_descriptor(forced, ctx)
+    assert ov is not None and ov["force"] == 0, ov
+    out = np.full(n, 0x77, dtype=np.int64)
+    applied = _apply_overrides(out, [ov], ctx.sampler)
+    assert np.array_equal(applied == 0, forced == 0)
+
+
 def test_round_trip_reports_overall_and_unmodeled():
     trace = _trace_with_register([0x0F] * 30, sid_addr=0xD418)
     rt = round_trip(trace)
@@ -1554,3 +1708,62 @@ def test_tickband_rejects_noise():
     series = rng.integers(0, 4096, size=600).astype(np.int64)
     resets = list(range(0, 600, 6))
     assert segmented_tickband(series, resets) is None
+
+
+def test_or_modevol_cell_or_const():
+    # MODE/VOL ($D418) blitted as ``volume | filter_mode`` where the mode nibble is
+    # a constant ($10) and the volume is a captured cell (JCH idiom). Neither a
+    # single feeder nor a table walk reproduces it; ``cell | const`` does. The
+    # volume cell is not written for the first few frames, so the register holds its
+    # note-on seed ($1F) there -- exercising the held-seed prelude.
+    rng = np.random.default_rng(3)
+    n = 60
+    vol_cell, mode = 0x30, 0x10
+    seed = mode | 0x0F  # $1F held until the volume cell starts updating
+    prelude_frames = 5
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        if i < prelude_frames:
+            value = seed
+        else:
+            vol = int(rng.integers(1, 16))  # moving volume nibble, not an accumulator
+            ramwr.append(_ra(tick + 4, vol_cell, vol))
+            value = mode | vol
+        recs.append(_ev(tick + 20, SID_WRITE, reg=0x18, value=value, addr=0xD418, aux=0x1500))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = analyze(trace)
+    assert res[0xD418]["type"] == "OR", res[0xD418]["type"]
+    assert res[0xD418]["cell_a"] == vol_cell
+    assert res[0xD418]["const"] == mode
+    assert res[0xD418]["prelude_end"] == prelude_frames
+    rt = round_trip(trace)
+    assert rt[0xD418] == 1.0
+
+
+def test_or_modevol_cell_pair():
+    # MODE/VOL ($D418) blitted as ``mode_cell | volume_cell``: a moving filter-mode
+    # hi-nibble OR-ed with a moving volume lo-nibble. Neither cell alone reproduces
+    # it, but the exact OR of the pair does, sampled at the SID-write instant.
+    rng = np.random.default_rng(5)
+    n = 60
+    mode_cell, vol_cell = 0x30, 0x31
+    modes = [0x10, 0x20, 0x30]
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        mode = modes[int(rng.integers(0, len(modes)))]
+        vol = int(rng.integers(1, 16))
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, mode_cell, mode))
+        ramwr.append(_ra(tick + 5, vol_cell, vol))
+        recs.append(_ev(tick + 20, SID_WRITE, reg=0x18, value=mode | vol, addr=0xD418, aux=0x1500))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = analyze(trace)
+    assert res[0xD418]["type"] == "OR", res[0xD418]["type"]
+    assert {res[0xD418]["cell_a"], res[0xD418]["cell_b"]} == {mode_cell, vol_cell}
+    rt = round_trip(trace)
+    assert rt[0xD418] == 1.0

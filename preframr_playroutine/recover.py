@@ -1172,16 +1172,21 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
         result.update(bacc)
         cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
         # The feeder cell captures dwell/hold the bare recurrence can miss, so it
-        # is used at reconstruction when attached (:func:`_recon_bacc`). Attach it
-        # only when it strictly beats the recurrence's own fidelity, so a model
-        # that already regenerates the register (e.g. the tick-banded sweep) is
-        # never displaced by a lower-fidelity captured cell.
+        # is used at reconstruction when attached (:func:`_recon_bacc`). The feeder
+        # plus its held-seed prelude (the captured cell drives every live frame, the
+        # prelude fills the pre-modulation leading hold the cell has not yet been
+        # written on) is attached only when it strictly beats the recurrence's own
+        # fidelity, so a model that already regenerates the register (e.g. the
+        # tick-banded sweep) is never displaced by a lower-fidelity captured cell.
         recurrence_fid = _candidate_fidelity(bacc, series, bacc.get("byte_role", "full"))
-        if cell is not None and frac >= 0.5 and frac > recurrence_fid:
-            result["cell"] = cell
-            result["sid"] = int(sid_addr)
-            result["cell_frac"] = round(float(frac), 4)
-            _attach_seed_prelude(result, series, ctx)
+        if cell is not None and frac >= 0.5:
+            trial = dict(result)
+            trial["cell"] = cell
+            trial["sid"] = int(sid_addr)
+            trial["cell_frac"] = round(float(frac), 4)
+            _attach_seed_prelude(trial, series, ctx)
+            if _descriptor_fidelity(trial, series, ctx) > recurrence_fid:
+                result = trial
         return result
 
     result = _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
@@ -1189,6 +1194,7 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
         result = _maybe_xor_ctrl(sid_addr, series, ctx, result)
         result = _maybe_and_ctrl(sid_addr, series, ctx, result)
     result = _maybe_feeder_upgrade(result, series, sid_addr, ctx)
+    result = _maybe_or_reg(sid_addr, series, ctx, result)
     return result
 
 
@@ -1227,7 +1233,8 @@ def _attach_seed_prelude(result, series, ctx, max_latches: int = 6):
     cell = result.get("cell")
     if sampler is None or cell is None:
         return
-    end = sampler.cell_first_frame(cell)
+    sid = result.get("sid", result.get("addr"))
+    end = sampler.first_live_frame(cell, sid)
     if not 0 < end < ctx.n_frames:
         return
     frames, values = _seq_latches(np.asarray(series, dtype=np.int64)[:end])
@@ -1430,6 +1437,13 @@ def _best_feeder_at_write(series, sid_addr, ctx):
     Prefilters by end-of-frame match, then re-scores the top candidates with the
     cell value sampled at the register's SID-write cycle (where the player reads
     it), which captures any modulation already folded into the feeder.
+
+    The prefilter also ranks each cell by its match to the register series shifted
+    one frame -- an output-then-compute player (defMON) writes the SID from a
+    self-modified operand then computes the NEXT value into its feeder cell, so the
+    cell's end-of-frame value leads the register by one call; that feeder still
+    reconstructs exactly when sampled at the write instant, so include the
+    one-call-latency shift so it survives the prefilter.
     """
     ss = ctx.stateseq
     if ss.grid.shape[1] == 0 or ctx.sampler is None:
@@ -1437,7 +1451,9 @@ def _best_feeder_at_write(series, sid_addr, ctx):
     grid = ss.grid.astype(np.int64)
     s = np.asarray(series, dtype=np.int64)
     eof_match = (grid == s[:, None]).mean(axis=0)
-    order = np.argsort(eof_match)[::-1][:8]
+    lead = (grid == np.roll(s, -1)[:, None]).mean(axis=0)
+    rank = np.maximum(eof_match, lead)
+    order = np.argsort(rank)[::-1][:8]
     best_addr, best_recon, best_frac = None, None, -1.0
     for j in order:
         cell = int(ss.addrs[j])
@@ -1451,15 +1467,21 @@ def _best_feeder_at_write(series, sid_addr, ctx):
 def _find_override(forced, ctx, max_terms: int = 3):
     """A conjunction of cell predicates that fires exactly on ``forced`` frames.
 
-    Candidate predicates (cell value-equality / single-bit tests) are restricted
-    to those true on every forced frame (recall 1.0); a greedy intersection then
-    drives precision to 1.0. Returns ``[(cell, mask, value), ...]`` or ``None``.
+    Candidate predicates (cell value-equality / single-bit tests / small
+    value-membership) are restricted to those true on every forced frame (recall
+    1.0); a greedy intersection then drives precision to 1.0. A membership term
+    ``cell in {v0,..}`` (recovered set of <= ``max_set`` distinct cell values, e.g.
+    the per-voice waveform shadow whose value selects the instruments that
+    hard-restart) captures a force gated by a handful of states no single
+    equality/bit can express. Returns ``[(cell, mask, value) | (cell, "in",
+    (v0,..)), ...]`` or ``None``.
     """
     if int(forced.sum()) == 0:
         return None
     grid = ctx.stateseq.grid.astype(np.int64)
     addrs = ctx.stateseq.addrs
     n_forced = int(forced.sum())
+    max_set = 6
     cands = []
     for j in range(grid.shape[1]):
         col = grid[:, j]
@@ -1467,6 +1489,11 @@ def _find_override(forced, ctx, max_terms: int = 3):
         uniq = np.unique(fc)
         if len(uniq) == 1:
             cands.append((col == int(uniq[0]), (int(addrs[j]), 0xFF, int(uniq[0]))))
+        elif 2 <= len(uniq) <= max_set and len(uniq) < len(np.unique(col)):
+            # A force gated by the cell holding one of a few states (recall 1.0 by
+            # construction); the greedy precision/strict-improvement gating below
+            # rejects it unless it genuinely tightens the selection.
+            cands.append((np.isin(col, uniq), (int(addrs[j]), "in", tuple(int(x) for x in uniq))))
         for b in range(8):
             bit = (fc >> b) & 1
             if bit.min() == bit.max():
@@ -1778,15 +1805,37 @@ def _composite16(trace, sid_addr, reg_off, ctx):
             "overrides": [],
         }
         modelled = (base_val + _comp_part(mod, n, ctx.sampler)) & 0xFFFF
-        forced = np.where(modelled == target, -1, out_byte)
-        ov = _override_descriptor(forced, ctx)
-        if ov is not None:
-            desc["overrides"].append(ov)
+        _best_composite_override(desc, modelled, target, out_byte, target_byte, n, ctx)
         fid = float(np.mean(_recon_composite(desc, n, ctx.sampler) == target_byte))
         desc["residual"] = fid
         if fid > best_fid:
             best_fid, best_desc = fid, desc
     return best_desc
+
+
+def _best_composite_override(desc, modelled, target, out_byte, target_byte, n, ctx):
+    """Attach the per-byte residual override only when it reconstructs strictly
+    better; none otherwise.
+
+    The forced value is the register byte on the frames the base+mod model fails
+    (a note-onset reset / hard-restart), gated by a recovered cell predicate (an
+    equality, single-bit, or small value-membership test -- see
+    :func:`_find_override`). Strictly non-worsening: an override that does not
+    raise reconstruction (a spurious membership predicate, say) is dropped, so a
+    register an override already nails is never displaced.
+    """
+    base_fid = float(np.mean(_recon_composite(desc, n, ctx.sampler) == target_byte))
+    candidates = []
+    ov_b = _override_descriptor(np.where(modelled == target, -1, out_byte).astype(np.int64), ctx)
+    if ov_b is not None:
+        candidates.append(ov_b)
+    best_fid, best_ov = base_fid, None
+    for ov in candidates:
+        desc["overrides"] = [ov]
+        fid = float(np.mean(_recon_composite(desc, n, ctx.sampler) == target_byte))
+        if fid > best_fid:
+            best_fid, best_ov = fid, ov
+    desc["overrides"] = [best_ov] if best_ov is not None else []
 
 
 def _composite8(sid_addr, series, ctx):
@@ -1923,17 +1972,64 @@ def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
     _frac, gj, cj = best
     if gj is None or gj == cj:
         return None
-    recon = (full[gj] & full[cj]) & 0xFF
-    fid = float(np.mean(recon == s))
-    if fid < min_fid:
-        return None
-    return {
+    desc = {
         "type": "AND",
         "cell_a": int(addrs[cj]),
         "cell_b": int(addrs[gj]),
         "sid": int(sid_addr),
-        "residual": fid,
+        "overrides": [],
     }
+    work = _and_recon_masked(desc, ctx)
+    desc["residual"] = float(np.mean(work == s))
+    # The steady CTRL is wave AND gate; the note-onset / hard-restart frames force
+    # a control byte the shadow never carries. Recover those as value-forcing
+    # overrides (same greedy, strictly-improving pass as the table-walk path) so a
+    # gated wave-table CTRL written through a shadow cell recovers byte-exact.
+    _recover_pair_overrides(desc, s, ctx)
+    if desc["residual"] < min_fid:
+        return None
+    return desc
+
+
+def _and_recon_masked(desc, ctx) -> np.ndarray:
+    """``_recon_and`` with the pre-first-write power-on default applied (for scoring)."""
+    base = _recon_and(desc, ctx.n_frames, ctx.sampler)
+    written = ctx.sampler.written_mask(desc["sid"])
+    return np.where(written, base, 0)
+
+
+def _recover_pair_overrides(desc, series, ctx, max_overrides: int = 4):
+    """Recover value-forcing overrides over an ``AND`` pair recon (CTRL onsets).
+
+    Mirrors :func:`_recover_walk_overrides`: each onset/hard-restart byte the
+    wave-AND-gate base fails to explain is forced where a recovered cell predicate
+    holds, taken greedily and kept only when it strictly raises reproduction (so it
+    never regresses a pair that already reconstructs exactly).
+    """
+    sampler = ctx.sampler
+    if sampler is None:
+        return
+    series = np.asarray(series, dtype=np.int64)
+    written = sampler.written_mask(desc["sid"])
+    cur = _recon_and(desc, ctx.n_frames, sampler)
+    work = np.where(written, cur, 0)
+    best_fid = float(np.mean(work == series))
+    overrides = []
+    for _ in range(max_overrides):
+        forced = np.where(series == work, -1, series).astype(np.int64)
+        ov = _override_descriptor(forced, ctx)
+        if ov is None or ov in overrides:
+            break
+        cur2 = _apply_overrides(cur, [ov], sampler)
+        work2 = np.where(written, cur2, 0)
+        fid2 = float(np.mean(work2 == series))
+        if fid2 <= best_fid:
+            break
+        overrides.append(ov)
+        cur, work, best_fid = cur2, work2, fid2
+    if overrides:
+        desc["overrides"] = overrides
+        desc["residual"] = best_fid
 
 
 def _maybe_and_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
@@ -1952,6 +2048,122 @@ def _maybe_and_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
         keep.update(and_d)
         return keep
     return result
+
+
+def _attach_or_prelude(desc, series, ctx, cells, max_latches: int = 6):
+    """Capture the held-seed prelude before an OR's feeder cells start updating.
+
+    Like :func:`_attach_seed_prelude`: before its source cells' first RAM write the
+    register holds its note-on seed (e.g. ``$D418`` holds ``mode|$0F`` until the
+    volume cell is first stored), but the captured cells still read their power-on
+    default, so the OR replay is wrong on those leading frames. Record that bounded
+    hold as SEQ latches; the OR drives every frame the cells are live. Only a few
+    latches (a genuine seed prelude, not modulation) are recorded.
+    """
+    sampler = ctx.sampler
+    if sampler is None:
+        return
+    ends = [sampler.cell_first_frame(int(c)) for c in cells]
+    end = max(ends) if ends else 0
+    n = len(series)
+    if not 0 < end < n:
+        return
+    frames, values = _seq_latches(np.asarray(series, dtype=np.int64)[:end])
+    if len(frames) > max_latches:
+        return
+    desc["prelude_end"] = int(end)
+    desc["prelude_frames"] = frames
+    desc["prelude_values"] = values
+
+
+def _or_pair(sid_addr, series, ctx, min_fid: float = 0.999):
+    """Recover a register written as ``cellA | cellB`` or ``cell | const``.
+
+    The global MODE/VOL register ``$D418`` is blitted as ``filter_mode | volume``
+    (JCH ``$1793 | $1009``; defMON ``mode | $0F``) -- a bitwise OR of a captured
+    cell with another captured cell or a constant nibble, sampled at the SID-write
+    instant. Neither operand alone reproduces it, so the per-frame machinery only
+    partly fits it; the exact OR reproduces it byte-for-byte. Mirrors
+    :func:`_xor_pair`/:func:`_and_pair`: searches low-entropy (control-like) cells
+    over a frame subsample, fitting each against every other cell and against its
+    per-bit-optimal constant, then verifies the best model (plus any held-seed
+    prelude) on all frames. Returns an ``OR`` descriptor only when it reproduces
+    ``>= min_fid``.
+    """
+    ss = ctx.stateseq
+    if ss.grid.shape[1] == 0 or ctx.sampler is None:
+        return None
+    s = np.asarray(series, dtype=np.int64) & 0xFF
+    n = len(s)
+    grid = ss.grid
+    addrs = ss.addrs
+    cols = [j for j in range(grid.shape[1]) if len(np.unique(grid[:, j])) <= 24]
+    if not cols:
+        return None
+    mat_full = np.stack(
+        [ctx.sampler.at_write(int(addrs[j]), sid_addr).astype(np.int64) & 0xFF for j in cols],
+        axis=1,
+    )
+    sample = np.unique(np.linspace(0, n - 1, min(n, 512)).astype(np.int64))
+    mat = mat_full[sample]
+    ss_s = s[sample]
+    bits = (1 << np.arange(8)).astype(np.int64)
+    sb = (ss_s[:, None] & bits) > 0
+    best = (-1.0, None, None, None)  # (frac, ai, bi, const)
+    for ai in range(len(cols)):
+        a = mat[:, ai]
+        # cell | const: each bit set in the constant always matches series' 1-bits;
+        # leaving it clear matches where the cell already agrees -- pick per bit.
+        ab = (a[:, None] & bits) > 0
+        kbits = sb.sum(axis=0) >= (sb == ab).sum(axis=0)
+        k = int((kbits.astype(np.int64) * bits).sum())
+        fk = float(np.mean(((a | k) & 0xFF) == ss_s))
+        if fk > best[0]:
+            best = (fk, ai, None, k)
+        # cell | cell
+        f = (((a[:, None] | mat) & 0xFF) == ss_s[:, None]).mean(axis=0)
+        bi = int(f.argmax())
+        if f[bi] > best[0] and bi != ai:
+            best = (float(f[bi]), ai, bi, None)
+    _frac, ai, bi, k = best
+    if ai is None:
+        return None
+    desc = {"type": "OR", "cell_a": int(addrs[cols[ai]]), "sid": int(sid_addr)}
+    cells = [desc["cell_a"]]
+    if bi is None:
+        desc["const"] = int(k)
+    else:
+        desc["cell_b"] = int(addrs[cols[bi]])
+        cells.append(desc["cell_b"])
+    _attach_or_prelude(desc, s, ctx, cells)
+    recon = _recon_or(desc, n, ctx.sampler)
+    fid = float(np.mean(recon == s))
+    if fid < min_fid:
+        return None
+    desc["residual"] = fid
+    return desc
+
+
+def _maybe_or_reg(sid_addr, series, ctx, result, min_fid: float = 0.999):
+    """Upgrade a per-frame register to ``cellA | cellB`` / ``cell | const`` when it wins.
+
+    The MODE/VOL ``$D418`` blit (``filter_mode | volume``) and similar OR-folds are
+    not single-cell generators, so the generic per-frame path leaves them
+    imperfect. Tried on any register the generic path did not already reconstruct
+    perfectly, and adopted only when the OR reproduces ``>= min_fid`` AND strictly
+    beats the current descriptor -- so a register already nailed (including a
+    freshly adopted XOR/AND) is never displaced. Not CTRL-only, unlike
+    :func:`_maybe_xor_ctrl`.
+    """
+    cur = _descriptor_fidelity(result, series, ctx)
+    if cur >= 1.0:
+        return result
+    or_d = _or_pair(sid_addr, series, ctx, min_fid)
+    if or_d is None or or_d["residual"] <= cur:
+        return result
+    keep = {k: result[k] for k in ("addr", "store_pcs", "n_writes") if k in result}
+    keep.update(or_d)
+    return keep
 
 
 # -- event/state correlation ----------------------------------------------
@@ -2114,6 +2326,22 @@ class _CellSampler:
         if len(cyc) == 0:
             return 0
         return int(np.searchsorted(self.ticks, np.uint64(int(cyc.min())), side="right")) - 1
+
+    def first_live_frame(self, cell_addr, sid_addr) -> int:
+        """First frame whose at-write sample of ``cell_addr`` reflects a real write.
+
+        A feeder cell may be written later in its first frame than the register's
+        store, so :meth:`at_write` still reads the power-on default on that frame
+        even though :meth:`cell_first_frame` counts it written. The held-seed
+        prelude must cover up to here -- the first frame the captured cell actually
+        drives the register.
+        """
+        cyc, _ = self._cell_writes(int(cell_addr))
+        if len(cyc) == 0:
+            return self.n
+        sample = self.write_cycles(sid_addr) + np.uint64(2)
+        live = np.nonzero(sample >= np.uint64(int(cyc.min())))[0]
+        return int(live[0]) if len(live) else self.n
 
     def written_mask(self, sid_addr) -> np.ndarray:
         """Per-frame bool: True once ``sid_addr`` has been written by frame end.
@@ -2318,7 +2546,13 @@ def _apply_overrides(out, overrides, sampler) -> np.ndarray:
     for ov in overrides:
         sel = np.ones(n, dtype=bool)
         for cell, cmask, cval in ov.get("predicate", []):
-            sel &= (sampler.eof(cell) & cmask) == cval
+            col = sampler.eof(cell)
+            # ``cmask == "in"`` marks a value-membership term (cval is the value
+            # tuple); an integer ``cmask`` is the historical bit/equality test.
+            if cmask == "in":
+                sel &= np.isin(col, np.asarray(cval, dtype=col.dtype))
+            else:
+                sel &= (col & cmask) == cval
         out = np.where(sel, int(ov["force"]), out)
     return out
 
@@ -2388,12 +2622,46 @@ def _recon_xor(desc, n, sampler) -> np.ndarray:
 
 
 def _recon_and(desc, n, sampler) -> np.ndarray:
-    """Regenerate a ``cellA AND cellB`` CTRL register from its two captured cells."""
+    """Regenerate a ``cellA AND cellB`` CTRL register from its two captured cells.
+
+    The waveform-shadow cell AND the gate-mask cell reproduce the steady CTRL; the
+    note-onset / hard-restart frames force a control byte (e.g. ``$08``/``$09``/
+    ``$81``) the shadow never carries, recovered as value-forcing overrides.
+    """
     if sampler is None:
         return np.zeros(n, dtype=np.int64)
     a = sampler.at_write(desc["cell_a"], desc["sid"]).astype(np.int64)
     b = sampler.at_write(desc["cell_b"], desc["sid"]).astype(np.int64)
-    return (a & b) & 0xFF
+    out = (a & b) & 0xFF
+    return _apply_overrides(out, desc.get("overrides", []), sampler)
+
+
+def _recon_or(desc, n, sampler) -> np.ndarray:
+    """Regenerate an ``OR`` register (``cellA | cellB`` or ``cell | const``).
+
+    Samples the source cell(s) at the write instant and OR-folds the constant mode
+    nibble; the held-seed prelude (if recovered) overrides the leading frames before
+    the cells' first write, mirroring :func:`_recon_bacc`.
+    """
+    if sampler is None:
+        return np.zeros(n, dtype=np.int64)
+    out = sampler.at_write(desc["cell_a"], desc["sid"]).astype(np.int64)
+    if desc.get("cell_b") is not None:
+        out = out | sampler.at_write(desc["cell_b"], desc["sid"]).astype(np.int64)
+    if desc.get("const") is not None:
+        out = out | int(desc["const"])
+    out &= 0xFF
+    end = desc.get("prelude_end")
+    if end:
+        prelude = _recon_seq(
+            {
+                "latch_frames": desc.get("prelude_frames", [0]),
+                "latch_values": desc.get("prelude_values", [0]),
+            },
+            n,
+        )
+        out = np.where(np.arange(n) < int(end), prelude & 0xFF, out)
+    return out
 
 
 def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndarray:
@@ -2406,7 +2674,8 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
     captured cell when one was recovered); ``COMPOSITE`` -> base + modulation +
     overrides; ``FEEDER`` -> a global filter register's captured RAM feeder cell
     sampled at the write instant; ``XOR`` -> a CTRL register's ``cellA XOR cellB``
-    (base/eor gate idiom). Cell-referencing descriptors read those cells
+    (base/eor gate idiom); ``OR`` -> a MODE/VOL-style ``cellA | cellB`` /
+    ``cell | const`` blit. Cell-referencing descriptors read those cells
     from ``trace`` (or a shared ``sampler``); ``XSTATE`` has no single-generator
     model yet and returns ``None``.
     """
@@ -2427,6 +2696,7 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
             "FEEDER": _recon_feeder,
             "XOR": _recon_xor,
             "AND": _recon_and,
+            "OR": _recon_or,
         }
         if kind in builders:
             recon = builders[kind](descriptor, n, smp)
