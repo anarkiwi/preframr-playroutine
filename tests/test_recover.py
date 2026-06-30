@@ -1273,3 +1273,66 @@ def test_table_walk_scan_parity(seed):
         ref = _ref_table_walk_scan(series, ctx)
         opt = _table_walk_scan(series, ctx)
         assert _walk_eq(ref, opt), (seed, ref, opt)
+
+
+# -- ping-pong (clamp-and-flip) BACC --------------------------------------
+
+from preframr_playroutine.recover import (  # noqa: E402
+    _recon_bacc_full,
+    _simulate_pingpong,
+    _simulate_reflect,
+    segmented_pingpong,
+)
+
+
+def test_fit_bacc_pingpong_clamp_flip():
+    # Asymmetric clamp-and-flip sweep (defMON PW): saturates at the bounds and
+    # reverses, with different up/down step magnitudes.
+    lo, hi, up, down = 10, 250, 5, 7
+    series, _ = _simulate_pingpong(lo, hi, lo, hi, up, down, lo, 1, 600)
+    fit = fit_bacc(series)
+    assert fit is not None
+    assert fit["type"] == "BACC"
+    assert fit["mode"] == "pingpong"
+    assert fit["step"] == up
+    assert fit["down_step"] == down
+    assert fit["lo"] == lo and fit["hi"] == hi
+    assert fit["clamp_lo"] == lo and fit["clamp_hi"] == hi
+    assert fit["residual"] >= 0.99
+
+
+def test_reconstruct_bacc_pingpong_roundtrip():
+    lo, hi, up, down = 10, 250, 5, 7
+    n = 600
+    series, _ = _simulate_pingpong(lo, hi, lo, hi, up, down, lo, 1, n)
+    fit = fit_bacc(series)
+    assert fit is not None and fit["mode"] == "pingpong"
+    desc = dict(fit, byte_role="full")
+    recon = reconstruct_register(desc, _ticks(n))
+    assert np.array_equal(recon, series)
+
+
+def test_segmented_pingpong_per_note_roundtrip():
+    # Two notes with different seeds and rates, reseeded; the descriptor keeps a
+    # per-segment step/direction and regenerates the whole series exactly.
+    s1, _ = _simulate_pingpong(0, 200, 0, 200, 4, 6, 0, 1, 150)
+    s2, _ = _simulate_pingpong(0, 200, 0, 200, 8, 5, 50, 1, 150)
+    series = np.concatenate([s1, s2])
+    fit = segmented_pingpong(series, [0, 150])
+    assert fit is not None
+    assert fit["mode"] == "pingpong"
+    assert fit["clamp_lo"] == 0 and fit["clamp_hi"] == 200
+    recon = _recon_bacc_full(fit, len(series))
+    assert np.array_equal(recon, series)
+    desc = dict(fit, byte_role="full")
+    recon2 = reconstruct_register(desc, _ticks(len(series)))
+    assert np.array_equal(recon2, series)
+
+
+def test_pingpong_does_not_steal_mirror_reflect():
+    # A true mirror reflect (overshoot mirrored, not clamped) must still fit as
+    # reflect -- the new clamp mode must not over-fire on clean reflect/saw/wrap.
+    series, _ = _simulate_reflect(0, 20, 3, 0, 1, 400)
+    fit = fit_bacc(np.asarray(series))
+    assert fit is not None
+    assert fit["mode"] == "reflect"

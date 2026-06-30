@@ -183,6 +183,81 @@ def _fit_reflect(series, lo, hi, step):
     }
 
 
+def _simulate_pingpong(lo, hi, clamp_lo, clamp_hi, up_step, down_step, start, direction, n):
+    """Simulate a clamp-and-flip (ping-pong) accumulator; return (series, flips).
+
+    Unlike the mirror reflect, an overshoot saturates at a fixed clamp value and
+    reverses direction (defMON PW: ceiling -> ``clamp_hi``, floor -> ``clamp_lo``).
+    The step magnitude may differ by direction (``up_step``/``down_step``).
+    """
+    out = np.empty(n, dtype=np.int64)
+    v = start
+    d = direction
+    flips = []
+    for i in range(n):
+        out[i] = v
+        step = up_step if d > 0 else down_step
+        nv = v + d * step
+        if nv > hi:
+            d = -d
+            nv = clamp_hi
+            flips.append(i)
+        elif nv < lo:
+            d = -d
+            nv = clamp_lo
+            flips.append(i)
+        v = nv
+    return out, flips
+
+
+def _dominant_signed_step(diffs: np.ndarray, positive: bool) -> int:
+    """Most common positive (or |negative|) per-frame step."""
+    arr = diffs[diffs > 0] if positive else -diffs[diffs < 0]
+    if len(arr) == 0:
+        return 0
+    vals, counts = np.unique(arr, return_counts=True)
+    return int(vals[counts.argmax()])
+
+
+def _fit_pingpong(series, lo, hi):
+    """Fit a clamp-and-flip (ping-pong) accumulator (defMON PW sweep).
+
+    The value saturates at ``lo``/``hi`` and reverses (rather than mirroring the
+    overshoot like ``_fit_reflect``); up and down step magnitudes are recovered
+    independently. Requires both directions to be present.
+    """
+    diffs = np.diff(series)
+    up = _dominant_signed_step(diffs, True)
+    down = _dominant_signed_step(diffs, False)
+    if up == 0 or down == 0:
+        return None
+    n = len(series)
+    nz = diffs[diffs != 0]
+    # A ping-pong sweep ramps for many frames between reversals; a fast oscillation
+    # (a short table walk read as ±step) is not one. Require long monotonic runs.
+    signs = np.sign(nz)
+    n_rev = int(np.count_nonzero(np.diff(signs))) if len(signs) > 1 else 0
+    if n_rev and n / (n_rev + 1) < 3.0:
+        return None
+    direction = 1 if nz[0] > 0 else -1
+    pred, flips = _simulate_pingpong(lo, hi, lo, hi, up, down, int(series[0]), direction, n)
+    residual = float(np.mean(pred == series))
+    period = int(np.median(np.diff(flips))) if len(flips) >= 2 else None
+    return {
+        "mode": "pingpong",
+        "step": int(up),
+        "down_step": int(down),
+        "lo": int(lo),
+        "hi": int(hi),
+        "clamp_lo": int(lo),
+        "clamp_hi": int(hi),
+        "phase": int(series[0]),
+        "direction": int(direction),
+        "period": period,
+        "residual": residual,
+    }
+
+
 def _fit_linear(series, lo, hi, step):
     """Fit a wrapping/sawtooth accumulator: value = lo + (start-lo + step*i) % M.
 
@@ -240,7 +315,12 @@ def fit_bacc(series, min_residual: float = 0.8):
         return None
     best = None
     best_res = -1.0
-    for cand in (_fit_reflect(series, lo, hi, step), _fit_linear(series, lo, hi, step)):
+    candidates = (
+        _fit_reflect(series, lo, hi, step),
+        _fit_linear(series, lo, hi, step),
+        _fit_pingpong(series, lo, hi),
+    )
+    for cand in candidates:
         if cand is not None and cand["residual"] > best_res:
             best = cand
             best_res = cand["residual"]
@@ -468,9 +548,8 @@ def segmented_bacc(series, reset_frames, min_residual: float = 0.6, min_segments
         modes[fit["mode"]] = modes.get(fit["mode"], 0) + 1
     resets = [int(b) for b in bounds[:-1]]
     seeds = [int(series[b]) for b in resets]
-    return {
+    base = {
         "type": "BACC",
-        "mode": max(modes, key=modes.get),
         "step": int(step),
         "lo": int(min(f["lo"] for f in modal)),
         "hi": int(max(f["hi"] for f in modal)),
@@ -480,6 +559,95 @@ def segmented_bacc(series, reset_frames, min_residual: float = 0.6, min_segments
         "segmented": True,
         "resets": resets,
         "seeds": seeds,
+    }
+    out = dict(base, mode=max(modes, key=modes.get))
+    # A clamp-and-flip (ping-pong) sweep degenerates to a plain ramp away from its
+    # bounds, so non-reversing note segments fit as reflect/saw and outvote it; the
+    # only structural difference is the boundary. When any segment fit ping-pong,
+    # compare both modes by how well each regenerates the whole series and keep the
+    # better -- the boundary is the only place they disagree.
+    if "pingpong" in modes:
+        pp = [f for f in modal if f["mode"] == "pingpong"]
+        downs = {}
+        for f in pp:
+            downs[f["down_step"]] = downs.get(f["down_step"], 0) + 1
+        ping = dict(
+            base,
+            mode="pingpong",
+            down_step=int(max(downs, key=downs.get)),
+            clamp_lo=int(min(f["clamp_lo"] for f in pp)),
+            clamp_hi=int(max(f["clamp_hi"] for f in pp)),
+        )
+        if _seg_fidelity(ping, series) > _seg_fidelity(out, series):
+            out = ping
+    return out
+
+
+def _seg_fidelity(desc, series) -> float:
+    """Fraction of frames a segmented BACC descriptor regenerates from its seeds."""
+    recon = _recon_bacc_full(desc, len(series))
+    return float(np.mean(recon == np.asarray(series, dtype=np.int64)))
+
+
+def segmented_pingpong(series, reset_frames, min_residual: float = 0.6, min_reversing: int = 2):
+    """Recover a per-note clamp-and-flip (ping-pong) sweep (defMON PW).
+
+    Each note seeds the accumulator and sets its own signed rate, so step and
+    direction vary per segment while the floor/ceiling clamp is shared. Unlike
+    :func:`segmented_bacc`, no single modal step is required: every segment keeps
+    its own step/direction. The shared bounds/clamps are taken from the segments
+    that actually reverse (where the clamp is observed). Returns a ``pingpong``
+    BACC descriptor with per-segment ``steps``/``down_steps``/``directions`` or
+    ``None`` when too few segments reverse.
+    """
+    series = np.asarray(series, dtype=np.int64).ravel()
+    if len(series) < 8:
+        return None
+    cuts = set(int(x) for x in _discontinuities(series))
+    cuts.update(int(x) for x in reset_frames if 0 < int(x) < len(series))
+    bounds = [0] + sorted(cuts) + [len(series)]
+    resets, seeds, steps, downs, dirs = [], [], [], [], []
+    reversing = []
+    for k in range(len(bounds) - 1):
+        seg = series[bounds[k] : bounds[k + 1]]
+        d = np.diff(seg)
+        nz = d[d != 0]
+        up = _dominant_signed_step(d, True)
+        down = _dominant_signed_step(d, False)
+        resets.append(int(bounds[k]))
+        seeds.append(int(seg[0]))
+        steps.append(int(up or down or 1))
+        downs.append(int(down or up or 1))
+        dirs.append(1 if (len(nz) == 0 or nz[0] > 0) else -1)
+        strip = _strip_holds(seg)
+        if len(strip) >= 4 and up and down:
+            fit = _fit_pingpong(strip, int(strip.min()), int(strip.max()))
+            if fit is not None and fit["residual"] >= min_residual:
+                reversing.append(fit)
+    if len(reversing) < min_reversing:
+        return None
+    lo = int(min(f["lo"] for f in reversing))
+    hi = int(max(f["hi"] for f in reversing))
+    rate = {}
+    for s in steps:
+        rate[s] = rate.get(s, 0) + 1
+    return {
+        "type": "BACC",
+        "mode": "pingpong",
+        "step": int(max(rate, key=rate.get)),
+        "lo": lo,
+        "hi": hi,
+        "clamp_lo": lo,
+        "clamp_hi": hi,
+        "segmented": True,
+        "resets": resets,
+        "seeds": seeds,
+        "steps": steps,
+        "down_steps": downs,
+        "directions": dirs,
+        "n_segments": int(len(resets)),
+        "n_fit": int(len(reversing)),
+        "residual": float(np.mean([f["residual"] for f in reversing])),
     }
 
 
@@ -790,23 +958,38 @@ def _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx):
             lo, hi = (series, partner) if partner_off == 1 else (partner, series)
             combined = combine_lohi(lo, hi)
 
+    series = np.asarray(series, dtype=np.int64)
+    # Candidate accumulators, 16-bit (lo/hi combined) first so it wins ties: the
+    # combined form is the true generator domain (a fast-wrapping 8-bit byte fits
+    # spuriously but reconstructs poorly). Pick the one that best regenerates the
+    # register's own series rather than the one with the most fittable segments.
+    cands = []
     if combined is not None:
-        glob = fit_bacc(combined)
-        if glob is not None:
-            return _bacc_finish(glob, combined, 16, role)
-    glob = fit_bacc(series)
-    if glob is not None:
-        return _bacc_finish(glob, series, 8, "full")
+        cands.append((fit_bacc(combined), combined, 16, role))
+        cands.append((segmented_pingpong(combined, resets), combined, 16, role))
+        cands.append((segmented_bacc(combined, resets), combined, 16, role))
+    cands.append((fit_bacc(series), series, 8, "full"))
+    cands.append((segmented_bacc(series, resets), series, 8, "full"))
+    best = None
+    best_fid = -1.0
+    for fit, src, width, crole in cands:
+        if fit is None:
+            continue
+        finished = _bacc_finish(fit, src, width, crole)
+        fid = _candidate_fidelity(finished, series, crole)
+        if fid > best_fid:
+            best, best_fid = finished, fid
+    return best
 
-    best = segmented_bacc(series, resets)
-    best_src = (series, 8, "full")
-    if combined is not None:
-        cb = segmented_bacc(combined, resets)
-        if cb is not None and (best is None or cb["n_fit"] >= best["n_fit"]):
-            best, best_src = cb, (combined, 16, role)
-    if best is None:
-        return None
-    return _bacc_finish(best, *best_src)
+
+def _candidate_fidelity(desc, series, role) -> float:
+    """Fraction of frames a BACC descriptor regenerates the 8-bit register series."""
+    full = _recon_bacc_full(desc, len(series))
+    if role == "lo":
+        full = full & 0xFF
+    elif role == "hi":
+        full = (full >> 8) & 0xFF
+    return float(np.mean(full == series))
 
 
 def _bacc_finish(fit, src, width, role):
@@ -1728,13 +1911,32 @@ def _recon_seq(desc, n) -> np.ndarray:
     return values[idx]
 
 
-def _run_recurrence(mode, step, lo, hi, seed, length, modulus) -> np.ndarray:
+def _run_recurrence(
+    mode,
+    step,
+    lo,
+    hi,
+    seed,
+    length,
+    modulus,
+    down_step=None,
+    clamp_lo=None,
+    clamp_hi=None,
+    direction=None,
+) -> np.ndarray:
     """Regenerate one bounded-accumulator segment from a seed."""
     if length <= 0:
         return np.empty(0, dtype=np.int64)
+    if mode == "pingpong" and hi > lo:
+        d = (1 if seed <= (lo + hi) // 2 else -1) if direction is None else direction
+        clo = lo if clamp_lo is None else clamp_lo
+        chi = hi if clamp_hi is None else clamp_hi
+        ds = step if down_step is None else down_step
+        series, _ = _simulate_pingpong(lo, hi, clo, chi, step, ds, int(seed), d, length)
+        return series
     if mode == "reflect" and hi > lo:
-        direction = 1 if seed <= (lo + hi) // 2 else -1
-        series, _ = _simulate_reflect(lo, hi, step, int(seed), direction, length)
+        d = (1 if seed <= (lo + hi) // 2 else -1) if direction is None else direction
+        series, _ = _simulate_reflect(lo, hi, step, int(seed), d, length)
         return series
     mod = modulus if modulus else (hi - lo + step)
     if mod <= 0:
@@ -1756,10 +1958,21 @@ def _recon_bacc_full(desc, n) -> np.ndarray:
     lo = desc["lo"]
     hi = desc["hi"]
     modulus = desc.get("modulus")
+    down_step = desc.get("down_step")
+    clamp_lo = desc.get("clamp_lo")
+    clamp_hi = desc.get("clamp_hi")
+    steps = desc.get("steps")
+    down_steps = desc.get("down_steps")
+    directions = desc.get("directions")
     for i, start in enumerate(resets):
         length = bounds[i + 1] - start
         seed = seeds[i] if i < len(seeds) else lo
-        out[start : start + length] = _run_recurrence(mode, step, lo, hi, seed, length, modulus)
+        st = steps[i] if steps and i < len(steps) else step
+        ds = down_steps[i] if down_steps and i < len(down_steps) else down_step
+        di = directions[i] if directions and i < len(directions) else None
+        out[start : start + length] = _run_recurrence(
+            mode, st, lo, hi, seed, length, modulus, ds, clamp_lo, clamp_hi, di
+        )
     return out
 
 
