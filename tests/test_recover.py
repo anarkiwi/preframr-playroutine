@@ -502,6 +502,43 @@ def test_classify_bacc():
     assert 0x1100 in res["store_pcs"]
 
 
+def test_classify_bacc_held_seed_prelude_before_cell_write():
+    # A note-reseeded PW accumulator captured by a feeder cell, preceded by a
+    # pre-dwell hold at the note-on seed where the cell is not yet written (the
+    # MusicAssembler PW case). The cell drives the modulated frames; the held-seed
+    # prelude must reconstruct from latches so the register round-trips exactly.
+    cell = 0x40
+    seed = 0x08
+    note_len = 8
+    predwell = 9
+    # Per-note saw whose stride varies between notes: the modal-step recurrence
+    # mis-fits the off-modal notes while the captured cell reproduces every
+    # modulated frame, so the cell attaches.
+    steps = [6, 6, 5, 6, 5, 6]
+    ramp = [(0x10 + st * t) & 0xFF for st in steps for t in range(note_len)]
+    values = [seed] * predwell + ramp
+    recs = []
+    ramwr = []
+    for i, v in enumerate(values):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        if i < predwell:
+            ctrl = 0x40  # gate off during the held-seed pre-dwell
+        else:
+            j = i - predwell
+            ctrl = 0x40 if (j % note_len) == note_len - 1 else 0x41
+            ramwr.append(_ra(tick + 10, cell, int(v)))  # cell written only while modulating
+        recs.append(_ev(tick + 8, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1500))
+        recs.append(_ev(tick + 12, SID_WRITE, reg=2, value=int(v), addr=0xD402, aux=0x1388))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = classify_register(trace, 0xD402)
+    assert res["type"] == "BACC"
+    assert res["cell"] == cell
+    assert res["prelude_end"] == predwell
+    rt = round_trip(trace)
+    assert rt[0xD402] == 1.0
+
+
 def test_classify_table_walk():
     ram = np.zeros(65536, dtype=np.uint8)
     base = 0x2200

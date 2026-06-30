@@ -1181,6 +1181,7 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
             result["cell"] = cell
             result["sid"] = int(sid_addr)
             result["cell_frac"] = round(float(frac), 4)
+            _attach_seed_prelude(result, series, ctx)
         return result
 
     result = _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
@@ -1209,6 +1210,32 @@ def _bacc_with_feeder(bacc, series, sid_addr, ctx):
         bacc["sid"] = int(sid_addr)
         bacc["cell_frac"] = round(float(frac), 4)
     return bacc
+
+
+def _attach_seed_prelude(result, series, ctx, max_latches: int = 6):
+    """Fill the pre-modulation held-seed prelude of a cell-fed accumulator.
+
+    Before its feeder cell's first RAM write the register holds its note-on seed
+    (the instrument PW seed loaded once and held until modulation starts), but the
+    captured cell still reads its power-on default, so the cell replay is wrong on
+    those leading frames. Capture that bounded held prelude as SEQ latches; the
+    cell drives every frame it is actually written. Recorded only when the hold is
+    a few latches (a genuine seed prelude, not arbitrary modulation), so it never
+    displaces the captured cell where the cell is live.
+    """
+    sampler = ctx.sampler
+    cell = result.get("cell")
+    if sampler is None or cell is None:
+        return
+    end = sampler.cell_first_frame(cell)
+    if not 0 < end < ctx.n_frames:
+        return
+    frames, values = _seq_latches(np.asarray(series, dtype=np.int64)[:end])
+    if len(frames) > max_latches:
+        return
+    result["prelude_end"] = int(end)
+    result["prelude_frames"] = frames
+    result["prelude_values"] = values
 
 
 def _classify_freq(trace, sid_addr, series, voice, reg_off, ctx, result):
@@ -2081,6 +2108,13 @@ class _CellSampler:
             self._atwrite[key] = _carry_at(cyc, val, sample)
         return self._atwrite[key]
 
+    def cell_first_frame(self, cell_addr) -> int:
+        """Frame index of a RAM cell's first write (``0`` if never written)."""
+        cyc, _ = self._cell_writes(int(cell_addr))
+        if len(cyc) == 0:
+            return 0
+        return int(np.searchsorted(self.ticks, np.uint64(int(cyc.min())), side="right")) - 1
+
     def written_mask(self, sid_addr) -> np.ndarray:
         """Per-frame bool: True once ``sid_addr`` has been written by frame end.
 
@@ -2235,7 +2269,18 @@ def _recon_bacc(desc, n, sampler=None) -> np.ndarray:
     # captured, regenerate from it (same "else use the captured cell" fallback as
     # the table-walk cursor); otherwise run the pure recurrence.
     if sampler is not None and desc.get("cell") is not None and desc.get("sid") is not None:
-        return sampler.at_write(desc["cell"], desc["sid"]) & 0xFF
+        out = sampler.at_write(desc["cell"], desc["sid"]) & 0xFF
+        end = desc.get("prelude_end")
+        if end:
+            prelude = _recon_seq(
+                {
+                    "latch_frames": desc.get("prelude_frames", [0]),
+                    "latch_values": desc.get("prelude_values", [0]),
+                },
+                n,
+            )
+            out = np.where(np.arange(n) < int(end), prelude & 0xFF, out)
+        return out
     full = _recon_bacc_full(desc, n)
     role = desc.get("byte_role", "full")
     if role == "lo":
