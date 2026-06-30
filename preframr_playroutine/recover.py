@@ -1553,6 +1553,7 @@ class _CellSampler:
         self._eof: dict = {}
         self._writecyc: dict = {}
         self._atwrite: dict = {}
+        self._written: dict = {}
 
     def _cell_writes(self, addr):
         sel = self._rw[self._rw["addr"] == addr]
@@ -1590,6 +1591,24 @@ class _CellSampler:
             cyc, val = self._cell_writes(int(cell_addr))
             self._atwrite[key] = _carry_at(cyc, val, sample)
         return self._atwrite[key]
+
+    def written_mask(self, sid_addr) -> np.ndarray:
+        """Per-frame bool: True once ``sid_addr`` has been written by frame end.
+
+        Before its first write a register holds the power-on default (``0``, the
+        oracle's carry value), so reconstruction zeros these leading frames.
+        """
+        sid_addr = int(sid_addr)
+        if sid_addr not in self._written:
+            wr = self.trace.sid_writes()
+            sel = wr[wr["addr"] == sid_addr]
+            mask = np.zeros(self.n, dtype=bool)
+            if len(sel):
+                cyc = np.sort(sel["cycle"])
+                pos = np.searchsorted(cyc, _frame_bounds(self.ticks), side="left")
+                mask = pos > 0
+            self._written[sid_addr] = mask
+        return self._written[sid_addr]
 
 
 def _sampler_for(ticks, trace, sampler):
@@ -1776,26 +1795,50 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
     """
     n = len(ticks)
     kind = descriptor.get("type")
+    smp = _sampler_for(ticks, trace, sampler)
     if kind == "CONST":
         value = descriptor.get("value")
-        return np.full(n, 0 if value is None else int(value), dtype=np.int64)
-    if kind == "SEQ":
-        return _recon_seq(descriptor, n)
-    smp = _sampler_for(ticks, trace, sampler)
-    builders = {
-        "BACC": _recon_bacc,
-        "TABLE_WALK": _recon_table,
-        "COMPOSITE": _recon_composite,
-        "PITCHWALK": _recon_pitchwalk,
-        "FEEDER": _recon_feeder,
-    }
-    if kind in builders:
-        return builders[kind](descriptor, n, smp)
-    # XSTATE: not yet modelled -- best effort is the closest observable feeder
-    # cell sampled at the write instant (or nothing if none was recorded).
-    if kind == "XSTATE" and smp is not None and descriptor.get("cell") is not None:
-        return smp.at_write(descriptor["cell"], descriptor["sid"]) & 0xFF
-    return None  # no model yet for this descriptor
+        recon = np.full(n, 0 if value is None else int(value), dtype=np.int64)
+    elif kind == "SEQ":
+        recon = _recon_seq(descriptor, n)
+    else:
+        builders = {
+            "BACC": _recon_bacc,
+            "TABLE_WALK": _recon_table,
+            "COMPOSITE": _recon_composite,
+            "PITCHWALK": _recon_pitchwalk,
+            "FEEDER": _recon_feeder,
+        }
+        if kind in builders:
+            recon = builders[kind](descriptor, n, smp)
+        # XSTATE: not yet modelled -- best effort is the closest observable feeder
+        # cell sampled at the write instant (or nothing if none was recorded).
+        elif kind == "XSTATE" and smp is not None and descriptor.get("cell") is not None:
+            recon = smp.at_write(descriptor["cell"], descriptor["sid"]) & 0xFF
+        else:
+            return None  # no model yet for this descriptor
+    return _default_until_first_write(recon, descriptor, smp)
+
+
+def _default_until_first_write(recon, descriptor, sampler):
+    """Hold the power-on default (``0``) on frames before a register's first write.
+
+    The oracle carries ``0`` until the player's first store to a register, but a
+    reconstruction back-fills its recovered value to frame 0, mismatching those
+    leading frames. Zero them to mirror the oracle. Strictly non-worsening: those
+    frames are ``0`` in the oracle by construction.
+    """
+    if recon is None or sampler is None:
+        return recon
+    addr = descriptor.get("addr")
+    if addr is None:
+        return recon
+    written = sampler.written_mask(addr)
+    if written.all():
+        return recon
+    recon = np.array(recon, dtype=np.int64, copy=True)
+    recon[~written] = 0
+    return recon
 
 
 def round_trip(trace, kind="auto") -> dict:
