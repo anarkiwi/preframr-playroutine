@@ -1172,16 +1172,21 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
         result.update(bacc)
         cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
         # The feeder cell captures dwell/hold the bare recurrence can miss, so it
-        # is used at reconstruction when attached (:func:`_recon_bacc`). Attach it
-        # only when it strictly beats the recurrence's own fidelity, so a model
-        # that already regenerates the register (e.g. the tick-banded sweep) is
-        # never displaced by a lower-fidelity captured cell.
+        # is used at reconstruction when attached (:func:`_recon_bacc`). The feeder
+        # plus its held-seed prelude (the captured cell drives every live frame, the
+        # prelude fills the pre-modulation leading hold the cell has not yet been
+        # written on) is attached only when it strictly beats the recurrence's own
+        # fidelity, so a model that already regenerates the register (e.g. the
+        # tick-banded sweep) is never displaced by a lower-fidelity captured cell.
         recurrence_fid = _candidate_fidelity(bacc, series, bacc.get("byte_role", "full"))
-        if cell is not None and frac >= 0.5 and frac > recurrence_fid:
-            result["cell"] = cell
-            result["sid"] = int(sid_addr)
-            result["cell_frac"] = round(float(frac), 4)
-            _attach_seed_prelude(result, series, ctx)
+        if cell is not None and frac >= 0.5:
+            trial = dict(result)
+            trial["cell"] = cell
+            trial["sid"] = int(sid_addr)
+            trial["cell_frac"] = round(float(frac), 4)
+            _attach_seed_prelude(trial, series, ctx)
+            if _descriptor_fidelity(trial, series, ctx) > recurrence_fid:
+                result = trial
         return result
 
     result = _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
@@ -1227,7 +1232,8 @@ def _attach_seed_prelude(result, series, ctx, max_latches: int = 6):
     cell = result.get("cell")
     if sampler is None or cell is None:
         return
-    end = sampler.cell_first_frame(cell)
+    sid = result.get("sid", result.get("addr"))
+    end = sampler.first_live_frame(cell, sid)
     if not 0 < end < ctx.n_frames:
         return
     frames, values = _seq_latches(np.asarray(series, dtype=np.int64)[:end])
@@ -1430,6 +1436,13 @@ def _best_feeder_at_write(series, sid_addr, ctx):
     Prefilters by end-of-frame match, then re-scores the top candidates with the
     cell value sampled at the register's SID-write cycle (where the player reads
     it), which captures any modulation already folded into the feeder.
+
+    The prefilter also ranks each cell by its match to the register series shifted
+    one frame -- an output-then-compute player (defMON) writes the SID from a
+    self-modified operand then computes the NEXT value into its feeder cell, so the
+    cell's end-of-frame value leads the register by one call; that feeder still
+    reconstructs exactly when sampled at the write instant, so include the
+    one-call-latency shift so it survives the prefilter.
     """
     ss = ctx.stateseq
     if ss.grid.shape[1] == 0 or ctx.sampler is None:
@@ -1437,7 +1450,9 @@ def _best_feeder_at_write(series, sid_addr, ctx):
     grid = ss.grid.astype(np.int64)
     s = np.asarray(series, dtype=np.int64)
     eof_match = (grid == s[:, None]).mean(axis=0)
-    order = np.argsort(eof_match)[::-1][:8]
+    lead = (grid == np.roll(s, -1)[:, None]).mean(axis=0)
+    rank = np.maximum(eof_match, lead)
+    order = np.argsort(rank)[::-1][:8]
     best_addr, best_recon, best_frac = None, None, -1.0
     for j in order:
         cell = int(ss.addrs[j])
@@ -2114,6 +2129,22 @@ class _CellSampler:
         if len(cyc) == 0:
             return 0
         return int(np.searchsorted(self.ticks, np.uint64(int(cyc.min())), side="right")) - 1
+
+    def first_live_frame(self, cell_addr, sid_addr) -> int:
+        """First frame whose at-write sample of ``cell_addr`` reflects a real write.
+
+        A feeder cell may be written later in its first frame than the register's
+        store, so :meth:`at_write` still reads the power-on default on that frame
+        even though :meth:`cell_first_frame` counts it written. The held-seed
+        prelude must cover up to here -- the first frame the captured cell actually
+        drives the register.
+        """
+        cyc, _ = self._cell_writes(int(cell_addr))
+        if len(cyc) == 0:
+            return self.n
+        sample = self.write_cycles(sid_addr) + np.uint64(2)
+        live = np.nonzero(sample >= np.uint64(int(cyc.min())))[0]
+        return int(live[0]) if len(live) else self.n
 
     def written_mask(self, sid_addr) -> np.ndarray:
         """Per-frame bool: True once ``sid_addr`` has been written by frame end.

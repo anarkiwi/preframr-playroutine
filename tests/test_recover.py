@@ -539,6 +539,50 @@ def test_classify_bacc_held_seed_prelude_before_cell_write():
     assert rt[0xD402] == 1.0
 
 
+def test_classify_bacc_output_then_compute_latency_feeder():
+    # defMON output-then-compute: each call writes SID from a self-modified operand
+    # (current value) then computes the NEXT value into the feeder cell, so the
+    # cell's end-of-frame value LEADS the register by one call while the value read
+    # at the write instant is exact. A leading held-seed prelude precedes the first
+    # cell write. The feeder must still be recovered (its end-of-frame match to the
+    # register is ~0; it matches the one-call-shifted register) and round-trip
+    # exactly once the prelude fills the pre-modulation hold.
+    cell = 0x1023
+    seed = 0xD3
+    note_len = 8
+    predwell = 11
+    steps = [19, 19, 18, 19, 18, 19]  # per-note stride varies: recurrence mis-fits
+    ramp = [(0x90 - st * t) & 0xFF for st in steps for t in range(note_len)]
+    # The held seed runs through frame ``predwell`` inclusive; the cell is written
+    # only once per modulating frame, late (after the SID store) with the NEXT
+    # value, so its end-of-frame value leads the register by one call and the value
+    # read at the write instant lags to the current one.
+    values = [seed] * (predwell + 1) + ramp
+    recs = []
+    ramwr = []
+    for i, v in enumerate(values):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        if i < predwell:
+            ctrl = 0x40  # gate off during the held-seed pre-dwell
+        else:
+            j = i - predwell
+            ctrl = 0x40 if (j % note_len) == note_len - 1 else 0x41
+            nxt = values[i + 1] if i + 1 < len(values) else v
+            ramwr.append(_ra(tick + 40, cell, int(nxt)))  # next value, late -> leads eof
+        recs.append(_ev(tick + 8, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1500))
+        recs.append(_ev(tick + 12, SID_WRITE, reg=2, value=int(v), addr=0xD402, aux=0x1388))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = classify_register(trace, 0xD402)
+    assert res["type"] == "BACC"
+    assert res["cell"] == cell  # the one-call-latency feeder is recovered
+    # The first cell write is late in its frame, so the held-seed prelude must
+    # extend one frame past the cell's first-write frame (the first-live handoff).
+    assert res["prelude_end"] == predwell + 1
+    rt = round_trip(trace)
+    assert rt[0xD402] == 1.0
+
+
 def test_classify_table_walk():
     ram = np.zeros(65536, dtype=np.uint8)
     base = 0x2200
