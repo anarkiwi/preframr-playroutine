@@ -45,7 +45,19 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   defMON and similar players use to toggle control bits), `AND` (a CTRL register
   recovered as `cellA AND cellB` — the waveform×gate idiom, e.g. GoatTracker2's
   `chnwave AND chngate` where the gate mask is `$FF` pass / `$FE` force-off;
-  sibling of `XOR`), the **held-seed prelude** for cell-fed PW accumulators (a
+  sibling of `XOR`), `OR` (a register recovered as `cellA | cellB` or
+  `cell | const` — the `mode | volume` MODE/VOL `$D418` idiom where a filter-mode
+  nibble is OR-folded onto the master volume; sibling of `XOR`/`AND`, recovers
+  JCH _Dreams_ and lifts Stargazer/Automatas `$D418`), the **AND-pair
+  value-forcing overrides** for CTRL (a value-membership predicate that forces
+  the recovered byte to the captured onset/hard-restart value — e.g. `$08`/`$81`
+  — on the frames a DMC player patches it, so the wave×gate base round-trips
+  through the hard-restart, recovering DMC _Guns_n_Ghosts_/_In_My_Head_ CTRL),
+  the **one-call-latency feeder** for output-then-compute players (the feeder
+  cell leads the SID register by one call: recovered by ranking the
+  one-call-shifted exact-copy match and extending the prelude boundary to the
+  cell's first *live* write-instant sample — recovers defMON _Wasps_), the
+  **held-seed prelude** for cell-fed PW accumulators (a
   note-reseeded `BACC` that holds its note-on seed for a bounded leading run
   before its captured accumulator cell is first written is recovered by latching
   that seed as a few `SEQ` writes and replaying the captured cell thereafter, so
@@ -90,26 +102,34 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   identical (frozen-reference parity test), keeping CI time bounded as fixtures
   grow.
 
-**Round-trip landscape** (whole-song): 14 perfect (Doctagop, Only_3, Denarius,
-Tom_Tom, 24th_Amaranth, Hawkeye, and the five GoatTracker2 tunes Grid_Runner,
-Day_6_in_Kleve_Hades, Raindrops, Tunnelbound, Cauldron_II_Remix plus the three
-MusicAssembler tunes Let_It_Bee, Torpedo, Pozitronic). The eight newly perfect
-tunes: the GoatTracker2 set is recovered by the `AND` CTRL primitive (its
-`chnwave AND chngate` wave×gate idiom) plus the generalized `FEEDER` (voice CTRL
-waveform/gate shadows and the RES/FILT immediate as exact captured-cell copies,
-previously mis-filed as XSTATE or an over-fit TABLE_WALK); the MusicAssembler set
-is recovered by the **held-seed prelude** for their cell-fed PW accumulators
-(latching each note-on seed across the bounded leading run before the captured PW
-cell is first written). Most other tunes 0.96–1.0; weakest are Commando ~0.78
-(Hubbard's hand-coded player) and the FutureComposer FREQ / PITCHWALK cases. The
-defMON tunes rose to ~0.92–0.96 once the `XOR` CTRL primitive recovered the
-`base XOR eor` gate sequencer (`$D404`/`$D40B`/`$D412`) and the `COMPOSITE`
-mod-guard stopped a phase-residual cell from polluting the FREQ operands; the
-defMON PW **ping-pong** sweep (Vacuole 0.94→0.98) and the FutureComposer
-**tick-banded** PW sweep (Hawkeye → perfect) are recovered `BACC` modes. The
-remaining gaps are the bespoke players, the FutureComposer / defMON FREQ slide
-(vibrato/portamento) and the global filter-cutoff BACC, plus the residual XSTATE
-CTRL gate bits on DMC (`$D40B`/`$D412`) and JCH (`$D40B`).
+**Round-trip landscape** (whole-song): 17 perfect (Doctagop, In_My_Head, Only_3,
+Denarius, Tom_Tom, 24th_Amaranth, Dreams, Hawkeye, Wasps, the five GoatTracker2
+tunes Grid_Runner, Day_6_in_Kleve_Hades, Raindrops, Tunnelbound,
+Cauldron_II_Remix, plus the three MusicAssembler tunes Let_It_Bee, Torpedo,
+Pozitronic). The three newly perfect tunes:
+- **Wasps** (defMON) — the **one-call-latency feeder**: an output-then-compute
+  player whose feeder cell leads its SID register by one call, recovered by the
+  one-call-shifted exact-copy match plus a prelude boundary extended to the
+  cell's first *live* write-instant sample.
+- **In_My_Head** (DMC) — CTRL recovered as wave-table-walk × gate with
+  `$08`/`$81` onset/hard-restart **value-forcing overrides** (the AND-pair plus a
+  value-membership override predicate), and the FREQ hard-restart composites
+  recovered exactly. The sibling DMC tune **Guns_n_Ghosts** gets the same CTRL
+  recovery but is held off perfect (0.99999) by its `$D416` filter cutoff — the
+  documented instrumentation gap below.
+- **Dreams** (JCH_NewPlayer) — MODE/VOL `$D418` recovered via the new `OR`
+  primitive (`mode | volume`).
+
+Most other tunes 0.96–1.0; weakest are Commando ~0.78 (Hubbard's hand-coded
+player) and the FutureComposer FREQ / PITCHWALK cases. The defMON tunes rose to
+~0.92–0.96 once the `XOR` CTRL primitive recovered the `base XOR eor` gate
+sequencer (`$D404`/`$D40B`/`$D412`) and the `COMPOSITE` mod-guard stopped a
+phase-residual cell from polluting the FREQ operands; the defMON PW **ping-pong**
+sweep (Vacuole 0.94→0.98) and the FutureComposer **tick-banded** PW sweep
+(Hawkeye → perfect) are recovered `BACC` modes. The remaining gaps are the
+bespoke players, the FutureComposer / defMON FREQ slide (vibrato/portamento) and
+the global `$D416` filter-cutoff (see Next steps — an instrumentation gap, not a
+missing primitive).
 
 ## Next steps
 
@@ -132,23 +152,33 @@ CTRL gate bits on DMC (`$D40B`/`$D412`) and JCH (`$D40B`).
      0.96→0.997; no regression. The same tick foundation still needs extending to
      the FC **FREQ slide** (vibrato/portamento) and the CTRL-wave / filter-segment
      lanes (`step = table[tick]` paced by `$1942`), the dominant remaining FC gaps.
-   - **defMON + FC `$D416` cutoff → segmented BACC with SEQ-directed sign +
-     post-scale**. RE (`$10b6/$10be`, opcode at `$10b8`): direction is the
-     `ADC`/`SBC` **opcode patched per instrument step** (observable in the
-     SMC-immediate log), then an `ASL` (×2 on 6581 / `NOP` on 8580) before
-     `$D416`. Let `segmented_bacc` carry a per-segment sign and `reconstruct_register`
-     honor a scalar post-scale.
+   - **defMON + FC `$D416` filter-cutoff → currently unrecoverable from the
+     trace (instrumentation gap, not a missing primitive).** Its opcode-directed
+     16-bit reflecting accumulator lives in the CPU **A-register**: the
+     `ASL`/`STA` cutoff flows through registers and is stored straight to `$D416`,
+     never landing in RAM. The documented accumulator cells `$10b6/$10be` do
+     **not** track `$D416` (best match across all 110 logged RAM cells <0.3), and
+     while the sign/step bytes are observable in the SMC-immediate log the reflect
+     **phase** is not. Closing it needs `sidtrace` to capture the A-register /
+     pre-`ASL` cutoff value at the store site — until then this blocks **Vacuole,
+     Stargazer, Automatas, Manchester, Tune_06** and holds DMC **Guns_n_Ghosts**
+     just off perfect (0.99999, sole residual register) despite its CTRL/FREQ
+     recovering exactly.
 
-   Each gap names the exact accumulator/table/opcode cell, so a new primitive is
-   **unit-testable against ground truth**, not just round-trip-scored. The
-   GoatTracker2 CTRL wave×gate gate (recovered by the `AND` primitive + exact-cell
-   `FEEDER`) and the MusicAssembler cell-fed PW (recovered by the held-seed
-   prelude) are now done; the residual CTRL gate gaps are the DMC (`$D40B`/`$D412`)
-   and JCH (`$D40B`) XSTATE gate bits. The residual bespoke cases come last,
-   sharing no machinery: the FutureComposer vibrato/portamento (recover depth/rate
-   from the already-logged SMC immediate writes — `$12F7` — before adding any
-   observable) and Commando ~0.78 (Hubbard's reflected triangle off the **global**
-   frame counter plus an octave-toggle mux — a different reset axis).
+   Each RAM-resident gap names the exact accumulator/table/opcode cell, so a new
+   primitive is **unit-testable against ground truth**, not just
+   round-trip-scored. The GoatTracker2 CTRL wave×gate gate (recovered by the `AND`
+   primitive + exact-cell `FEEDER`), the DMC CTRL onset/hard-restart bytes
+   (recovered by the **AND-pair value-forcing overrides**), the JCH MODE/VOL
+   `$D418` (recovered by the `OR` primitive), the MusicAssembler cell-fed PW
+   (held-seed prelude) and the defMON output-then-compute feeder (one-call-latency
+   feeder) are now done. The residual gaps are the `$D416` instrumentation gap
+   above plus the bespoke cases, which share no machinery: the FutureComposer
+   vibrato/portamento FREQ slide (recover depth/rate from the already-logged SMC
+   immediate writes — `$12F7`), **A_Mind_Is_Born** (generative modulation we do
+   not model, 0.991), **Blackout**, and **Commando** ~0.78 (Hubbard's reflected
+   triangle off the **global** frame counter plus an octave-toggle mux — a
+   different reset axis).
 2. **Absolute octave/semitone label.** `recover_tuning` now emits absolute note
    numbers and fits the reference from the recovered note table; the residual is
    the integer octave/semitone label, which is per-player-convention dependent

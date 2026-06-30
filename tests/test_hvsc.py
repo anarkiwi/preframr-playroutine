@@ -50,10 +50,12 @@ def _key(entry):
 # it here (CI XPASS-fails until you do).
 _PERFECT = {
     ("DMC", "Doctagop.sid"),
+    ("DMC", "In_My_Head.sid"),
     ("Soundmonitor", "Only_3.sid"),
     ("Soundmonitor", "Denarius.sid"),
     ("Soundmonitor", "Tom_Tom.sid"),
     ("JCH_NewPlayer", "24th_Amaranth_Grand_Prix_3.sid"),
+    ("JCH_NewPlayer", "Dreams.sid"),
     ("FutureComposer", "Hawkeye.sid"),
     ("GoatTracker2", "Grid_Runner.sid"),
     ("GoatTracker2", "Day_6_in_Kleve_Hades.sid"),
@@ -63,6 +65,7 @@ _PERFECT = {
     ("MusicAssembler", "Let_It_Bee.sid"),
     ("MusicAssembler", "Torpedo.sid"),
     ("MusicAssembler", "Pozitronic.sid"),
+    ("defMON", "Wasps.sid"),
 }
 
 # DMC / GoatTracker2 per-voice register strides: $D400 + 7*voice.
