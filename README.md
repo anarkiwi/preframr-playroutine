@@ -50,7 +50,14 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   boundary clamp and reverses (with independent up/down step magnitudes), the
   defMON PW sweep idiom (`$1474`: clamp + `eor #$80` flip) — recovered per-note
   (`segmented_pingpong`, each note seeding its own rate) and chosen by whichever
-  candidate best reconstructs the register's own series.
+  candidate best reconstructs the register's own series. A **tick-banded** BACC
+  mode (`segmented_tickband`) further generalizes the stride from a scalar to
+  `step = rate_table[tick]`: the FutureComposer PW sweep, whose per-frame rate is
+  a step-function of the per-voice tick (frames since note-on, the FC
+  sawtooth-reset pinning invariant). The per-note rate vectors de-duplicate into
+  a small shared table set (8 tables explain 1031 note segments) — proof it's a
+  reused program, not memorization — and the candidate is gated to never steal a
+  clean constant-step fit.
 - **Global tuning / absolute notes.** `recover_tuning` emits absolute MIDI
   `note_numbers` / `note_range` (so the IR's notes are absolute pitch, comparable
   across tunes) and fits the reference A4 from the recovered note→frequency table
@@ -72,17 +79,18 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   identical (frozen-reference parity test), keeping CI time bounded as fixtures
   grow.
 
-**Round-trip landscape** (whole-song): 5 perfect (Doctagop, Only_3, Denarius,
-Tom_Tom, 24th_Amaranth); most tunes 0.96–1.0; weakest are Commando 0.77
-(Hubbard's hand-coded player) and the FutureComposer (~0.90) FREQ cases. The
+**Round-trip landscape** (whole-song): 6 perfect (Doctagop, Only_3, Denarius,
+Tom_Tom, 24th_Amaranth, Hawkeye); most tunes 0.96–1.0; weakest are Commando 0.77
+(Hubbard's hand-coded player) and the FutureComposer FREQ cases. The
 defMON tunes rose to ~0.92–0.96 once the `XOR` CTRL primitive recovered the
 `base XOR eor` gate sequencer (`$D404`/`$D40B`/`$D412`) and the `COMPOSITE`
 mod-guard stopped a phase-residual cell from polluting the FREQ operands. The
 filter-cutoff stragglers (`FEEDER`) and the pre-first-write default are also
-recovered, and the defMON PW **ping-pong** sweep is now a recovered `BACC` mode
-(Vacuole 0.94→0.98); the remaining gaps are the bespoke players, the
-FutureComposer / defMON tick-banded (table-indexed-stride) PW + FREQ slide, and
-the global filter-cutoff BACC.
+recovered; the defMON PW **ping-pong** sweep (Vacuole 0.94→0.98) and the
+FutureComposer **tick-banded** PW sweep (Hawkeye → perfect, its sole gap closed)
+are now recovered `BACC` modes. The remaining gaps are the bespoke players, the
+FutureComposer / defMON FREQ slide (vibrato/portamento), and the global
+filter-cutoff BACC.
 
 ## Next steps
 
@@ -97,13 +105,14 @@ the global filter-cutoff BACC.
      up/down steps) recovers the defMON PW sweep, per-note-segmented
      (`segmented_pingpong`); Vacuole 0.94→0.98, no regression on the 5 perfect
      tunes. The other defMON FREQ-slide / filter-cutoff gaps below still apply.
-   - **FutureComposer PW / filter → BACC with table-indexed stride** (unlocks the
-     FC ~0.90 cluster). RE (`pweng_1341`): the **rate is a step-function of the
-     tick** (`$1695` threshold→rate table), so the stride changes *within* a note
-     and both single-step fits reject it. Generalize the stride from a scalar to
-     `step = table[cursor]` paced by the per-voice tick (`$1942`) — the FC pinning
-     invariant: recover the tick once and the PW / CTRL-wave / filter-segment /
-     freq-offset lanes all collapse to `table[tick]`.
+   - **FutureComposer PW → BACC with table-indexed stride** — ✅ **done** (#24):
+     `segmented_tickband` generalizes the stride to `step = rate_table[tick]`,
+     the tick synthesized from note-on resets (the FC pinning invariant), the
+     per-note rate vectors de-duplicated into a small shared table set. Recovered
+     Hawkeye's PW `$D402` 0.856→1.0 (its sole gap → **new perfect tune**), MU PW
+     0.96→0.997; no regression. The same tick foundation still needs extending to
+     the FC **FREQ slide** (vibrato/portamento) and the CTRL-wave / filter-segment
+     lanes (`step = table[tick]` paced by `$1942`), the dominant remaining FC gaps.
    - **defMON + FC `$D416` cutoff → segmented BACC with SEQ-directed sign +
      post-scale**. RE (`$10b6/$10be`, opcode at `$10b8`): direction is the
      `ADC`/`SBC` **opcode patched per instrument step** (observable in the
