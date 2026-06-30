@@ -52,6 +52,7 @@ _PERFECT = {
     ("DMC", "Doctagop.sid"),
     ("Soundmonitor", "Only_3.sid"),
     ("Soundmonitor", "Denarius.sid"),
+    ("Soundmonitor", "Tom_Tom.sid"),
 }
 
 # DMC / GoatTracker2 per-voice register strides: $D400 + 7*voice.

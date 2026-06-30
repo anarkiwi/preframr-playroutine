@@ -547,6 +547,38 @@ def test_classify_xstate_dense_irregular():
     assert res["type"] == "XSTATE"
 
 
+def test_classify_filter_feeder_latch():
+    # Global filter cutoff-high ($D416) is an irregular per-frame copy of a RAM
+    # feeder cell -> FEEDER primitive, round-tripping exactly.
+    rng = np.random.default_rng(7)
+    values = rng.integers(0, 256, size=80)
+    cell = 0x40
+    recs = []
+    ramwr = []
+    for i, v in enumerate(values):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        ramwr.append(_ra(tick + 10, cell, int(v)))
+        recs.append(_ev(tick + 20, SID_WRITE, reg=0x16, value=int(v), addr=0xD416, aux=0x1700))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = classify_register(trace, 0xD416)
+    assert res["type"] == "FEEDER", res["type"]
+    assert res["cell"] == cell
+    assert res["sid"] == 0xD416
+    assert res["cell_frac"] == 1.0
+    rt = round_trip(trace)
+    assert rt[0xD416] == 1.0
+    ticks = trace.tick_cycles("auto")
+    recon = reconstruct_register(res, ticks, trace=trace)
+    assert np.array_equal(recon, np.asarray(values, dtype=np.int64))
+
+
+def test_reconstruct_feeder_no_sampler_zeros():
+    desc = {"type": "FEEDER", "cell": 0x40, "sid": 0xD416}
+    recon = reconstruct_register(desc, _ticks(10))
+    assert np.array_equal(recon, np.zeros(10, dtype=np.int64))
+
+
 # -- correlate_event_reset ------------------------------------------------
 
 
