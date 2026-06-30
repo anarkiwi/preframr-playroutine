@@ -526,6 +526,46 @@ def test_classify_table_walk():
     assert res["cursor_addr"] == 0x80
 
 
+def test_classify_table_walk_three_overrides():
+    # A CTRL waveform table walk whose player forces three distinct off-table
+    # values (one per gating cell): a $0A-style wavetable command resolved to a
+    # real waveform plus two key/gate forces. Recovering all three requires more
+    # than two overrides; each is kept only when it raises reproduction, so the
+    # walk round-trips exactly.
+    ram = np.zeros(65536, dtype=np.uint8)
+    base = 0x18AD
+    table = np.array([0x41, 0x11, 0x21, 0x81], dtype=np.uint8)
+    ram[base : base + len(table)] = table
+    cell_a, cell_b, cell_c = 0x0050, 0x0051, 0x0052
+    # Decreasing force counts (20/8/4) so each greedy pass has a dominant residual
+    # value; the firing frames are disjoint by construction.
+    n = 240
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        cur = i % len(table)
+        flags = {cell_a: 0, cell_b: 0, cell_c: 0}
+        ctrl = int(table[cur])
+        if i % 12 == 1:
+            flags[cell_a], ctrl = 1, 0x09
+        elif i % 30 == 2:
+            flags[cell_b], ctrl = 1, 0x80
+        elif i % 60 == 3:
+            flags[cell_c], ctrl = 1, 0x44
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        recs.append(_ev(tick + 20, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1591))
+        ramwr.append(_ra(tick + 8, 0x80, cur))
+        for cell, flag in flags.items():
+            ramwr.append(_ra(tick + 6, cell, flag))
+    trace = _build_trace(recs, ram_writes=ramwr, ram=ram)
+    res = classify_register(trace, 0xD404)
+    assert res["type"] == "TABLE_WALK"
+    assert res["cursor_addr"] == 0x80
+    assert len(res["overrides"]) == 3
+    assert round_trip(trace)[0xD404] == 1.0
+
+
 def test_classify_seq_sparse():
     # Register written only on a few note boundaries (sparse) -> SEQ.
     recs = []

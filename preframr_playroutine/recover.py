@@ -1036,22 +1036,35 @@ def _recover_gate(tw, series, ctx):
         tw["residual"] = best_fid
 
 
-def _recover_walk_overrides(tw, series, ctx, max_overrides: int = 2):
-    """Recover value-forcing overrides (e.g. CTRL ``$08``/``$81``) over a walk."""
+def _recover_walk_overrides(tw, series, ctx, max_overrides: int = 3):
+    """Recover value-forcing overrides (e.g. CTRL ``$08``/``$81``) over a walk.
+
+    The table can hold non-waveform command bytes (e.g. a ``$0A`` wavetable
+    control entry) that the player never emits, forcing the real waveform at that
+    cursor cell instead; each such force is one override. Overrides are taken
+    greedily and an override is kept only when it strictly raises reproduction, so
+    raising the cap never regresses a register that needed fewer.
+    """
     if ctx.sampler is None:
         return
+    series = np.asarray(series, dtype=np.int64)
     work = _recon_table(tw, ctx.n_frames, ctx.sampler)
+    best_fid = float(np.mean(work == series))
     overrides = []
     for _ in range(max_overrides):
-        forced = np.where(np.asarray(series) == work, -1, np.asarray(series)).astype(np.int64)
+        forced = np.where(series == work, -1, series).astype(np.int64)
         ov = _override_descriptor(forced, ctx)
         if ov is None or ov in overrides:
             break
+        cand = _apply_overrides(work, [ov], ctx.sampler)
+        cand_fid = float(np.mean(cand == series))
+        if cand_fid <= best_fid:
+            break
         overrides.append(ov)
-        work = _apply_overrides(work, [ov], ctx.sampler)
+        work, best_fid = cand, cand_fid
     if overrides:
         tw["overrides"] = overrides
-        tw["residual"] = float(np.mean(work == np.asarray(series)))
+        tw["residual"] = best_fid
 
 
 def _best_feeder_at_write(series, sid_addr, ctx):
