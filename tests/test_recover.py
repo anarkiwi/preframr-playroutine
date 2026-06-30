@@ -923,6 +923,66 @@ def test_round_trip_composite_freq_from_trace():
     assert rt[0xD401] == 1.0
 
 
+def test_composite_freq_base_only_no_spurious_mod():
+    # Output-then-compute style: the operand cell already carries the whole FREQ.
+    # An unrelated varying cell must NOT be grafted on as an additive modulation
+    # (that would lower fidelity) -- the composite stays base-only and exact.
+    n = 80
+    note_len = 20
+    op_lo, op_hi, noise = 0x10, 0x11, 0x22
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        note = i // note_len
+        freq = (0x0500 + note * 0x130 + (i % 7) * 11) & 0xFFFF
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, op_lo, freq & 0xFF))
+        ramwr.append(_ra(tick + 4, op_hi, (freq >> 8) & 0xFF))
+        ramwr.append(_ra(tick + 5, noise, (i * 37) & 0xFF))
+        gate = 0x41 if i % note_len else 0x40
+        recs.append(_ev(tick + 8, SID_WRITE, reg=4, value=gate, addr=0xD404, aux=0x1500))
+        recs.append(_ev(tick + 10, SID_WRITE, reg=0, value=freq & 0xFF, addr=0xD400, aux=0x1606))
+        recs.append(
+            _ev(tick + 10, SID_WRITE, reg=1, value=(freq >> 8) & 0xFF, addr=0xD401, aux=0x1609)
+        )
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = analyze(trace)
+    assert res[0xD400]["type"] == "COMPOSITE"
+    assert res[0xD400]["mod"] is None
+    assert res[0xD401]["mod"] is None
+    rt = round_trip(trace)
+    assert rt[0xD400] == 1.0
+    assert rt[0xD401] == 1.0
+
+
+def test_xor_ctrl_recovers_base_eor():
+    # CTRL written as ``base XOR eor`` (the defMON gate/waveform idiom): neither
+    # captured cell alone reproduces it, but the exact XOR of the pair does. Gate
+    # (bit 0) stays on while the waveform/sync bits move every frame, so the
+    # register is a per-frame generator (not a note-gated SEQ latch).
+    n = 60
+    base_cell, eor_cell = 0x30, 0x31
+    waveforms = [0x11, 0x21, 0x41, 0x81]  # bit0 (gate) always set
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        base = waveforms[i % len(waveforms)]
+        eor = 0x02 if i % 3 else 0x00  # sync bit toggled by flipping the eor mask
+        ctrl = base ^ eor
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, base_cell, base))
+        ramwr.append(_ra(tick + 5, eor_cell, eor))
+        recs.append(_ev(tick + 10, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1500))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = analyze(trace)
+    assert res[0xD404]["type"] == "XOR", res[0xD404]["type"]
+    assert {res[0xD404]["cell_a"], res[0xD404]["cell_b"]} == {base_cell, eor_cell}
+    rt = round_trip(trace)
+    assert rt[0xD404] == 1.0
+
+
 def test_round_trip_reports_overall_and_unmodeled():
     trace = _trace_with_register([0x0F] * 30, sid_addr=0xD418)
     rt = round_trip(trace)
