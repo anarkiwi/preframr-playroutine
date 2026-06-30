@@ -847,6 +847,8 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
         result.update(type="CONST", value=int(wr["value"][0]))
         return result
 
+    is_filter = voice is None and 0xD415 <= int(sid_addr) <= 0xD418
+
     feeder, ffrac = _best_feeder(series, ctx.stateseq)
     if feeder is not None and ffrac >= 0.5:
         result["cell_addr"] = feeder
@@ -880,7 +882,10 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
             result["cell_frac"] = round(float(frac), 4)
         return result
 
-    return _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
+    result = _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
+    if is_filter:
+        result = _filter_feeder(result)
+    return result
 
 
 def _descriptor_fidelity(desc, series, ctx):
@@ -983,6 +988,22 @@ def _xstate_with_feeder(result, series, sid_addr, ctx):
         result["cell"] = cell
         result["sid"] = int(sid_addr)
         result["cell_frac"] = round(float(frac), 4)
+    return result
+
+
+def _filter_feeder(result, min_feeder: float = 0.999):
+    """Upgrade a global filter register ($D415-$D418) XSTATE to a FEEDER primitive.
+
+    The filter sweep/table cursor is independent of the voice gates, so when the
+    generic per-frame machinery finds no single generator a filter register falls
+    to XSTATE. The player computes the cutoff/resonance into a RAM cell then
+    stores it to SID; a register that is a near-exact latched copy of that
+    captured feeder cell (recorded as ``cell``/``cell_frac`` by
+    :func:`_xstate_with_feeder`) is a real per-frame primitive, not an unmodelled
+    dependency. Relabel such results FEEDER; everything else is unchanged.
+    """
+    if result.get("type") == "XSTATE" and result.get("cell_frac", 0.0) >= min_feeder:
+        result["type"] = "FEEDER"
     return result
 
 
@@ -1716,6 +1737,17 @@ def _recon_pitchwalk(desc, n, sampler) -> np.ndarray:
     return _apply_overrides(out, desc.get("overrides", []), sampler)
 
 
+def _recon_feeder(desc, n, sampler) -> np.ndarray:
+    """Regenerate a cell-latched filter register: the captured feeder cell.
+
+    The player computes the value into a RAM cell then stores it to SID; replay
+    is that captured cell sampled at the register's write instant.
+    """
+    if sampler is None:
+        return np.zeros(n, dtype=np.int64)
+    return sampler.at_write(desc["cell"], desc["sid"]) & 0xFF
+
+
 def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndarray:
     """Regenerate a register's per-frame output from its recovered descriptor.
 
@@ -1724,9 +1756,10 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
     ``BACC`` -> the recurrence re-run (reset at the recovered note-on seeds);
     ``TABLE_WALK`` -> ``table[base + cursor*stride] & mask`` (gate-masked by a
     captured cell when one was recovered); ``COMPOSITE`` -> base + modulation +
-    overrides. Cell-referencing descriptors read those cells from ``trace`` (or a
-    shared ``sampler``); ``XSTATE`` has no single-generator model yet and returns
-    ``None``.
+    overrides; ``FEEDER`` -> a global filter register's captured RAM feeder cell
+    sampled at the write instant. Cell-referencing descriptors read those cells
+    from ``trace`` (or a shared ``sampler``); ``XSTATE`` has no single-generator
+    model yet and returns ``None``.
     """
     n = len(ticks)
     kind = descriptor.get("type")
@@ -1741,6 +1774,7 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
         "TABLE_WALK": _recon_table,
         "COMPOSITE": _recon_composite,
         "PITCHWALK": _recon_pitchwalk,
+        "FEEDER": _recon_feeder,
     }
     if kind in builders:
         return builders[kind](descriptor, n, smp)
