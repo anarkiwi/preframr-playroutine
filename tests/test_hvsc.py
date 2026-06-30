@@ -57,6 +57,12 @@ _PERFECT = {
     ("FutureComposer", "Hawkeye.sid"),
     ("GoatTracker2", "Grid_Runner.sid"),
     ("GoatTracker2", "Day_6_in_Kleve_Hades.sid"),
+    ("GoatTracker2", "Raindrops.sid"),
+    ("GoatTracker2", "Tunnelbound.sid"),
+    ("GoatTracker2", "Cauldron_II_Remix.sid"),
+    ("MusicAssembler", "Let_It_Bee.sid"),
+    ("MusicAssembler", "Torpedo.sid"),
+    ("MusicAssembler", "Pozitronic.sid"),
 }
 
 # DMC / GoatTracker2 per-voice register strides: $D400 + 7*voice.
