@@ -1938,17 +1938,64 @@ def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
     _frac, gj, cj = best
     if gj is None or gj == cj:
         return None
-    recon = (full[gj] & full[cj]) & 0xFF
-    fid = float(np.mean(recon == s))
-    if fid < min_fid:
-        return None
-    return {
+    desc = {
         "type": "AND",
         "cell_a": int(addrs[cj]),
         "cell_b": int(addrs[gj]),
         "sid": int(sid_addr),
-        "residual": fid,
+        "overrides": [],
     }
+    work = _and_recon_masked(desc, s, ctx)
+    desc["residual"] = float(np.mean(work == s))
+    # The steady CTRL is wave AND gate; the note-onset / hard-restart frames force
+    # a control byte the shadow never carries. Recover those as value-forcing
+    # overrides (same greedy, strictly-improving pass as the table-walk path) so a
+    # gated wave-table CTRL written through a shadow cell recovers byte-exact.
+    _recover_pair_overrides(desc, s, ctx)
+    if desc["residual"] < min_fid:
+        return None
+    return desc
+
+
+def _and_recon_masked(desc, series, ctx) -> np.ndarray:
+    """``_recon_and`` with the pre-first-write power-on default applied (for scoring)."""
+    base = _recon_and(desc, ctx.n_frames, ctx.sampler)
+    written = ctx.sampler.written_mask(desc["sid"])
+    return np.where(written, base, 0)
+
+
+def _recover_pair_overrides(desc, series, ctx, max_overrides: int = 4):
+    """Recover value-forcing overrides over an ``AND`` pair recon (CTRL onsets).
+
+    Mirrors :func:`_recover_walk_overrides`: each onset/hard-restart byte the
+    wave-AND-gate base fails to explain is forced where a recovered cell predicate
+    holds, taken greedily and kept only when it strictly raises reproduction (so it
+    never regresses a pair that already reconstructs exactly).
+    """
+    sampler = ctx.sampler
+    if sampler is None:
+        return
+    series = np.asarray(series, dtype=np.int64)
+    written = sampler.written_mask(desc["sid"])
+    cur = _recon_and(desc, ctx.n_frames, sampler)
+    work = np.where(written, cur, 0)
+    best_fid = float(np.mean(work == series))
+    overrides = []
+    for _ in range(max_overrides):
+        forced = np.where(series == work, -1, series).astype(np.int64)
+        ov = _override_descriptor(forced, ctx)
+        if ov is None or ov in overrides:
+            break
+        cur2 = _apply_overrides(cur, [ov], sampler)
+        work2 = np.where(written, cur2, 0)
+        fid2 = float(np.mean(work2 == series))
+        if fid2 <= best_fid:
+            break
+        overrides.append(ov)
+        cur, work, best_fid = cur2, work2, fid2
+    if overrides:
+        desc["overrides"] = overrides
+        desc["residual"] = best_fid
 
 
 def _maybe_and_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
@@ -2419,12 +2466,18 @@ def _recon_xor(desc, n, sampler) -> np.ndarray:
 
 
 def _recon_and(desc, n, sampler) -> np.ndarray:
-    """Regenerate a ``cellA AND cellB`` CTRL register from its two captured cells."""
+    """Regenerate a ``cellA AND cellB`` CTRL register from its two captured cells.
+
+    The waveform-shadow cell AND the gate-mask cell reproduce the steady CTRL; the
+    note-onset / hard-restart frames force a control byte (e.g. ``$08``/``$09``/
+    ``$81``) the shadow never carries, recovered as value-forcing overrides.
+    """
     if sampler is None:
         return np.zeros(n, dtype=np.int64)
     a = sampler.at_write(desc["cell_a"], desc["sid"]).astype(np.int64)
     b = sampler.at_write(desc["cell_b"], desc["sid"]).astype(np.int64)
-    return (a & b) & 0xFF
+    out = (a & b) & 0xFF
+    return _apply_overrides(out, desc.get("overrides", []), sampler)
 
 
 def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndarray:
