@@ -1466,15 +1466,21 @@ def _best_feeder_at_write(series, sid_addr, ctx):
 def _find_override(forced, ctx, max_terms: int = 3):
     """A conjunction of cell predicates that fires exactly on ``forced`` frames.
 
-    Candidate predicates (cell value-equality / single-bit tests) are restricted
-    to those true on every forced frame (recall 1.0); a greedy intersection then
-    drives precision to 1.0. Returns ``[(cell, mask, value), ...]`` or ``None``.
+    Candidate predicates (cell value-equality / single-bit tests / small
+    value-membership) are restricted to those true on every forced frame (recall
+    1.0); a greedy intersection then drives precision to 1.0. A membership term
+    ``cell in {v0,..}`` (recovered set of <= ``max_set`` distinct cell values, e.g.
+    the per-voice waveform shadow whose value selects the instruments that
+    hard-restart) captures a force gated by a handful of states no single
+    equality/bit can express. Returns ``[(cell, mask, value) | (cell, "in",
+    (v0,..)), ...]`` or ``None``.
     """
     if int(forced.sum()) == 0:
         return None
     grid = ctx.stateseq.grid.astype(np.int64)
     addrs = ctx.stateseq.addrs
     n_forced = int(forced.sum())
+    max_set = 6
     cands = []
     for j in range(grid.shape[1]):
         col = grid[:, j]
@@ -1482,6 +1488,11 @@ def _find_override(forced, ctx, max_terms: int = 3):
         uniq = np.unique(fc)
         if len(uniq) == 1:
             cands.append((col == int(uniq[0]), (int(addrs[j]), 0xFF, int(uniq[0]))))
+        elif 2 <= len(uniq) <= max_set and len(uniq) < len(np.unique(col)):
+            # A force gated by the cell holding one of a few states (recall 1.0 by
+            # construction); the greedy precision/strict-improvement gating below
+            # rejects it unless it genuinely tightens the selection.
+            cands.append((np.isin(col, uniq), (int(addrs[j]), "in", tuple(int(x) for x in uniq))))
         for b in range(8):
             bit = (fc >> b) & 1
             if bit.min() == bit.max():
@@ -1793,15 +1804,37 @@ def _composite16(trace, sid_addr, reg_off, ctx):
             "overrides": [],
         }
         modelled = (base_val + _comp_part(mod, n, ctx.sampler)) & 0xFFFF
-        forced = np.where(modelled == target, -1, out_byte)
-        ov = _override_descriptor(forced, ctx)
-        if ov is not None:
-            desc["overrides"].append(ov)
+        _best_composite_override(desc, modelled, target, out_byte, target_byte, n, ctx)
         fid = float(np.mean(_recon_composite(desc, n, ctx.sampler) == target_byte))
         desc["residual"] = fid
         if fid > best_fid:
             best_fid, best_desc = fid, desc
     return best_desc
+
+
+def _best_composite_override(desc, modelled, target, out_byte, target_byte, n, ctx):
+    """Attach the per-byte residual override only when it reconstructs strictly
+    better; none otherwise.
+
+    The forced value is the register byte on the frames the base+mod model fails
+    (a note-onset reset / hard-restart), gated by a recovered cell predicate (an
+    equality, single-bit, or small value-membership test -- see
+    :func:`_find_override`). Strictly non-worsening: an override that does not
+    raise reconstruction (a spurious membership predicate, say) is dropped, so a
+    register an override already nails is never displaced.
+    """
+    base_fid = float(np.mean(_recon_composite(desc, n, ctx.sampler) == target_byte))
+    candidates = []
+    ov_b = _override_descriptor(np.where(modelled == target, -1, out_byte).astype(np.int64), ctx)
+    if ov_b is not None:
+        candidates.append(ov_b)
+    best_fid, best_ov = base_fid, None
+    for ov in candidates:
+        desc["overrides"] = [ov]
+        fid = float(np.mean(_recon_composite(desc, n, ctx.sampler) == target_byte))
+        if fid > best_fid:
+            best_fid, best_ov = fid, ov
+    desc["overrides"] = [best_ov] if best_ov is not None else []
 
 
 def _composite8(sid_addr, series, ctx):
@@ -1945,7 +1978,7 @@ def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
         "sid": int(sid_addr),
         "overrides": [],
     }
-    work = _and_recon_masked(desc, s, ctx)
+    work = _and_recon_masked(desc, ctx)
     desc["residual"] = float(np.mean(work == s))
     # The steady CTRL is wave AND gate; the note-onset / hard-restart frames force
     # a control byte the shadow never carries. Recover those as value-forcing
@@ -1957,7 +1990,7 @@ def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
     return desc
 
 
-def _and_recon_masked(desc, series, ctx) -> np.ndarray:
+def _and_recon_masked(desc, ctx) -> np.ndarray:
     """``_recon_and`` with the pre-first-write power-on default applied (for scoring)."""
     base = _recon_and(desc, ctx.n_frames, ctx.sampler)
     written = ctx.sampler.written_mask(desc["sid"])
@@ -2396,7 +2429,13 @@ def _apply_overrides(out, overrides, sampler) -> np.ndarray:
     for ov in overrides:
         sel = np.ones(n, dtype=bool)
         for cell, cmask, cval in ov.get("predicate", []):
-            sel &= (sampler.eof(cell) & cmask) == cval
+            col = sampler.eof(cell)
+            # ``cmask == "in"`` marks a value-membership term (cval is the value
+            # tuple); an integer ``cmask`` is the historical bit/equality test.
+            if cmask == "in":
+                sel &= np.isin(col, np.asarray(cval, dtype=col.dtype))
+            else:
+                sel &= (col & cmask) == cval
         out = np.where(sel, int(ov["force"]), out)
     return out
 
