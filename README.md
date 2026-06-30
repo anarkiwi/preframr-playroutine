@@ -45,7 +45,12 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   when it strictly improves reconstruction — so an output-then-compute player's
   operand cell (which already carries the whole value, one call late) is
   recovered base-only instead of being polluted by a spurious phase-residual
-  modulation cell.
+  modulation cell. The `BACC` accumulator also has a **ping-pong** (clamp-and-flip)
+  mode: unlike the mirror-reflect triangle, an overshoot saturates to a fixed
+  boundary clamp and reverses (with independent up/down step magnitudes), the
+  defMON PW sweep idiom (`$1474`: clamp + `eor #$80` flip) — recovered per-note
+  (`segmented_pingpong`, each note seeding its own rate) and chosen by whichever
+  candidate best reconstructs the register's own series.
 - **Global tuning / absolute notes.** `recover_tuning` emits absolute MIDI
   `note_numbers` / `note_range` (so the IR's notes are absolute pitch, comparable
   across tunes) and fits the reference A4 from the recovered note→frequency table
@@ -74,8 +79,10 @@ defMON tunes rose to ~0.92–0.96 once the `XOR` CTRL primitive recovered the
 `base XOR eor` gate sequencer (`$D404`/`$D40B`/`$D412`) and the `COMPOSITE`
 mod-guard stopped a phase-residual cell from polluting the FREQ operands. The
 filter-cutoff stragglers (`FEEDER`) and the pre-first-write default are also
-recovered; the remaining gaps are the bespoke players and the defMON PW
-ping-pong sweep / global filter-cutoff BACC.
+recovered, and the defMON PW **ping-pong** sweep is now a recovered `BACC` mode
+(Vacuole 0.94→0.98); the remaining gaps are the bespoke players, the
+FutureComposer / defMON tick-banded (table-indexed-stride) PW + FREQ slide, and
+the global filter-cutoff BACC.
 
 ## Next steps
 
@@ -85,13 +92,11 @@ ping-pong sweep / global filter-cutoff BACC.
    each violating one of the current model's two structural assumptions —
    `_simulate_reflect` mirrors the overshoot (`hi-(nv-hi)`), and `fit_bacc` /
    `segmented_bacc` assume a single scalar step. In leverage order:
-   - **defMON PW ping-pong → BACC clamp-and-flip mode** (4 defMON tunes,
-     ~0.92–0.96). RE (`$1474`): at the bound it **clamps to a fixed value**
-     (`$f8` ceiling / `$01` floor) and flips (`eor #$80`) — a clamp-and-reverse,
-     not the mirror reflect the code simulates; 12-bit, rate `anc #$7f`-masked and
-     SEQ-seeded per instrument step (`$101e,X`, constant within a note, so the
-     existing note-on segmentation already isolates it — only the reflection shape
-     blocks). Add a `mode="pingpong"` clamp-then-flip to `_simulate_reflect`.
+   - **defMON PW ping-pong → BACC clamp-and-flip mode** — ✅ **done** (#22): the
+     `pingpong` mode (saturate to a fixed boundary clamp + reverse, independent
+     up/down steps) recovers the defMON PW sweep, per-note-segmented
+     (`segmented_pingpong`); Vacuole 0.94→0.98, no regression on the 5 perfect
+     tunes. The other defMON FREQ-slide / filter-cutoff gaps below still apply.
    - **FutureComposer PW / filter → BACC with table-indexed stride** (unlocks the
      FC ~0.90 cluster). RE (`pweng_1341`): the **rate is a step-function of the
      tick** (`$1695` threshold→rate table), so the stride changes *within* a note
