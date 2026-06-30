@@ -29,7 +29,7 @@ them.
 
 ## Current status
 
-Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16):
+Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
 
 - **Oracle + instrumentation.** Deterministic, byte-exact tracer (`sidtrace`) on
   patched libsidplayfp: cycle-stamped SID writes (PC-tagged), CIA/VIC interrupts,
@@ -46,6 +46,9 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16):
   sparse live frequencies), falling back to the live fit (`source: live_freq`).
 - **Lossless gate.** `reconstruct_register` + `round_trip` regenerate each
   register from its IR and score it byte-for-byte against the oracle.
+  Reconstruction holds each register's **power-on default** (`0`) until its
+  first write, mirroring the oracle's pre-first-write frames across every
+  primitive.
 - **25 HVSC fixtures** (3× the top-6 trackers + 3 defMON + A Mind Is Born +
   Commando/Grid Runner/Cauldron II), whole-song, parallel, with an **xfail
   ratchet**: every fixture must round-trip perfectly with zero XSTATE; the
@@ -56,34 +59,28 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16):
   identical (frozen-reference parity test), keeping CI time bounded as fixtures
   grow.
 
-**Round-trip landscape** (whole-song): 4 perfect (Doctagop, Only_3, Denarius,
-Tom_Tom); most tunes 0.96–1.0; weakest are Commando 0.77 (Hubbard's hand-coded
-player), the FutureComposer (~0.90) and defMON (~0.84–0.92) FREQ cases. The
-filter-cutoff stragglers are now recovered (`FEEDER`); the dominant remaining
-small-gap blocker is the **pre-first-write default** (below).
+**Round-trip landscape** (whole-song): 5 perfect (Doctagop, Only_3, Denarius,
+Tom_Tom, 24th_Amaranth); most tunes 0.96–1.0; weakest are Commando 0.77
+(Hubbard's hand-coded player), the FutureComposer (~0.90) and defMON
+(~0.87–0.92) FREQ cases. The filter-cutoff stragglers (`FEEDER`) and the
+pre-first-write default are now recovered; the remaining gaps are the bespoke
+players and the FREQ / CTRL stragglers (below).
 
 ## Next steps
 
-1. **Pre-first-write defaults (next; smallest, highest-leverage gap).** A
-   register's reconstruction currently back-fills its recovered value to frame 0,
-   but the oracle holds the register's *power-on default* (`0`, or the captured
-   RAM-image value) until the player's first write to it. This off-by-a-few-frames
-   artifact is now the *sole* remaining blocker on `24th_Amaranth` (`$D417` CONST
-   `241` vs the held `0` on frames 0–1) and the frame-0 component of `Let_It_Bee`,
-   `Torpedo`, and others. Honor the default-until-first-write in
-   `reconstruct_register` across all primitive types (CONST/SEQ/BACC/…); it is
-   general, low-risk, and flips `24th_Amaranth` outright.
-2. **Drive the rest of the xfail set to zero** (biggest round-trip gaps first):
-   Commando / other bespoke players; the FutureComposer vibrato/portamento
-   residual (try recovering it from the already-logged self-modifying-code
-   immediate writes before adding any observable); the defMON FREQ cases; the
-   remaining voice CTRL / COMPOSITE stragglers.
-3. **Absolute octave/semitone label.** `recover_tuning` now emits absolute note
+1. **Drive the rest of the xfail set to zero** (biggest round-trip gaps first):
+   the per-voice CTRL / COMPOSITE stragglers that XSTATE on otherwise-clean tunes
+   (the most common remaining blocker — `$D40B`/`$D412` waveform/gate sequencers
+   on DMC / GoatTracker2 / defMON); the FutureComposer vibrato/portamento residual
+   (try recovering it from the already-logged self-modifying-code immediate writes
+   before adding any observable); the defMON FREQ cases; Commando / other bespoke
+   players.
+2. **Absolute octave/semitone label.** `recover_tuning` now emits absolute note
    numbers and fits the reference from the recovered note table; the residual is
    the integer octave/semitone label, which is per-player-convention dependent
    (frequency pins tuning only modulo one semitone). Wire a per-player
    note-table base where the convention is known so A4 is fully absolute.
-4. **6502 reference replayer** (assemble the IR with the in-build `xa65`, run it
+3. **6502 reference replayer** (assemble the IR with the in-build `xa65`, run it
    under the emulator, round-trip against the oracle) — proves on-platform
    practicality.
 
