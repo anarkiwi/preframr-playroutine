@@ -79,15 +79,40 @@ ping-pong sweep / global filter-cutoff BACC.
 
 ## Next steps
 
-1. **Drive the rest of the xfail set to zero** (biggest round-trip gaps first):
-   the defMON PW **ping-pong sweep** (12-bit accumulator that reflects and flips
-   direction at the bounds) and the global filter-cutoff BACC (whose direction is
-   an `ADC`/`SBC` opcode patched per instrument step) — the per-voice CTRL
-   waveform/gate sequencers are now recovered via the `XOR` (`base XOR eor`)
-   primitive; the FutureComposer vibrato/portamento residual (try recovering it
-   from the already-logged self-modifying-code immediate writes before adding any
-   observable); Commando's vibrato/arpeggio FREQ (a reflected triangle off the
-   global frame counter plus an octave toggle) and other bespoke players.
+1. **Drive the rest of the xfail set to zero.** Cross-referenced against the
+   byte-exact per-register RE (`re-trackers/*-generators.md`), the remaining gaps
+   are **not** scattered one-offs: they cluster onto three BACC generalizations,
+   each violating one of the current model's two structural assumptions —
+   `_simulate_reflect` mirrors the overshoot (`hi-(nv-hi)`), and `fit_bacc` /
+   `segmented_bacc` assume a single scalar step. In leverage order:
+   - **defMON PW ping-pong → BACC clamp-and-flip mode** (4 defMON tunes,
+     ~0.92–0.96). RE (`$1474`): at the bound it **clamps to a fixed value**
+     (`$f8` ceiling / `$01` floor) and flips (`eor #$80`) — a clamp-and-reverse,
+     not the mirror reflect the code simulates; 12-bit, rate `anc #$7f`-masked and
+     SEQ-seeded per instrument step (`$101e,X`, constant within a note, so the
+     existing note-on segmentation already isolates it — only the reflection shape
+     blocks). Add a `mode="pingpong"` clamp-then-flip to `_simulate_reflect`.
+   - **FutureComposer PW / filter → BACC with table-indexed stride** (unlocks the
+     FC ~0.90 cluster). RE (`pweng_1341`): the **rate is a step-function of the
+     tick** (`$1695` threshold→rate table), so the stride changes *within* a note
+     and both single-step fits reject it. Generalize the stride from a scalar to
+     `step = table[cursor]` paced by the per-voice tick (`$1942`) — the FC pinning
+     invariant: recover the tick once and the PW / CTRL-wave / filter-segment /
+     freq-offset lanes all collapse to `table[tick]`.
+   - **defMON + FC `$D416` cutoff → segmented BACC with SEQ-directed sign +
+     post-scale**. RE (`$10b6/$10be`, opcode at `$10b8`): direction is the
+     `ADC`/`SBC` **opcode patched per instrument step** (observable in the
+     SMC-immediate log), then an `ASL` (×2 on 6581 / `NOP` on 8580) before
+     `$D416`. Let `segmented_bacc` carry a per-segment sign and `reconstruct_register`
+     honor a scalar post-scale.
+
+   Each gap names the exact accumulator/table/opcode cell, so a new primitive is
+   **unit-testable against ground truth**, not just round-trip-scored. The
+   residual bespoke cases come last, sharing no machinery: the FutureComposer
+   vibrato/portamento (recover depth/rate from the already-logged SMC immediate
+   writes — `$12F7` — before adding any observable) and Commando 0.77 (Hubbard's
+   reflected triangle off the **global** frame counter plus an octave-toggle mux —
+   a different reset axis).
 2. **Absolute octave/semitone label.** `recover_tuning` now emits absolute note
    numbers and fits the reference from the recovered note table; the residual is
    the integer octave/semitone label, which is per-player-convention dependent
