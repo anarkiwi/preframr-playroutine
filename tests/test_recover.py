@@ -502,6 +502,43 @@ def test_classify_bacc():
     assert 0x1100 in res["store_pcs"]
 
 
+def test_classify_bacc_held_seed_prelude_before_cell_write():
+    # A note-reseeded PW accumulator captured by a feeder cell, preceded by a
+    # pre-dwell hold at the note-on seed where the cell is not yet written (the
+    # MusicAssembler PW case). The cell drives the modulated frames; the held-seed
+    # prelude must reconstruct from latches so the register round-trips exactly.
+    cell = 0x40
+    seed = 0x08
+    note_len = 8
+    predwell = 9
+    # Per-note saw whose stride varies between notes: the modal-step recurrence
+    # mis-fits the off-modal notes while the captured cell reproduces every
+    # modulated frame, so the cell attaches.
+    steps = [6, 6, 5, 6, 5, 6]
+    ramp = [(0x10 + st * t) & 0xFF for st in steps for t in range(note_len)]
+    values = [seed] * predwell + ramp
+    recs = []
+    ramwr = []
+    for i, v in enumerate(values):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        if i < predwell:
+            ctrl = 0x40  # gate off during the held-seed pre-dwell
+        else:
+            j = i - predwell
+            ctrl = 0x40 if (j % note_len) == note_len - 1 else 0x41
+            ramwr.append(_ra(tick + 10, cell, int(v)))  # cell written only while modulating
+        recs.append(_ev(tick + 8, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1500))
+        recs.append(_ev(tick + 12, SID_WRITE, reg=2, value=int(v), addr=0xD402, aux=0x1388))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = classify_register(trace, 0xD402)
+    assert res["type"] == "BACC"
+    assert res["cell"] == cell
+    assert res["prelude_end"] == predwell
+    rt = round_trip(trace)
+    assert rt[0xD402] == 1.0
+
+
 def test_classify_table_walk():
     ram = np.zeros(65536, dtype=np.uint8)
     base = 0x2200
@@ -611,6 +648,66 @@ def test_classify_filter_feeder_latch():
     ticks = trace.tick_cycles("auto")
     recon = reconstruct_register(res, ticks, trace=trace)
     assert np.array_equal(recon, np.asarray(values, dtype=np.int64))
+
+
+def test_classify_ctrl_feeder_overrides_table_walk():
+    # A voice CTRL ($D404) waveform table walk plus an irregular per-frame gate
+    # bit the table can't reproduce -> imperfect TABLE_WALK. A captured RAM cell
+    # holds the exact written value, so the case-2 FEEDER upgrade replaces the
+    # over-fit table on this NON-filter register and round-trips exactly.
+    ram = np.zeros(65536, dtype=np.uint8)
+    base = 0x18AD
+    table = np.array([0x40, 0x10, 0x20, 0x80], dtype=np.uint8)  # waveform, gate=0
+    ram[base : base + len(table)] = table
+    cursor_cell = 0x177A
+    feeder_cell = 0x1762
+    n = 80
+    rng = np.random.default_rng(11)
+    gate = rng.integers(0, 2, size=n)
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        cur = i % len(table)
+        ctrl = int(table[cur]) | int(gate[i])
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        ramwr.append(_ra(tick + 6, cursor_cell, cur))
+        ramwr.append(_ra(tick + 8, feeder_cell, ctrl))
+        recs.append(_ev(tick + 14, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1628))
+    trace = _build_trace(recs, ram_writes=ramwr, ram=ram)
+    res = classify_register(trace, 0xD404)
+    assert res["type"] == "FEEDER", res["type"]
+    assert res["cell"] == feeder_cell
+    assert res["sid"] == 0xD404
+    assert res["cell_frac"] == 1.0
+    assert round_trip(trace)[0xD404] == 1.0
+
+
+def test_classify_ctrl_table_walk_without_feeder_is_imperfect():
+    # Same waveform-plus-gate trace WITHOUT the captured cell still classifies as
+    # an imperfect TABLE_WALK -- proving the FEEDER upgrade above fires on the
+    # case-2 (table/composite replacement) branch, not the XSTATE relabel.
+    ram = np.zeros(65536, dtype=np.uint8)
+    base = 0x18AD
+    table = np.array([0x40, 0x10, 0x20, 0x80], dtype=np.uint8)
+    ram[base : base + len(table)] = table
+    cursor_cell = 0x177A
+    n = 80
+    rng = np.random.default_rng(11)
+    gate = rng.integers(0, 2, size=n)
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        cur = i % len(table)
+        ctrl = int(table[cur]) | int(gate[i])
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        ramwr.append(_ra(tick + 6, cursor_cell, cur))
+        recs.append(_ev(tick + 14, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1628))
+    trace = _build_trace(recs, ram_writes=ramwr, ram=ram)
+    res = classify_register(trace, 0xD404)
+    assert res["type"] == "TABLE_WALK", res["type"]
+    assert round_trip(trace)[0xD404] < 1.0
 
 
 def test_reconstruct_feeder_no_sampler_zeros():
@@ -979,6 +1076,34 @@ def test_xor_ctrl_recovers_base_eor():
     res = analyze(trace)
     assert res[0xD404]["type"] == "XOR", res[0xD404]["type"]
     assert {res[0xD404]["cell_a"], res[0xD404]["cell_b"]} == {base_cell, eor_cell}
+    rt = round_trip(trace)
+    assert rt[0xD404] == 1.0
+
+
+def test_and_ctrl_recovers_wave_gate():
+    # CTRL written as ``chnwave AND chngate`` (the GoatTracker2 idiom): a waveform
+    # shadow cell masked by a gate cell holding $FF (pass) or $FE (force gate
+    # off). Neither cell alone reproduces CTRL, but the exact AND of the pair
+    # does, sampled at the SID-write instant.
+    rng = np.random.default_rng(7)
+    n = 60
+    wave_cell, gate_cell = 0x30, 0x31
+    waveforms = [0x11, 0x21, 0x41, 0x81]  # waveform+gate-bit shadow values
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        wave = waveforms[i % len(waveforms)]
+        gate = 0xFF if rng.integers(0, 2) else 0xFE  # $FE forces gate (bit0) off
+        ctrl = wave & gate
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, wave_cell, wave))
+        ramwr.append(_ra(tick + 5, gate_cell, gate))
+        recs.append(_ev(tick + 10, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1500))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = analyze(trace)
+    assert res[0xD404]["type"] == "AND", res[0xD404]["type"]
+    assert {res[0xD404]["cell_a"], res[0xD404]["cell_b"]} == {wave_cell, gate_cell}
     rt = round_trip(trace)
     assert rt[0xD404] == 1.0
 

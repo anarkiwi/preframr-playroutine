@@ -1144,8 +1144,6 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
         result.update(type="CONST", value=int(wr["value"][0]))
         return result
 
-    is_filter = voice is None and 0xD415 <= int(sid_addr) <= 0xD418
-
     feeder, ffrac = _best_feeder(series, ctx.stateseq)
     if feeder is not None and ffrac >= 0.5:
         result["cell_addr"] = feeder
@@ -1183,13 +1181,14 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
             result["cell"] = cell
             result["sid"] = int(sid_addr)
             result["cell_frac"] = round(float(frac), 4)
+            _attach_seed_prelude(result, series, ctx)
         return result
 
     result = _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
     if reg_off == _CTRL:
         result = _maybe_xor_ctrl(sid_addr, series, ctx, result)
-    if is_filter:
-        result = _filter_feeder(result)
+        result = _maybe_and_ctrl(sid_addr, series, ctx, result)
+    result = _maybe_feeder_upgrade(result, series, sid_addr, ctx)
     return result
 
 
@@ -1211,6 +1210,32 @@ def _bacc_with_feeder(bacc, series, sid_addr, ctx):
         bacc["sid"] = int(sid_addr)
         bacc["cell_frac"] = round(float(frac), 4)
     return bacc
+
+
+def _attach_seed_prelude(result, series, ctx, max_latches: int = 6):
+    """Fill the pre-modulation held-seed prelude of a cell-fed accumulator.
+
+    Before its feeder cell's first RAM write the register holds its note-on seed
+    (the instrument PW seed loaded once and held until modulation starts), but the
+    captured cell still reads its power-on default, so the cell replay is wrong on
+    those leading frames. Capture that bounded held prelude as SEQ latches; the
+    cell drives every frame it is actually written. Recorded only when the hold is
+    a few latches (a genuine seed prelude, not arbitrary modulation), so it never
+    displaces the captured cell where the cell is live.
+    """
+    sampler = ctx.sampler
+    cell = result.get("cell")
+    if sampler is None or cell is None:
+        return
+    end = sampler.cell_first_frame(cell)
+    if not 0 < end < ctx.n_frames:
+        return
+    frames, values = _seq_latches(np.asarray(series, dtype=np.int64)[:end])
+    if len(frames) > max_latches:
+        return
+    result["prelude_end"] = int(end)
+    result["prelude_frames"] = frames
+    result["prelude_values"] = values
 
 
 def _classify_freq(trace, sid_addr, series, voice, reg_off, ctx, result):
@@ -1296,19 +1321,46 @@ def _xstate_with_feeder(result, series, sid_addr, ctx):
     return result
 
 
-def _filter_feeder(result, min_feeder: float = 0.999):
-    """Upgrade a global filter register ($D415-$D418) XSTATE to a FEEDER primitive.
+def _maybe_feeder_upgrade(result, series, sid_addr, ctx, min_feeder: float = 0.999):
+    """Recover a per-frame register as a FEEDER (exact captured-cell copy).
 
-    The filter sweep/table cursor is independent of the voice gates, so when the
-    generic per-frame machinery finds no single generator a filter register falls
-    to XSTATE. The player computes the cutoff/resonance into a RAM cell then
-    stores it to SID; a register that is a near-exact latched copy of that
-    captured feeder cell (recorded as ``cell``/``cell_frac`` by
-    :func:`_xstate_with_feeder`) is a real per-frame primitive, not an unmodelled
-    dependency. Relabel such results FEEDER; everything else is unchanged.
+    The player often computes a register's value into a RAM cell and then stores
+    that cell to SID; a register that is a near-exact latched copy of such a
+    captured feeder cell is a real per-frame primitive (``FEEDER``), not an
+    unmodelled dependency (``XSTATE``) nor an over-fit table/composite. This
+    generalizes the original filter-only relabel ($D415-$D418) to every per-frame
+    register, in two cases:
+
+    1. an ``XSTATE`` result whose attached feeder cell is an exact copy
+       (``cell_frac >= min_feeder``) -- e.g. a wave-table CTRL written through a
+       gated shadow cell; relabel it ``FEEDER``;
+    2. an imperfect ``TABLE_WALK``/``COMPOSITE`` that a captured feeder cell,
+       sampled at the write instant, reconstructs exactly (``>= min_feeder``) and
+       strictly better than the chosen generator -- the register IS that cell
+       copy; replace the descriptor.
+
+    Strictly non-worsening: case 2 only fires when the feeder beats the current
+    generator, and case 1 never changes the reconstruction (both replay the same
+    cell). Generators that already reconstruct perfectly are left untouched.
     """
-    if result.get("type") == "XSTATE" and result.get("cell_frac", 0.0) >= min_feeder:
+    rtype = result.get("type")
+    if rtype == "XSTATE" and result.get("cell_frac", 0.0) >= min_feeder:
         result["type"] = "FEEDER"
+        return result
+    if rtype in ("TABLE_WALK", "COMPOSITE"):
+        cur = _descriptor_fidelity(result, series, ctx)
+        if cur >= 1.0:
+            return result
+        cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
+        if cell is not None and frac >= min_feeder and frac > cur:
+            keep = {k: result[k] for k in ("addr", "store_pcs", "n_writes") if k in result}
+            keep.update(
+                type="FEEDER",
+                cell=int(cell),
+                sid=int(sid_addr),
+                cell_frac=round(float(frac), 4),
+            )
+            return keep
     return result
 
 
@@ -1830,6 +1882,78 @@ def _maybe_xor_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
     return result
 
 
+def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
+    """Recover a CTRL register written as ``waveCell AND gateCell`` (or ``None``).
+
+    The GoatTracker2 idiom ``CTRL = chnwave AND chngate`` masks a waveform shadow
+    cell with a gate cell holding ``$FF`` (pass) or ``$FE`` (force gate-off). The
+    gate cell is near-binary while the waveform cell carries many distinct bytes,
+    so the search is asymmetric: each low-entropy gate-like cell (``<= 4`` values)
+    is AND-ed against every control-like candidate cell (``<= 32`` values),
+    sampled at the SID-write instant over a frame subsample, then the best pair
+    is verified on all frames. Returns an ``AND`` descriptor only when it
+    reproduces ``>= min_fid``.
+    """
+    ss = ctx.stateseq
+    if ss.grid.shape[1] == 0 or ctx.sampler is None:
+        return None
+    s = np.asarray(series, dtype=np.int64) & 0xFF
+    n = len(s)
+    grid = ss.grid
+    addrs = ss.addrs
+    uniq = [len(np.unique(grid[:, j])) for j in range(grid.shape[1])]
+    cols = [j for j in range(grid.shape[1]) if uniq[j] <= 32]
+    gates = [j for j in range(grid.shape[1]) if uniq[j] <= 4]
+    if not cols or not gates:
+        return None
+    full = {
+        j: ctx.sampler.at_write(int(addrs[j]), sid_addr).astype(np.int64) & 0xFF
+        for j in set(cols) | set(gates)
+    }
+    sample = np.unique(np.linspace(0, n - 1, min(n, 512)).astype(np.int64))
+    ss_s = s[sample]
+    cand = np.stack([full[j][sample] for j in cols], axis=1)
+    best = (-1.0, None, None)
+    for g in gates:
+        gv = full[g][sample]
+        f = ((gv[:, None] & cand) == ss_s[:, None]).mean(axis=0)
+        k = int(f.argmax())
+        if f[k] > best[0]:
+            best = (float(f[k]), g, cols[k])
+    _frac, gj, cj = best
+    if gj is None or gj == cj:
+        return None
+    recon = (full[gj] & full[cj]) & 0xFF
+    fid = float(np.mean(recon == s))
+    if fid < min_fid:
+        return None
+    return {
+        "type": "AND",
+        "cell_a": int(addrs[cj]),
+        "cell_b": int(addrs[gj]),
+        "sid": int(sid_addr),
+        "residual": fid,
+    }
+
+
+def _maybe_and_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
+    """Upgrade a CTRL register to the ``waveCell AND gateCell`` model when it wins.
+
+    Mirrors :func:`_maybe_xor_ctrl`: adopted only when the AND reproduces
+    ``>= min_fid`` AND strictly beats the current descriptor (so a CTRL that
+    already reconstructs perfectly -- including a freshly adopted XOR -- is never
+    displaced).
+    """
+    and_d = _and_pair(sid_addr, series, ctx, min_fid)
+    if and_d is None:
+        return result
+    if and_d["residual"] > _descriptor_fidelity(result, series, ctx):
+        keep = {k: result[k] for k in ("addr", "store_pcs", "n_writes") if k in result}
+        keep.update(and_d)
+        return keep
+    return result
+
+
 # -- event/state correlation ----------------------------------------------
 
 
@@ -1983,6 +2107,13 @@ class _CellSampler:
             cyc, val = self._cell_writes(int(cell_addr))
             self._atwrite[key] = _carry_at(cyc, val, sample)
         return self._atwrite[key]
+
+    def cell_first_frame(self, cell_addr) -> int:
+        """Frame index of a RAM cell's first write (``0`` if never written)."""
+        cyc, _ = self._cell_writes(int(cell_addr))
+        if len(cyc) == 0:
+            return 0
+        return int(np.searchsorted(self.ticks, np.uint64(int(cyc.min())), side="right")) - 1
 
     def written_mask(self, sid_addr) -> np.ndarray:
         """Per-frame bool: True once ``sid_addr`` has been written by frame end.
@@ -2138,7 +2269,18 @@ def _recon_bacc(desc, n, sampler=None) -> np.ndarray:
     # captured, regenerate from it (same "else use the captured cell" fallback as
     # the table-walk cursor); otherwise run the pure recurrence.
     if sampler is not None and desc.get("cell") is not None and desc.get("sid") is not None:
-        return sampler.at_write(desc["cell"], desc["sid"]) & 0xFF
+        out = sampler.at_write(desc["cell"], desc["sid"]) & 0xFF
+        end = desc.get("prelude_end")
+        if end:
+            prelude = _recon_seq(
+                {
+                    "latch_frames": desc.get("prelude_frames", [0]),
+                    "latch_values": desc.get("prelude_values", [0]),
+                },
+                n,
+            )
+            out = np.where(np.arange(n) < int(end), prelude & 0xFF, out)
+        return out
     full = _recon_bacc_full(desc, n)
     role = desc.get("byte_role", "full")
     if role == "lo":
@@ -2245,6 +2387,15 @@ def _recon_xor(desc, n, sampler) -> np.ndarray:
     return (a ^ b) & 0xFF
 
 
+def _recon_and(desc, n, sampler) -> np.ndarray:
+    """Regenerate a ``cellA AND cellB`` CTRL register from its two captured cells."""
+    if sampler is None:
+        return np.zeros(n, dtype=np.int64)
+    a = sampler.at_write(desc["cell_a"], desc["sid"]).astype(np.int64)
+    b = sampler.at_write(desc["cell_b"], desc["sid"]).astype(np.int64)
+    return (a & b) & 0xFF
+
+
 def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndarray:
     """Regenerate a register's per-frame output from its recovered descriptor.
 
@@ -2275,6 +2426,7 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
             "PITCHWALK": _recon_pitchwalk,
             "FEEDER": _recon_feeder,
             "XOR": _recon_xor,
+            "AND": _recon_and,
         }
         if kind in builders:
             recon = builders[kind](descriptor, n, smp)
