@@ -36,9 +36,16 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   CPU vectors, play-window-scoped RAM read/write logs, PC coverage, RAM image.
 - **Recovery primitives.** `CONST`, `SEQ`, `BACC`, `TABLE_WALK`, `COMPOSITE`,
   `PITCHWALK`, `FEEDER` (a global filter register `$D415`–`$D418` recovered as an
-  exact latched copy of its captured RAM feeder cell), plus the note/pitch layer
-  (`recover_tuning`, `voice_detune`). The CTRL waveform table-walk also tolerates
-  up to three suppressed off-table command bytes (strict-improvement guarded).
+  exact latched copy of its captured RAM feeder cell), `XOR` (a CTRL register
+  recovered as `cellA XOR cellB` — the gate/test/waveform "base XOR eor" idiom
+  defMON and similar players use to toggle control bits), plus the note/pitch
+  layer (`recover_tuning`, `voice_detune`). The CTRL waveform table-walk also
+  tolerates up to three suppressed off-table command bytes (strict-improvement
+  guarded), and the 16-bit `COMPOSITE` keeps its additive-modulation term only
+  when it strictly improves reconstruction — so an output-then-compute player's
+  operand cell (which already carries the whole value, one call late) is
+  recovered base-only instead of being polluted by a spurious phase-residual
+  modulation cell.
 - **Global tuning / absolute notes.** `recover_tuning` emits absolute MIDI
   `note_numbers` / `note_range` (so the IR's notes are absolute pitch, comparable
   across tunes) and fits the reference A4 from the recovered note→frequency table
@@ -49,9 +56,10 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   Reconstruction holds each register's **power-on default** (`0`) until its
   first write, mirroring the oracle's pre-first-write frames across every
   primitive.
-- **25 HVSC fixtures** (3× the top-6 trackers + 3 defMON + A Mind Is Born +
-  Commando/Grid Runner/Cauldron II), whole-song, parallel, with an **xfail
-  ratchet**: every fixture must round-trip perfectly with zero XSTATE; the
+- **26 HVSC fixtures** (3× the top-6 trackers + 4 defMON, incl. Goto80's
+  *Automatas* — the canonical defMON reverse-engineering reference tune — + A
+  Mind Is Born + Commando/Grid Runner/Cauldron II), whole-song, parallel, with an
+  **xfail ratchet**: every fixture must round-trip perfectly with zero XSTATE; the
   not-yet-perfect ones are `xfail(strict=True)`, so the gap can only shrink (a
   fix XPASS-fails CI until its marker is removed).
 - **Analysis performance.** `_table_walk_scan` (the no-read-log table-walk
@@ -61,20 +69,25 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
 
 **Round-trip landscape** (whole-song): 5 perfect (Doctagop, Only_3, Denarius,
 Tom_Tom, 24th_Amaranth); most tunes 0.96–1.0; weakest are Commando 0.77
-(Hubbard's hand-coded player), the FutureComposer (~0.90) and defMON
-(~0.87–0.92) FREQ cases. The filter-cutoff stragglers (`FEEDER`) and the
-pre-first-write default are now recovered; the remaining gaps are the bespoke
-players and the FREQ / CTRL stragglers (below).
+(Hubbard's hand-coded player) and the FutureComposer (~0.90) FREQ cases. The
+defMON tunes rose to ~0.92–0.96 once the `XOR` CTRL primitive recovered the
+`base XOR eor` gate sequencer (`$D404`/`$D40B`/`$D412`) and the `COMPOSITE`
+mod-guard stopped a phase-residual cell from polluting the FREQ operands. The
+filter-cutoff stragglers (`FEEDER`) and the pre-first-write default are also
+recovered; the remaining gaps are the bespoke players and the defMON PW
+ping-pong sweep / global filter-cutoff BACC.
 
 ## Next steps
 
 1. **Drive the rest of the xfail set to zero** (biggest round-trip gaps first):
-   the per-voice CTRL / COMPOSITE stragglers that XSTATE on otherwise-clean tunes
-   (the most common remaining blocker — `$D40B`/`$D412` waveform/gate sequencers
-   on DMC / GoatTracker2 / defMON); the FutureComposer vibrato/portamento residual
-   (try recovering it from the already-logged self-modifying-code immediate writes
-   before adding any observable); the defMON FREQ cases; Commando / other bespoke
-   players.
+   the defMON PW **ping-pong sweep** (12-bit accumulator that reflects and flips
+   direction at the bounds) and the global filter-cutoff BACC (whose direction is
+   an `ADC`/`SBC` opcode patched per instrument step) — the per-voice CTRL
+   waveform/gate sequencers are now recovered via the `XOR` (`base XOR eor`)
+   primitive; the FutureComposer vibrato/portamento residual (try recovering it
+   from the already-logged self-modifying-code immediate writes before adding any
+   observable); Commando's vibrato/arpeggio FREQ (a reflected triangle off the
+   global frame counter plus an octave toggle) and other bespoke players.
 2. **Absolute octave/semitone label.** `recover_tuning` now emits absolute note
    numbers and fits the reference from the recovered note table; the residual is
    the integer octave/semitone label, which is per-player-convention dependent

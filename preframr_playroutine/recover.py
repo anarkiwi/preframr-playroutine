@@ -883,6 +883,8 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
         return result
 
     result = _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
+    if reg_off == _CTRL:
+        result = _maybe_xor_ctrl(sid_addr, series, ctx, result)
     if is_filter:
         result = _filter_feeder(result)
     return result
@@ -1390,30 +1392,46 @@ def _composite16(trace, sid_addr, reg_off, ctx):
         return None
     base = {"lo": (base_lo, int(lo_addr)), "hi": (base_hi, int(hi_addr))}
     base_val = _comp_part(base, n, ctx.sampler)
+    out_byte = np.asarray(lo_oracle if role == "lo" else hi_oracle, dtype=np.int64)
+    target_byte = out_byte & 0xFF
+
+    # An additive modulation term is only real when it improves the *whole*
+    # reconstruction. With output-then-compute players (defMON) the base operand
+    # cell already carries the whole value (one call late), so its residual is a
+    # phase artefact a feeder search can spuriously "explain" with a noise cell,
+    # lowering fidelity; with a genuine accumulator the mod is needed. Build both
+    # the base-only and base+mod descriptors -- each with its own override pass,
+    # since the 16-bit base+mod sum is what isolates the override frames -- and
+    # keep whichever reconstructs the register best (strict-improvement, cf. the
+    # table-walk override guard).
+    mods = [None]
     residual = (target - base_val) & 0xFFFF
-    mod = None
     if np.any(residual != 0):
         mod_lo = _feeder_cell(residual & 0xFF, lo_addr, ctx)
         mod_hi = _feeder_cell((residual >> 8) & 0xFF, hi_addr, ctx)
         if mod_lo is not None and mod_hi is not None:
-            mod = {"lo": (mod_lo, int(lo_addr)), "hi": (mod_hi, int(hi_addr))}
-    desc = {
-        "type": "COMPOSITE",
-        "byte_role": role,
-        "width_mask": 0xFFFF,
-        "base": base,
-        "mod": mod,
-        "overrides": [],
-    }
-    modelled = (base_val + _comp_part(mod, n, ctx.sampler)) & 0xFFFF
-    out_byte = lo_oracle if role == "lo" else hi_oracle
-    forced = np.where(modelled == target, -1, np.asarray(out_byte, dtype=np.int64))
-    ov = _override_descriptor(forced, ctx)
-    if ov is not None:
-        desc["overrides"].append(ov)
-    recon = _recon_composite(desc, n, ctx.sampler)
-    desc["residual"] = float(np.mean(recon == (np.asarray(out_byte) & 0xFF)))
-    return desc
+            mods.append({"lo": (mod_lo, int(lo_addr)), "hi": (mod_hi, int(hi_addr))})
+
+    best_fid, best_desc = -1.0, None
+    for mod in mods:
+        desc = {
+            "type": "COMPOSITE",
+            "byte_role": role,
+            "width_mask": 0xFFFF,
+            "base": base,
+            "mod": mod,
+            "overrides": [],
+        }
+        modelled = (base_val + _comp_part(mod, n, ctx.sampler)) & 0xFFFF
+        forced = np.where(modelled == target, -1, out_byte)
+        ov = _override_descriptor(forced, ctx)
+        if ov is not None:
+            desc["overrides"].append(ov)
+        fid = float(np.mean(_recon_composite(desc, n, ctx.sampler) == target_byte))
+        desc["residual"] = fid
+        if fid > best_fid:
+            best_fid, best_desc = fid, desc
+    return best_desc
 
 
 def _composite8(sid_addr, series, ctx):
@@ -1436,6 +1454,77 @@ def _composite8(sid_addr, series, ctx):
     recon = _recon_composite(desc, ctx.n_frames, ctx.sampler)
     desc["residual"] = float(np.mean(recon == series))
     return desc
+
+
+def _xor_pair(sid_addr, series, ctx, min_fid: float = 0.999):
+    """Recover a CTRL register written as ``cellA XOR cellB`` (or ``None``).
+
+    A common gate/test/waveform idiom (defMON, and any player that flips control
+    bits with an eor mask rather than rewriting the whole byte) computes
+    ``CTRL = base XOR eor`` from two captured RAM cells. Neither cell alone
+    reproduces CTRL, so the per-frame machinery (table-walk / feeder / SEQ) can
+    only partly fit it; the exact-XOR of the right pair reproduces it byte-for-
+    byte. Searches low-entropy (control-like) cells, sampled at the SID-write
+    instant, over a frame subsample, then verifies the best pair on all frames.
+    Returns an ``XOR`` descriptor only when it reproduces ``>= min_fid``.
+    """
+    ss = ctx.stateseq
+    if ss.grid.shape[1] == 0 or ctx.sampler is None:
+        return None
+    s = np.asarray(series, dtype=np.int64) & 0xFF
+    n = len(s)
+    grid = ss.grid
+    addrs = ss.addrs
+    # Control bytes toggle among a handful of values; that prefilter bounds the
+    # pair search to O(m^2 * subsample), independent of trace length.
+    cols = [j for j in range(grid.shape[1]) if len(np.unique(grid[:, j])) <= 24]
+    if len(cols) < 2:
+        return None
+    mat_full = np.stack(
+        [ctx.sampler.at_write(int(addrs[j]), sid_addr).astype(np.int64) & 0xFF for j in cols],
+        axis=1,
+    )
+    sample = np.unique(np.linspace(0, n - 1, min(n, 512)).astype(np.int64))
+    mat = mat_full[sample]
+    ss_s = s[sample]
+    best = (-1.0, None, None)
+    for ai in range(len(cols)):
+        f = (mat[:, ai][:, None] ^ mat == ss_s[:, None]).mean(axis=0)
+        k = int(f.argmax())
+        if f[k] > best[0]:
+            best = (float(f[k]), ai, k)
+    _frac, ai, bi = best
+    if ai is None or ai == bi:
+        return None
+    recon = (mat_full[:, ai] ^ mat_full[:, bi]) & 0xFF
+    fid = float(np.mean(recon == s))
+    if fid < min_fid:
+        return None
+    return {
+        "type": "XOR",
+        "cell_a": int(addrs[cols[ai]]),
+        "cell_b": int(addrs[cols[bi]]),
+        "sid": int(sid_addr),
+        "residual": fid,
+    }
+
+
+def _maybe_xor_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
+    """Upgrade a CTRL register to the ``cellA XOR cellB`` model when it wins.
+
+    Tried only after the generic per-frame classification, and adopted only when
+    the XOR reproduces ``>= min_fid`` AND strictly beats the current descriptor
+    (so a clean table-walk/SEQ CTRL that already reconstructs perfectly is never
+    displaced, and no spurious pair can fire below near-exact fidelity).
+    """
+    xor = _xor_pair(sid_addr, series, ctx, min_fid)
+    if xor is None:
+        return result
+    if xor["residual"] > _descriptor_fidelity(result, series, ctx):
+        keep = {k: result[k] for k in ("addr", "store_pcs", "n_writes") if k in result}
+        keep.update(xor)
+        return keep
+    return result
 
 
 # -- event/state correlation ----------------------------------------------
@@ -1780,6 +1869,15 @@ def _recon_feeder(desc, n, sampler) -> np.ndarray:
     return sampler.at_write(desc["cell"], desc["sid"]) & 0xFF
 
 
+def _recon_xor(desc, n, sampler) -> np.ndarray:
+    """Regenerate a ``cellA XOR cellB`` CTRL register from its two captured cells."""
+    if sampler is None:
+        return np.zeros(n, dtype=np.int64)
+    a = sampler.at_write(desc["cell_a"], desc["sid"]).astype(np.int64)
+    b = sampler.at_write(desc["cell_b"], desc["sid"]).astype(np.int64)
+    return (a ^ b) & 0xFF
+
+
 def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndarray:
     """Regenerate a register's per-frame output from its recovered descriptor.
 
@@ -1789,7 +1887,8 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
     ``TABLE_WALK`` -> ``table[base + cursor*stride] & mask`` (gate-masked by a
     captured cell when one was recovered); ``COMPOSITE`` -> base + modulation +
     overrides; ``FEEDER`` -> a global filter register's captured RAM feeder cell
-    sampled at the write instant. Cell-referencing descriptors read those cells
+    sampled at the write instant; ``XOR`` -> a CTRL register's ``cellA XOR cellB``
+    (base/eor gate idiom). Cell-referencing descriptors read those cells
     from ``trace`` (or a shared ``sampler``); ``XSTATE`` has no single-generator
     model yet and returns ``None``.
     """
@@ -1808,6 +1907,7 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
             "COMPOSITE": _recon_composite,
             "PITCHWALK": _recon_pitchwalk,
             "FEEDER": _recon_feeder,
+            "XOR": _recon_xor,
         }
         if kind in builders:
             recon = builders[kind](descriptor, n, smp)
