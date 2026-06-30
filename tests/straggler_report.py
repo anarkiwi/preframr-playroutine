@@ -59,9 +59,7 @@ def main():
             trace = render(entry, work)
             result = analyze(trace)
             xstate = sorted(
-                a
-                for a, d in result.items()
-                if isinstance(a, int) and d.get("type") == "XSTATE"
+                a for a, d in result.items() if isinstance(a, int) and d.get("type") == "XSTATE"
             )
             rt = round_trip(trace)
         rows.append((rt["overall"], fam, name, xstate, rt["unmodeled"]))
