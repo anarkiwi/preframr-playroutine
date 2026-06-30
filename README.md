@@ -29,13 +29,16 @@ them.
 
 ## Current status
 
-Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13):
+Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16):
 
 - **Oracle + instrumentation.** Deterministic, byte-exact tracer (`sidtrace`) on
   patched libsidplayfp: cycle-stamped SID writes (PC-tagged), CIA/VIC interrupts,
   CPU vectors, play-window-scoped RAM read/write logs, PC coverage, RAM image.
 - **Recovery primitives.** `CONST`, `SEQ`, `BACC`, `TABLE_WALK`, `COMPOSITE`,
-  `PITCHWALK`, plus the note/pitch layer (`recover_tuning`, `voice_detune`).
+  `PITCHWALK`, `FEEDER` (a global filter register `$D415`–`$D418` recovered as an
+  exact latched copy of its captured RAM feeder cell), plus the note/pitch layer
+  (`recover_tuning`, `voice_detune`). The CTRL waveform table-walk also tolerates
+  up to three suppressed off-table command bytes (strict-improvement guarded).
 - **Global tuning / absolute notes.** `recover_tuning` emits absolute MIDI
   `note_numbers` / `note_range` (so the IR's notes are absolute pitch, comparable
   across tunes) and fits the reference A4 from the recovered note→frequency table
@@ -53,24 +56,34 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13):
   identical (frozen-reference parity test), keeping CI time bounded as fixtures
   grow.
 
-**Round-trip landscape** (whole-song): 3 perfect (Doctagop, Only_3, Denarius);
-most tunes 0.96–1.0; weakest are Commando 0.77 (Hubbard's hand-coded player),
-the FutureComposer (~0.90) and defMON (~0.84–0.92) FREQ cases, plus filter /
-CTRL stragglers on JCH.
+**Round-trip landscape** (whole-song): 4 perfect (Doctagop, Only_3, Denarius,
+Tom_Tom); most tunes 0.96–1.0; weakest are Commando 0.77 (Hubbard's hand-coded
+player), the FutureComposer (~0.90) and defMON (~0.84–0.92) FREQ cases. The
+filter-cutoff stragglers are now recovered (`FEEDER`); the dominant remaining
+small-gap blocker is the **pre-first-write default** (below).
 
 ## Next steps
 
-1. **Drive the xfail set to zero** (biggest round-trip gaps first): Commando /
-   other bespoke players; the FutureComposer vibrato/portamento residual (try
-   recovering it from the already-logged self-modifying-code immediate writes
-   before adding any observable); the defMON FREQ cases; the per-tune
-   filter-cutoff (`$D416`) and CTRL stragglers.
-2. **Absolute octave/semitone label.** `recover_tuning` now emits absolute note
+1. **Pre-first-write defaults (next; smallest, highest-leverage gap).** A
+   register's reconstruction currently back-fills its recovered value to frame 0,
+   but the oracle holds the register's *power-on default* (`0`, or the captured
+   RAM-image value) until the player's first write to it. This off-by-a-few-frames
+   artifact is now the *sole* remaining blocker on `24th_Amaranth` (`$D417` CONST
+   `241` vs the held `0` on frames 0–1) and the frame-0 component of `Let_It_Bee`,
+   `Torpedo`, and others. Honor the default-until-first-write in
+   `reconstruct_register` across all primitive types (CONST/SEQ/BACC/…); it is
+   general, low-risk, and flips `24th_Amaranth` outright.
+2. **Drive the rest of the xfail set to zero** (biggest round-trip gaps first):
+   Commando / other bespoke players; the FutureComposer vibrato/portamento
+   residual (try recovering it from the already-logged self-modifying-code
+   immediate writes before adding any observable); the defMON FREQ cases; the
+   remaining voice CTRL / COMPOSITE stragglers.
+3. **Absolute octave/semitone label.** `recover_tuning` now emits absolute note
    numbers and fits the reference from the recovered note table; the residual is
    the integer octave/semitone label, which is per-player-convention dependent
    (frequency pins tuning only modulo one semitone). Wire a per-player
    note-table base where the convention is known so A4 is fully absolute.
-3. **6502 reference replayer** (assemble the IR with the in-build `xa65`, run it
+4. **6502 reference replayer** (assemble the IR with the in-build `xa65`, run it
    under the emulator, round-trip against the oracle) — proves on-platform
    practicality.
 
