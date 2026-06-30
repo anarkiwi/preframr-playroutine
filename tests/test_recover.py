@@ -1708,3 +1708,62 @@ def test_tickband_rejects_noise():
     series = rng.integers(0, 4096, size=600).astype(np.int64)
     resets = list(range(0, 600, 6))
     assert segmented_tickband(series, resets) is None
+
+
+def test_or_modevol_cell_or_const():
+    # MODE/VOL ($D418) blitted as ``volume | filter_mode`` where the mode nibble is
+    # a constant ($10) and the volume is a captured cell (JCH idiom). Neither a
+    # single feeder nor a table walk reproduces it; ``cell | const`` does. The
+    # volume cell is not written for the first few frames, so the register holds its
+    # note-on seed ($1F) there -- exercising the held-seed prelude.
+    rng = np.random.default_rng(3)
+    n = 60
+    vol_cell, mode = 0x30, 0x10
+    seed = mode | 0x0F  # $1F held until the volume cell starts updating
+    prelude_frames = 5
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        if i < prelude_frames:
+            value = seed
+        else:
+            vol = int(rng.integers(1, 16))  # moving volume nibble, not an accumulator
+            ramwr.append(_ra(tick + 4, vol_cell, vol))
+            value = mode | vol
+        recs.append(_ev(tick + 20, SID_WRITE, reg=0x18, value=value, addr=0xD418, aux=0x1500))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = analyze(trace)
+    assert res[0xD418]["type"] == "OR", res[0xD418]["type"]
+    assert res[0xD418]["cell_a"] == vol_cell
+    assert res[0xD418]["const"] == mode
+    assert res[0xD418]["prelude_end"] == prelude_frames
+    rt = round_trip(trace)
+    assert rt[0xD418] == 1.0
+
+
+def test_or_modevol_cell_pair():
+    # MODE/VOL ($D418) blitted as ``mode_cell | volume_cell``: a moving filter-mode
+    # hi-nibble OR-ed with a moving volume lo-nibble. Neither cell alone reproduces
+    # it, but the exact OR of the pair does, sampled at the SID-write instant.
+    rng = np.random.default_rng(5)
+    n = 60
+    mode_cell, vol_cell = 0x30, 0x31
+    modes = [0x10, 0x20, 0x30]
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        mode = modes[int(rng.integers(0, len(modes)))]
+        vol = int(rng.integers(1, 16))
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, mode_cell, mode))
+        ramwr.append(_ra(tick + 5, vol_cell, vol))
+        recs.append(_ev(tick + 20, SID_WRITE, reg=0x18, value=mode | vol, addr=0xD418, aux=0x1500))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = analyze(trace)
+    assert res[0xD418]["type"] == "OR", res[0xD418]["type"]
+    assert {res[0xD418]["cell_a"], res[0xD418]["cell_b"]} == {mode_cell, vol_cell}
+    rt = round_trip(trace)
+    assert rt[0xD418] == 1.0
