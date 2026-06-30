@@ -35,8 +35,12 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   patched libsidplayfp: cycle-stamped SID writes (PC-tagged), CIA/VIC interrupts,
   CPU vectors, play-window-scoped RAM read/write logs, PC coverage, RAM image.
 - **Recovery primitives.** `CONST`, `SEQ`, `BACC`, `TABLE_WALK`, `COMPOSITE`,
-  `PITCHWALK`, `FEEDER` (a global filter register `$D415`–`$D418` recovered as an
-  exact latched copy of its captured RAM feeder cell), `XOR` (a CTRL register
+  `PITCHWALK`, `FEEDER` (any per-frame register recovered as an exact latched
+  copy of a captured RAM feeder cell — voice CTRL waveform/gate shadows and the
+  global RES/FILT immediate, not just the filter sweep `$D415`–`$D418`:
+  relabels an XSTATE-with-exact-cell, and replaces an imperfect
+  `TABLE_WALK`/`COMPOSITE` only when the captured cell sampled at the write
+  instant reconstructs exactly (≥0.999) and strictly better), `XOR` (a CTRL register
   recovered as `cellA XOR cellB` — the gate/test/waveform "base XOR eor" idiom
   defMON and similar players use to toggle control bits), plus the note/pitch
   layer (`recover_tuning`, `voice_detune`). The CTRL waveform table-walk also
@@ -79,13 +83,19 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   identical (frozen-reference parity test), keeping CI time bounded as fixtures
   grow.
 
-**Round-trip landscape** (whole-song): 6 perfect (Doctagop, Only_3, Denarius,
-Tom_Tom, 24th_Amaranth, Hawkeye); most tunes 0.96–1.0; weakest are Commando 0.77
+**Round-trip landscape** (whole-song): 8 perfect (Doctagop, Only_3, Denarius,
+Tom_Tom, 24th_Amaranth, Hawkeye, and the GoatTracker2 pair Grid_Runner and
+Day_6_in_Kleve_Hades — recovered by the generalized `FEEDER`: their voice CTRL
+waveform/gate shadows and the RES/FILT immediate are exact captured-cell copies,
+previously mis-filed as XSTATE or an over-fit TABLE_WALK; Automatas 0.93→0.95 and
+Cauldron_II_Remix 0.985→0.995 improved as side effects); most tunes 0.96–1.0;
+weakest are Commando 0.77
 (Hubbard's hand-coded player) and the FutureComposer FREQ cases. The
 defMON tunes rose to ~0.92–0.96 once the `XOR` CTRL primitive recovered the
 `base XOR eor` gate sequencer (`$D404`/`$D40B`/`$D412`) and the `COMPOSITE`
 mod-guard stopped a phase-residual cell from polluting the FREQ operands. The
-filter-cutoff stragglers (`FEEDER`) and the pre-first-write default are also
+captured-cell stragglers (`FEEDER`, now any per-frame register — filter
+immediate, CTRL waveform/gate shadows) and the pre-first-write default are also
 recovered; the defMON PW **ping-pong** sweep (Vacuole 0.94→0.98) and the
 FutureComposer **tick-banded** PW sweep (Hawkeye → perfect, its sole gap closed)
 are now recovered `BACC` modes. The remaining gaps are the bespoke players, the

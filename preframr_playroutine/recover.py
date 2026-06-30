@@ -1144,8 +1144,6 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
         result.update(type="CONST", value=int(wr["value"][0]))
         return result
 
-    is_filter = voice is None and 0xD415 <= int(sid_addr) <= 0xD418
-
     feeder, ffrac = _best_feeder(series, ctx.stateseq)
     if feeder is not None and ffrac >= 0.5:
         result["cell_addr"] = feeder
@@ -1188,8 +1186,7 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
     result = _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
     if reg_off == _CTRL:
         result = _maybe_xor_ctrl(sid_addr, series, ctx, result)
-    if is_filter:
-        result = _filter_feeder(result)
+    result = _maybe_feeder_upgrade(result, series, sid_addr, ctx)
     return result
 
 
@@ -1296,19 +1293,46 @@ def _xstate_with_feeder(result, series, sid_addr, ctx):
     return result
 
 
-def _filter_feeder(result, min_feeder: float = 0.999):
-    """Upgrade a global filter register ($D415-$D418) XSTATE to a FEEDER primitive.
+def _maybe_feeder_upgrade(result, series, sid_addr, ctx, min_feeder: float = 0.999):
+    """Recover a per-frame register as a FEEDER (exact captured-cell copy).
 
-    The filter sweep/table cursor is independent of the voice gates, so when the
-    generic per-frame machinery finds no single generator a filter register falls
-    to XSTATE. The player computes the cutoff/resonance into a RAM cell then
-    stores it to SID; a register that is a near-exact latched copy of that
-    captured feeder cell (recorded as ``cell``/``cell_frac`` by
-    :func:`_xstate_with_feeder`) is a real per-frame primitive, not an unmodelled
-    dependency. Relabel such results FEEDER; everything else is unchanged.
+    The player often computes a register's value into a RAM cell and then stores
+    that cell to SID; a register that is a near-exact latched copy of such a
+    captured feeder cell is a real per-frame primitive (``FEEDER``), not an
+    unmodelled dependency (``XSTATE``) nor an over-fit table/composite. This
+    generalizes the original filter-only relabel ($D415-$D418) to every per-frame
+    register, in two cases:
+
+    1. an ``XSTATE`` result whose attached feeder cell is an exact copy
+       (``cell_frac >= min_feeder``) -- e.g. a wave-table CTRL written through a
+       gated shadow cell; relabel it ``FEEDER``;
+    2. an imperfect ``TABLE_WALK``/``COMPOSITE`` that a captured feeder cell,
+       sampled at the write instant, reconstructs exactly (``>= min_feeder``) and
+       strictly better than the chosen generator -- the register IS that cell
+       copy; replace the descriptor.
+
+    Strictly non-worsening: case 2 only fires when the feeder beats the current
+    generator, and case 1 never changes the reconstruction (both replay the same
+    cell). Generators that already reconstruct perfectly are left untouched.
     """
-    if result.get("type") == "XSTATE" and result.get("cell_frac", 0.0) >= min_feeder:
+    rtype = result.get("type")
+    if rtype == "XSTATE" and result.get("cell_frac", 0.0) >= min_feeder:
         result["type"] = "FEEDER"
+        return result
+    if rtype in ("TABLE_WALK", "COMPOSITE"):
+        cur = _descriptor_fidelity(result, series, ctx)
+        if cur >= 1.0:
+            return result
+        cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
+        if cell is not None and frac >= min_feeder and frac > cur:
+            keep = {k: result[k] for k in ("addr", "store_pcs", "n_writes") if k in result}
+            keep.update(
+                type="FEEDER",
+                cell=int(cell),
+                sid=int(sid_addr),
+                cell_frac=round(float(frac), 4),
+            )
+            return keep
     return result
 
 

@@ -613,6 +613,66 @@ def test_classify_filter_feeder_latch():
     assert np.array_equal(recon, np.asarray(values, dtype=np.int64))
 
 
+def test_classify_ctrl_feeder_overrides_table_walk():
+    # A voice CTRL ($D404) waveform table walk plus an irregular per-frame gate
+    # bit the table can't reproduce -> imperfect TABLE_WALK. A captured RAM cell
+    # holds the exact written value, so the case-2 FEEDER upgrade replaces the
+    # over-fit table on this NON-filter register and round-trips exactly.
+    ram = np.zeros(65536, dtype=np.uint8)
+    base = 0x18AD
+    table = np.array([0x40, 0x10, 0x20, 0x80], dtype=np.uint8)  # waveform, gate=0
+    ram[base : base + len(table)] = table
+    cursor_cell = 0x177A
+    feeder_cell = 0x1762
+    n = 80
+    rng = np.random.default_rng(11)
+    gate = rng.integers(0, 2, size=n)
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        cur = i % len(table)
+        ctrl = int(table[cur]) | int(gate[i])
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        ramwr.append(_ra(tick + 6, cursor_cell, cur))
+        ramwr.append(_ra(tick + 8, feeder_cell, ctrl))
+        recs.append(_ev(tick + 14, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1628))
+    trace = _build_trace(recs, ram_writes=ramwr, ram=ram)
+    res = classify_register(trace, 0xD404)
+    assert res["type"] == "FEEDER", res["type"]
+    assert res["cell"] == feeder_cell
+    assert res["sid"] == 0xD404
+    assert res["cell_frac"] == 1.0
+    assert round_trip(trace)[0xD404] == 1.0
+
+
+def test_classify_ctrl_table_walk_without_feeder_is_imperfect():
+    # Same waveform-plus-gate trace WITHOUT the captured cell still classifies as
+    # an imperfect TABLE_WALK -- proving the FEEDER upgrade above fires on the
+    # case-2 (table/composite replacement) branch, not the XSTATE relabel.
+    ram = np.zeros(65536, dtype=np.uint8)
+    base = 0x18AD
+    table = np.array([0x40, 0x10, 0x20, 0x80], dtype=np.uint8)
+    ram[base : base + len(table)] = table
+    cursor_cell = 0x177A
+    n = 80
+    rng = np.random.default_rng(11)
+    gate = rng.integers(0, 2, size=n)
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        cur = i % len(table)
+        ctrl = int(table[cur]) | int(gate[i])
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        ramwr.append(_ra(tick + 6, cursor_cell, cur))
+        recs.append(_ev(tick + 14, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1628))
+    trace = _build_trace(recs, ram_writes=ramwr, ram=ram)
+    res = classify_register(trace, 0xD404)
+    assert res["type"] == "TABLE_WALK", res["type"]
+    assert round_trip(trace)[0xD404] < 1.0
+
+
 def test_reconstruct_feeder_no_sampler_zeros():
     desc = {"type": "FEEDER", "cell": 0x40, "sid": 0xD416}
     recon = reconstruct_register(desc, _ticks(10))
