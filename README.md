@@ -215,6 +215,7 @@ for the full binary contract.
 | `patches/instrument.patch` | Hooks added to a pinned libsidplayfp: SID-register writes (PC-tagged), CIA/VIC interrupt-line assertions, CPU interrupt vectors, and play-window-scoped RAM access + PC coverage, all cycle-stamped via the event scheduler. |
 | `app/sidtrace.cpp` | CLI that plays a tune and writes the oracle + program-state artifacts (`.bin`, `.ramwr.bin`, `.cov.bin`, `.ram`, `.json`). |
 | `preframr_playroutine/` | numpy package: `trace` (load the artifacts) and `recover` (generator recovery). |
+| `preframr_playroutine/render.py` | Render a recovered tune to WAV: replays the IR-regenerated SID register stream through reSIDfp (pyresidfp) for ear-verification. |
 | `tests/straggler_report.py` | Diagnostic (not collected by pytest): renders every catalog fixture whole-song and prints a worst-first table of each tune's round-trip, `XSTATE` registers, and `unmodeled` blocking registers (addr/type/fidelity) — ranks exactly what blocks the xfail set. Run by hand in the Docker image with an HVSC mirror mounted. |
 | `docs/INSTRUMENTATION.md` | The authoritative binary/format contract between the tracer and the python tooling. |
 | `Dockerfile` | Multi-stage build: reSIDfp + instrumented libsidplayfp + `sidtrace`, then a python test image. |
@@ -243,6 +244,19 @@ docker run --rm -v /path/to/hvsc:/sids -v "$PWD/out:/out" \
 ```
 
 This writes `out/song.bin` and `out/song.json`.
+
+## Render a recovery to WAV
+
+Replay the register stream *regenerated from the recovered IR* (not the oracle)
+through reSIDfp to ear-verify a decompilation. Needs the optional `audio` extra:
+
+```sh
+pip install '.[audio]'
+python -m preframr_playroutine.render out/song out/song.wav --model 8580
+```
+
+Pass `--sid path.sid` to auto-detect the chip model from a `.sid` header. The
+CLI prints round-trip `overall` fidelity and register mismatches vs the oracle.
 
 ## Oracle format
 
