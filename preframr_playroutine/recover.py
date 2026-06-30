@@ -1186,6 +1186,7 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
     result = _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
     if reg_off == _CTRL:
         result = _maybe_xor_ctrl(sid_addr, series, ctx, result)
+        result = _maybe_and_ctrl(sid_addr, series, ctx, result)
     result = _maybe_feeder_upgrade(result, series, sid_addr, ctx)
     return result
 
@@ -1854,6 +1855,78 @@ def _maybe_xor_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
     return result
 
 
+def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
+    """Recover a CTRL register written as ``waveCell AND gateCell`` (or ``None``).
+
+    The GoatTracker2 idiom ``CTRL = chnwave AND chngate`` masks a waveform shadow
+    cell with a gate cell holding ``$FF`` (pass) or ``$FE`` (force gate-off). The
+    gate cell is near-binary while the waveform cell carries many distinct bytes,
+    so the search is asymmetric: each low-entropy gate-like cell (``<= 4`` values)
+    is AND-ed against every control-like candidate cell (``<= 32`` values),
+    sampled at the SID-write instant over a frame subsample, then the best pair
+    is verified on all frames. Returns an ``AND`` descriptor only when it
+    reproduces ``>= min_fid``.
+    """
+    ss = ctx.stateseq
+    if ss.grid.shape[1] == 0 or ctx.sampler is None:
+        return None
+    s = np.asarray(series, dtype=np.int64) & 0xFF
+    n = len(s)
+    grid = ss.grid
+    addrs = ss.addrs
+    uniq = [len(np.unique(grid[:, j])) for j in range(grid.shape[1])]
+    cols = [j for j in range(grid.shape[1]) if uniq[j] <= 32]
+    gates = [j for j in range(grid.shape[1]) if uniq[j] <= 4]
+    if not cols or not gates:
+        return None
+    full = {
+        j: ctx.sampler.at_write(int(addrs[j]), sid_addr).astype(np.int64) & 0xFF
+        for j in set(cols) | set(gates)
+    }
+    sample = np.unique(np.linspace(0, n - 1, min(n, 512)).astype(np.int64))
+    ss_s = s[sample]
+    cand = np.stack([full[j][sample] for j in cols], axis=1)
+    best = (-1.0, None, None)
+    for g in gates:
+        gv = full[g][sample]
+        f = ((gv[:, None] & cand) == ss_s[:, None]).mean(axis=0)
+        k = int(f.argmax())
+        if f[k] > best[0]:
+            best = (float(f[k]), g, cols[k])
+    _frac, gj, cj = best
+    if gj is None or gj == cj:
+        return None
+    recon = (full[gj] & full[cj]) & 0xFF
+    fid = float(np.mean(recon == s))
+    if fid < min_fid:
+        return None
+    return {
+        "type": "AND",
+        "cell_a": int(addrs[cj]),
+        "cell_b": int(addrs[gj]),
+        "sid": int(sid_addr),
+        "residual": fid,
+    }
+
+
+def _maybe_and_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
+    """Upgrade a CTRL register to the ``waveCell AND gateCell`` model when it wins.
+
+    Mirrors :func:`_maybe_xor_ctrl`: adopted only when the AND reproduces
+    ``>= min_fid`` AND strictly beats the current descriptor (so a CTRL that
+    already reconstructs perfectly -- including a freshly adopted XOR -- is never
+    displaced).
+    """
+    and_d = _and_pair(sid_addr, series, ctx, min_fid)
+    if and_d is None:
+        return result
+    if and_d["residual"] > _descriptor_fidelity(result, series, ctx):
+        keep = {k: result[k] for k in ("addr", "store_pcs", "n_writes") if k in result}
+        keep.update(and_d)
+        return keep
+    return result
+
+
 # -- event/state correlation ----------------------------------------------
 
 
@@ -2269,6 +2342,15 @@ def _recon_xor(desc, n, sampler) -> np.ndarray:
     return (a ^ b) & 0xFF
 
 
+def _recon_and(desc, n, sampler) -> np.ndarray:
+    """Regenerate a ``cellA AND cellB`` CTRL register from its two captured cells."""
+    if sampler is None:
+        return np.zeros(n, dtype=np.int64)
+    a = sampler.at_write(desc["cell_a"], desc["sid"]).astype(np.int64)
+    b = sampler.at_write(desc["cell_b"], desc["sid"]).astype(np.int64)
+    return (a & b) & 0xFF
+
+
 def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndarray:
     """Regenerate a register's per-frame output from its recovered descriptor.
 
@@ -2299,6 +2381,7 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
             "PITCHWALK": _recon_pitchwalk,
             "FEEDER": _recon_feeder,
             "XOR": _recon_xor,
+            "AND": _recon_and,
         }
         if kind in builders:
             recon = builders[kind](descriptor, n, smp)

@@ -1043,6 +1043,34 @@ def test_xor_ctrl_recovers_base_eor():
     assert rt[0xD404] == 1.0
 
 
+def test_and_ctrl_recovers_wave_gate():
+    # CTRL written as ``chnwave AND chngate`` (the GoatTracker2 idiom): a waveform
+    # shadow cell masked by a gate cell holding $FF (pass) or $FE (force gate
+    # off). Neither cell alone reproduces CTRL, but the exact AND of the pair
+    # does, sampled at the SID-write instant.
+    rng = np.random.default_rng(7)
+    n = 60
+    wave_cell, gate_cell = 0x30, 0x31
+    waveforms = [0x11, 0x21, 0x41, 0x81]  # waveform+gate-bit shadow values
+    recs = []
+    ramwr = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        wave = waveforms[i % len(waveforms)]
+        gate = 0xFF if rng.integers(0, 2) else 0xFE  # $FE forces gate (bit0) off
+        ctrl = wave & gate
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, wave_cell, wave))
+        ramwr.append(_ra(tick + 5, gate_cell, gate))
+        recs.append(_ev(tick + 10, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1500))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = analyze(trace)
+    assert res[0xD404]["type"] == "AND", res[0xD404]["type"]
+    assert {res[0xD404]["cell_a"], res[0xD404]["cell_b"]} == {wave_cell, gate_cell}
+    rt = round_trip(trace)
+    assert rt[0xD404] == 1.0
+
+
 def test_round_trip_reports_overall_and_unmodeled():
     trace = _trace_with_register([0x0F] * 30, sid_addr=0xD418)
     rt = round_trip(trace)
