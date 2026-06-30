@@ -30,9 +30,18 @@ def render(entry, work):
     sid = ensure_tune(entry)
     prefix = os.path.join(work, "a")
     subprocess.run(
-        [SIDTRACE, "--seconds", str(entry["seconds"]), "--song",
-         str(entry.get("subtune", 1)), "--out", prefix, sid],
-        check=True, capture_output=True,
+        [
+            SIDTRACE,
+            "--seconds",
+            str(entry["seconds"]),
+            "--song",
+            str(entry.get("subtune", 1)),
+            "--out",
+            prefix,
+            sid,
+        ],
+        check=True,
+        capture_output=True,
     )
     return Trace.load(prefix)
 
@@ -50,7 +59,8 @@ def main():
             trace = render(entry, work)
             result = analyze(trace)
             xstate = sorted(
-                a for a, d in result.items()
+                a
+                for a, d in result.items()
                 if isinstance(a, int) and d.get("type") == "XSTATE"
             )
             rt = round_trip(trace)
@@ -62,8 +72,10 @@ def main():
         xs = [hex(a) for a in xstate] if isinstance(xstate, list) else xstate
         print(f"{overall:.4f}  {fam}:{name}  XSTATE={xs}")
         for u in unmodeled:
-            print(f"        {hex(u['addr'])}  {u['type']:<11} "
-                  f"fid={u['fidelity']:.4f}  frames={u['example_frames']}")
+            print(
+                f"        {hex(u['addr'])}  {u['type']:<11} "
+                f"fid={u['fidelity']:.4f}  frames={u['example_frames']}"
+            )
         print()
 
 
