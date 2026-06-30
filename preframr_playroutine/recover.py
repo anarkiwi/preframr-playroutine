@@ -210,6 +210,35 @@ def _simulate_pingpong(lo, hi, clamp_lo, clamp_hi, up_step, down_step, start, di
     return out, flips
 
 
+def _simulate_tickreflect(lo, hi, rate, start, direction, n):
+    """Simulate a reflecting accumulator whose per-frame stride is tick-indexed.
+
+    Unlike :func:`_simulate_reflect` (a scalar step), the stride is read from the
+    ``rate`` vector at the per-segment tick (the frame offset since the note-on
+    that seeded the segment); past the end of ``rate`` the last entry is held.
+    This is the Future Composer PW sweep: ``step = rate_table[tick]`` with the
+    direction flipping (mirror reflect) at the recovered PW bounds.
+    """
+    out = np.empty(n, dtype=np.int64)
+    v = start
+    d = direction
+    m = len(rate)
+    for i in range(n):
+        out[i] = v
+        if m == 0:
+            continue
+        st = int(rate[i]) if i < m else int(rate[m - 1])
+        nv = v + d * st
+        if nv > hi:
+            d = -d
+            nv = hi - (nv - hi)
+        elif nv < lo:
+            d = -d
+            nv = lo + (lo - nv)
+        v = nv
+    return out
+
+
 def _dominant_signed_step(diffs: np.ndarray, positive: bool) -> int:
     """Most common positive (or |negative|) per-frame step."""
     arr = diffs[diffs > 0] if positive else -diffs[diffs < 0]
@@ -651,6 +680,87 @@ def segmented_pingpong(series, reset_frames, min_residual: float = 0.6, min_reve
     }
 
 
+def segmented_tickband(series, reset_frames, min_segments: int = 6):
+    """Recover a tick-banded reflecting sweep (Future Composer PW LO/HI).
+
+    The accumulator is reseeded at every note-on; within a note its per-frame
+    stride is a step-function of the per-voice tick (frames since that note-on) --
+    ``step = rate_table[tick]`` -- and the direction mirror-reflects at the
+    recovered PW bounds. The tick is synthesized directly from the note-on
+    ``reset_frames`` (a sawtooth reset at each note), so no RAM cursor cell is
+    needed. Each note segment yields its own tick-rate vector (the absolute
+    per-frame diffs) and start direction; the vectors are de-duplicated into a
+    small table set shared across notes -- a real player has only a handful of
+    rate programs, so a tick-banded sweep collapses to a few tables while noise
+    does not. Returns a ``tickband`` BACC descriptor or ``None``.
+
+    Guarded to never steal a constant-step fit: the stride must genuinely vary
+    with the tick on a majority of segments, and the shared table set must stay
+    small relative to the segment count (else the per-segment vectors are not a
+    reused program and the candidate is rejected).
+    """
+    series = np.asarray(series, dtype=np.int64).ravel()
+    n = len(series)
+    if n < 8:
+        return None
+    resets = sorted({int(x) for x in reset_frames if 0 < int(x) < n})
+    bounds = [0] + resets + [n]
+    n_seg = len(bounds) - 1
+    if n_seg < min_segments:
+        return None
+    lo16, hi16 = int(series.min()), int(series.max())
+    if hi16 <= lo16:
+        return None
+    seg_resets, seeds, dirs, rate_vecs = [], [], [], []
+    varying = 0
+    for k in range(n_seg):
+        a, b = bounds[k], bounds[k + 1]
+        seg = series[a:b]
+        d = np.diff(seg)
+        nz = d[d != 0]
+        rate = np.abs(d).astype(np.int64)
+        seg_resets.append(int(a))
+        seeds.append(int(seg[0]))
+        dirs.append(1 if (len(nz) == 0 or nz[0] > 0) else -1)
+        rate_vecs.append(rate)
+        if len(np.unique(rate[rate != 0])) > 1:
+            varying += 1
+    # A tick-banded stride genuinely varies within a note; a constant per-note
+    # stride is a plain saw/reflect (handled by the scalar modes). Require the
+    # within-note variation on a majority of segments so this never steals a
+    # clean constant-step fit.
+    if varying < max(3, 0.3 * n_seg):
+        return None
+    tables, index, seg_tables = [], {}, []
+    for rate in rate_vecs:
+        key = rate.tobytes()
+        if key not in index:
+            index[key] = len(tables)
+            tables.append(rate)
+        seg_tables.append(index[key])
+    # The rate vectors must be a reused program (few tables, many notes); noise
+    # gives a distinct vector per note and is rejected here.
+    if len(tables) > max(8, 0.5 * n_seg):
+        return None
+    desc = {
+        "type": "BACC",
+        "mode": "tickband",
+        "step": int(tables[0][0]) if len(tables[0]) else 0,
+        "lo": lo16,
+        "hi": hi16,
+        "segmented": True,
+        "resets": seg_resets,
+        "seeds": seeds,
+        "directions": dirs,
+        "rate_tables": tables,
+        "seg_tables": seg_tables,
+        "n_segments": int(n_seg),
+    }
+    recon = _recon_tickband(desc, n)
+    desc["residual"] = float(np.mean(recon == series))
+    return desc
+
+
 def _read_log_tables(trace, ram, max_span: int = 256, cap: int = 96) -> list:
     """Candidate static tables from the RAM read log: ``(base, top, valueset)``.
 
@@ -968,6 +1078,10 @@ def _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx):
         cands.append((fit_bacc(combined), combined, 16, role))
         cands.append((segmented_pingpong(combined, resets), combined, 16, role))
         cands.append((segmented_bacc(combined, resets), combined, 16, role))
+        # A tick-banded reflecting sweep (FC PW): per-frame stride = rate[tick].
+        # Appended after the scalar-step modes so it loses ties (never steals a
+        # clean constant-step fit) and only wins on strictly higher fidelity.
+        cands.append((segmented_tickband(combined, resets), combined, 16, role))
     cands.append((fit_bacc(series), series, 8, "full"))
     cands.append((segmented_bacc(series, resets), series, 8, "full"))
     best = None
@@ -1059,7 +1173,13 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
     if bacc is not None:
         result.update(bacc)
         cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
-        if cell is not None and frac >= 0.5:
+        # The feeder cell captures dwell/hold the bare recurrence can miss, so it
+        # is used at reconstruction when attached (:func:`_recon_bacc`). Attach it
+        # only when it strictly beats the recurrence's own fidelity, so a model
+        # that already regenerates the register (e.g. the tick-banded sweep) is
+        # never displaced by a lower-fidelity captured cell.
+        recurrence_fid = _candidate_fidelity(bacc, series, bacc.get("byte_role", "full"))
+        if cell is not None and frac >= 0.5 and frac > recurrence_fid:
             result["cell"] = cell
             result["sid"] = int(sid_addr)
             result["cell_frac"] = round(float(frac), 4)
@@ -1944,8 +2064,42 @@ def _run_recurrence(
     return lo + ((int(seed) - lo) + step * np.arange(length, dtype=np.int64)) % mod
 
 
+def _recon_tickband(desc, n) -> np.ndarray:
+    """Regenerate a tick-banded reflecting sweep from its per-segment rate tables.
+
+    Each note segment reseeds the accumulator and replays its shared tick-rate
+    table (``rate_tables[seg_tables[i]]``) via :func:`_simulate_tickreflect`,
+    mirror-reflecting at the recovered bounds.
+    """
+    resets = list(desc.get("resets", [0]))
+    seeds = list(desc.get("seeds", []))
+    dirs = list(desc.get("directions", []))
+    seg_tables = list(desc.get("seg_tables", []))
+    tables = desc.get("rate_tables", [])
+    lo, hi = desc["lo"], desc["hi"]
+    if not resets or resets[0] != 0:
+        resets = [0] + resets
+        seeds = [seeds[0] if seeds else lo] + seeds
+        dirs = [dirs[0] if dirs else 1] + dirs
+        seg_tables = [seg_tables[0] if seg_tables else 0] + seg_tables
+    bounds = resets + [n]
+    out = np.zeros(n, dtype=np.int64)
+    for i, start in enumerate(resets):
+        length = bounds[i + 1] - start
+        if length <= 0:
+            continue
+        seed = seeds[i] if i < len(seeds) else lo
+        d = dirs[i] if i < len(dirs) else 1
+        ti = seg_tables[i] if i < len(seg_tables) else 0
+        rate = tables[ti] if ti < len(tables) else np.zeros(0, dtype=np.int64)
+        out[start : start + length] = _simulate_tickreflect(lo, hi, rate, int(seed), int(d), length)
+    return out
+
+
 def _recon_bacc_full(desc, n) -> np.ndarray:
     """Regenerate the full (8- or 16-bit) accumulator series from its descriptor."""
+    if desc.get("mode") == "tickband":
+        return _recon_tickband(desc, n)
     resets = list(desc.get("resets", [0]))
     seeds = list(desc.get("seeds", [desc.get("phase", desc.get("lo", 0))]))
     if not resets or resets[0] != 0:

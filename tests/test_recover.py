@@ -1336,3 +1336,96 @@ def test_pingpong_does_not_steal_mirror_reflect():
     fit = fit_bacc(np.asarray(series))
     assert fit is not None
     assert fit["mode"] == "reflect"
+
+
+# -- tick-banded (table-indexed-stride) reflect BACC ----------------------
+
+from preframr_playroutine.recover import (  # noqa: E402
+    _recon_tickband,
+    _simulate_tickreflect,
+    segmented_tickband,
+)
+
+
+def _tickband_series(rate, lo, hi, seed, n_notes, note_len, direction=1):
+    """Concatenated tick-banded reflect notes: stride = rate[tick], reseed each note.
+
+    Each note reseeds to ``seed`` at tick 0 and steps by ``rate[tick]`` per frame
+    (Future Composer PW), mirror-reflecting at ``lo``/``hi``. Returns the 16-bit
+    series and the per-note reset frames.
+    """
+    rate = np.asarray(rate, dtype=np.int64)
+    series, resets = [], []
+    for _ in range(n_notes):
+        resets.append(len(series))
+        seg = _simulate_tickreflect(lo, hi, rate, seed, direction, note_len)
+        series.extend(int(x) for x in seg)
+    return np.array(series, dtype=np.int64), resets
+
+
+def test_segmented_tickband_recovers_rate_table():
+    # Stride varies with the tick (96,96,64,64,96,128...) and reflects at the PW
+    # bounds; the fitter recovers a single shared rate table and reconstructs the
+    # whole reseeded series exactly.
+    rate = [96, 96, 64, 64, 96, 128, 128, 128, 128, 128]
+    series, resets = _tickband_series(rate, 1536, 2592, 1536, 12, 14)
+    fit = segmented_tickband(series, resets)
+    assert fit is not None
+    assert fit["type"] == "BACC"
+    assert fit["mode"] == "tickband"
+    assert fit["segmented"] is True
+    assert len(fit["rate_tables"]) == 1  # one shared program across all notes
+    assert fit["lo"] == 1536 and fit["hi"] == 2592
+    assert fit["residual"] == 1.0
+    recon = _recon_tickband(fit, len(series))
+    assert np.array_equal(recon, series)
+    # The reflect was actually exercised (the long notes turn around at the top).
+    assert series.max() == 2592 and np.any(np.diff(series) < 0)
+
+
+def test_classify_tickband_pw_roundtrip():
+    # A full PW LO/HI register pair (D402/D403) driven by a tick-banded sweep
+    # classifies as a tickband BACC and round-trips exactly on both bytes.
+    rate = [96, 96, 64, 64, 96, 128, 128, 128, 128, 128]
+    note_len = 14
+    pw, resets = _tickband_series(rate, 1536, 2592, 1536, 12, note_len)
+    lo = pw & 0xFF
+    hi = (pw >> 8) & 0xFF
+    n = len(pw)
+    reset_set = set(resets)
+    recs = []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        is_last = (i + 1) in reset_set or i == n - 1
+        ctrl = 0x40 if is_last else 0x41  # gate off at note end -> note_on next frame
+        recs.append(_ev(tick + 8, SID_WRITE, reg=4, value=ctrl, addr=0xD404, aux=0x1500))
+        recs.append(_ev(tick + 12, SID_WRITE, reg=2, value=int(lo[i]), addr=0xD402, aux=0x1388))
+        recs.append(_ev(tick + 12, SID_WRITE, reg=3, value=int(hi[i]), addr=0xD403, aux=0x1390))
+    trace = _build_trace(recs)
+    res = classify_register(trace, 0xD402)
+    assert res["type"] == "BACC"
+    assert res["mode"] == "tickband"
+    rt = round_trip(trace)
+    assert rt[0xD402] == 1.0
+    assert rt[0xD403] == 1.0
+
+
+def test_tickband_does_not_steal_constant_step():
+    # A constant per-note stride is a plain reflect, NOT tick-banded: the new mode
+    # must reject it (no within-note stride variation) and leave it to the scalar
+    # reflect/saw modes.
+    series, resets = _tickband_series([6] * 14, 0, 240, 0, 12, 16)
+    assert segmented_tickband(series, resets) is None
+    plain, _ = _simulate_reflect(0, 240, 6, 0, 1, 400)
+    fit = fit_bacc(np.asarray(plain))
+    assert fit is not None and fit["mode"] == "reflect"
+
+
+def test_tickband_rejects_noise():
+    # Per-note unique diff vectors (noise) are not a reused program: rejected by
+    # the shared-table guard.
+    rng = np.random.default_rng(5)
+    series = rng.integers(0, 4096, size=600).astype(np.int64)
+    resets = list(range(0, 600, 6))
+    assert segmented_tickband(series, resets) is None
