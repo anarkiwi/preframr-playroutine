@@ -1767,3 +1767,181 @@ def test_or_modevol_cell_pair():
     assert {res[0xD418]["cell_a"], res[0xD418]["cell_b"]} == {mode_cell, vol_cell}
     rt = round_trip(trace)
     assert rt[0xD418] == 1.0
+
+
+def _cutoff_image(store_pc, scale_byte=0xEA, base=0x02, reg_byte=0x16):
+    """A 64K RAM image carrying the defMON cutoff micro-routine signature."""
+    img = np.zeros(0x10000, dtype=np.uint8)
+    p = store_pc
+    img[p], img[p + 1], img[p + 2] = 0x8D, reg_byte, 0xD4  # sta $d4xx
+    img[p - 32] = 0xA9  # lda #lo
+    img[p - 30] = 0x18  # clc
+    img[p - 29] = 0x69  # adc/sbc #steplo (op cell default)
+    img[p - 27] = 0x8D  # sta lo
+    img[p - 24] = 0xA9  # lda #hi
+    img[p - 22] = 0x69  # adc/sbc #stephi (op cell default)
+    img[p - 20] = 0x10  # bpl
+    img[p - 15] = 0x8D  # sta hi
+    img[p - 12] = 0x69  # adc #imm
+    img[p - 10] = 0x30  # bmi
+    img[p - 8] = 0xC9  # cmp #base
+    img[p - 7] = base  # bound-load / clamp base cell
+    img[p - 1] = scale_byte  # nop (x1) / asl (x2)
+    return img
+
+
+def _cutoff_sim(op, slo, shi, imm, seed_lo, seed_hi, base, scale):
+    """6502-accurate frame loop for the cutoff routine -> stored (lo, hi, d416).
+
+    ``op``/``slo``/``shi``/``imm`` are per-frame operand values. Returns the arrays
+    the player would store to the accumulator cells and the SID each frame.
+    """
+    lo, hi = seed_lo, seed_hi
+    los, his, outs = [], [], []
+    for i in range(len(op)):
+        ilo, ihi = lo, hi
+        if op[i] == 0x69:
+            s = ilo + slo[i]
+            carry_lo = 1 if s > 0xFF else 0
+            lo = s & 0xFF
+            s2 = ihi + shi[i] + carry_lo
+            carry_hi = 1 if s2 > 0xFF else 0
+            hi = s2 & 0xFF
+        else:
+            s = ilo - slo[i] - 1
+            carry_lo = 1 if s >= 0 else 0
+            lo = s & 0xFF
+            s2 = ihi - shi[i] - (1 - carry_lo)
+            carry_hi = 1 if s2 >= 0 else 0
+            hi = s2 & 0xFF
+        a = (hi + imm[i] + carry_hi) & 0xFF
+        emit = base if (a < base or a >= 0x80) else a
+        los.append(lo)
+        his.append(hi)
+        outs.append((emit * scale) & 0xFF)
+    return np.array(los), np.array(his), np.array(outs)
+
+
+def _cutoff_cells_for(store_pc):
+    return {
+        "lo": store_pc - 31,
+        "op_lo": store_pc - 29,
+        "slo": store_pc - 28,
+        "hi": store_pc - 23,
+        "op_hi": store_pc - 22,
+        "shi": store_pc - 21,
+        "imm": store_pc - 11,
+        "base": store_pc - 7,
+        "scale": store_pc - 1,
+    }
+
+
+def test_cutoff_opcode_directed_sweep():
+    # Opcode-directed 16-bit accumulator (ADC up / SBC down triangle) emitted as
+    # clamp(hi + imm + carry) with a per-instrument imm (SEQ filter base). A whole
+    # number of periods (with warm-up) makes the frame-0 predecessor consistent, so
+    # the recovered CUTOFF descriptor regenerates every frame.
+    store_pc = 0x1200
+    base, scale = 0x02, 1
+    period = 60  # 30 up + 30 down
+    warm, n = period, period * 3
+    total = warm + n
+    op = np.empty(total, dtype=np.int64)
+    slo = np.empty(total, dtype=np.int64)
+    shi = np.empty(total, dtype=np.int64)
+    imm = np.empty(total, dtype=np.int64)
+    for i in range(total):
+        ph = i % period
+        if ph < period // 2:  # ADC: hi += 1, lo stays 0
+            op[i], slo[i], shi[i] = 0x69, 0x00, 0x01
+        else:  # SBC: hi -= 1 (slo=0xFF keeps lo at 0), carry gives the +1 emit bias
+            op[i], slo[i], shi[i] = 0xE9, 0xFF, 0x00
+        imm[i] = 0 if (i // period) % 2 == 0 else 5  # SEQ base steps per "instrument"
+    los, his, outs = _cutoff_sim(op, slo, shi, imm, 0x00, 0x14, base, scale)
+    cells = _cutoff_cells_for(store_pc)
+    recs, ramwr = [], []
+    for j in range(n):
+        i = warm + j
+        tick = _frame_cycle(j)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, cells["lo"], int(los[i])))
+        ramwr.append(_ra(tick + 5, cells["hi"], int(his[i])))
+        ramwr.append(_ra(tick + 6, cells["op_lo"], int(op[i])))
+        ramwr.append(_ra(tick + 7, cells["op_hi"], int(op[i])))
+        ramwr.append(_ra(tick + 8, cells["slo"], int(slo[i])))
+        ramwr.append(_ra(tick + 9, cells["shi"], int(shi[i])))
+        ramwr.append(_ra(tick + 10, cells["imm"], int(imm[i])))
+        recs.append(
+            _ev(tick + 20, SID_WRITE, reg=0x16, value=int(outs[i]), addr=0xD416, aux=store_pc)
+        )
+    trace = _build_trace(recs, ram_writes=ramwr, ram=_cutoff_image(store_pc))
+    res = analyze(trace)
+    assert res[0xD416]["type"] == "CUTOFF", res[0xD416]["type"]
+    assert res[0xD416]["cells"]["hi"] == cells["hi"]
+    # both emit levels present (clamp not hit): the sweep really moved.
+    assert len(np.unique(outs[warm:])) > 3
+    rt = round_trip(trace)
+    assert rt[0xD416] == 1.0
+
+
+def test_cutoff_scale_x2_model():
+    # 6581 SID-model post-scale ($10d4 = asl) doubles the emitted cutoff.
+    store_pc = 0x1200
+    base, scale = 0x02, 2
+    warm, period, n = 40, 40, 80
+    total = warm + n
+    op = np.full(total, 0x69, dtype=np.int64)
+    slo = np.zeros(total, dtype=np.int64)
+    shi = np.where((np.arange(total) % period) < period // 2, 1, 0).astype(np.int64)
+    shi[(np.arange(total) % period) >= period // 2] = 0
+    # ramp up then hold: keep hi in a small band that x2 leaves < 0x80.
+    imm = np.zeros(total, dtype=np.int64)
+    los, his, outs = _cutoff_sim(op, slo, shi, imm, 0x00, 0x08, base, scale)
+    cells = _cutoff_cells_for(store_pc)
+    recs, ramwr = [], []
+    for j in range(n):
+        i = warm + j
+        tick = _frame_cycle(j)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        for off, arr in (
+            ("lo", los),
+            ("hi", his),
+            ("slo", slo),
+            ("shi", shi),
+            ("imm", imm),
+        ):
+            ramwr.append(_ra(tick + 4, cells[off], int(arr[i])))
+        ramwr.append(_ra(tick + 5, cells["op_lo"], int(op[i])))
+        ramwr.append(_ra(tick + 6, cells["op_hi"], int(op[i])))
+        recs.append(
+            _ev(tick + 20, SID_WRITE, reg=0x16, value=int(outs[i]), addr=0xD416, aux=store_pc)
+        )
+    trace = _build_trace(recs, ram_writes=ramwr, ram=_cutoff_image(store_pc, scale_byte=0x0A))
+    res = analyze(trace)
+    assert res[0xD416]["type"] == "CUTOFF"
+    assert res[0xD416]["scale"] == 2
+    assert round_trip(trace)[0xD416] == 1.0
+
+
+def test_cutoff_signature_gate_rejects_non_routine():
+    # A corrupted store-site opcode (no cutoff routine) must not classify as CUTOFF;
+    # the register falls through to the generic paths without error.
+    store_pc = 0x1200
+    img = _cutoff_image(store_pc)
+    img[store_pc - 10] = 0x00  # break the BMI-clamp signature byte
+    op = np.full(40, 0x69, dtype=np.int64)
+    slo = np.zeros(40, dtype=np.int64)
+    shi = np.ones(40, dtype=np.int64)
+    imm = np.zeros(40, dtype=np.int64)
+    los, his, outs = _cutoff_sim(op, slo, shi, imm, 0x00, 0x10, 0x02, 1)
+    cells = _cutoff_cells_for(store_pc)
+    recs, ramwr = [], []
+    for i in range(40):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, cells["hi"], int(his[i])))
+        recs.append(
+            _ev(tick + 20, SID_WRITE, reg=0x16, value=int(outs[i]), addr=0xD416, aux=store_pc)
+        )
+    trace = _build_trace(recs, ram_writes=ramwr, ram=img)
+    assert analyze(trace)[0xD416]["type"] != "CUTOFF"

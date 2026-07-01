@@ -1116,6 +1116,80 @@ def _bacc_finish(fit, src, width, role):
     return fit
 
 
+# defMON global-filter cutoff micro-routine. A self-modifying 16-bit accumulator
+# is stepped (ADC/SBC operand cells) and emitted as clamp(hi + imm + carry) * scale
+# to $D415-$D418. Operand cells sit at fixed offsets before the store PC; the store
+# and the surrounding opcodes form a signature specific enough that no other player
+# matches it, so recovery is gated on both the signature and reconstruction.
+_CUTOFF_OFFS = {
+    "lo": -31,
+    "op_lo": -29,
+    "slo": -28,
+    "hi": -23,
+    "op_hi": -22,
+    "shi": -21,
+    "imm": -11,
+    "base": -7,
+    "scale": -1,
+}
+# store-PC-relative byte -> allowed opcode bytes (routine signature).
+_CUTOFF_SIG = {
+    -32: (0xA9,),  # lda #lo
+    -30: (0x18,),  # clc
+    -29: (0x69, 0xE9),  # adc/sbc #steplo
+    -27: (0x8D,),  # sta lo
+    -24: (0xA9,),  # lda #hi
+    -22: (0x69, 0xE9),  # adc/sbc #stephi
+    -20: (0x10,),  # bpl (hi bound)
+    -15: (0x8D,),  # sta hi
+    -12: (0x69,),  # adc #imm
+    -10: (0x30,),  # bmi (clamp)
+    -8: (0xC9,),  # cmp #base
+    -1: (0xEA, 0x0A),  # nop / asl (SID-model scale)
+    0: (0x8D,),  # sta $d4xx
+}
+
+
+def _defmon_cutoff(trace, sid_addr, series, store_pcs, ctx, min_fid: float = 0.999):
+    """Recover the defMON filter-cutoff SMC micro-routine, or ``None``.
+
+    Verifies a store PC carries the routine's opcode signature (so it never fires
+    on another player), reads the operand-cell addresses from their fixed offsets,
+    and returns a ``CUTOFF`` descriptor only when it reconstructs ``>= min_fid`` --
+    a strict high-fidelity gate that keeps it from displacing a better fit.
+    """
+    del trace
+    if ctx.sampler is None or ctx.ram is None or not store_pcs:
+        return None
+    img = ctx.ram
+    reg_byte = int(sid_addr) & 0xFF
+    for pc in store_pcs:
+        p = int(pc)
+        if not all(0 <= p + off < len(img) for off in (-32, 2)):
+            continue
+        if img[p + 1] != reg_byte or img[p + 2] != 0xD4:
+            continue
+        if not all(img[p + off] in allowed for off, allowed in _CUTOFF_SIG.items()):
+            continue
+        cells = {name: p + off for name, off in _CUTOFF_OFFS.items()}
+        desc = {
+            "type": "CUTOFF",
+            "addr": int(sid_addr),
+            "sid": int(sid_addr),
+            "cells": cells,
+            "base": int(img[cells["base"]]),
+            "imm": int(img[cells["imm"]]),
+            "scale": 2 if img[cells["scale"]] == 0x0A else 1,
+        }
+        recon = _recon_cutoff(desc, ctx.n_frames, ctx.sampler)
+        recon = _default_until_first_write(recon, desc, ctx.sampler)
+        fid = float(np.mean(recon == np.asarray(series, dtype=np.int64)))
+        desc["residual"] = round(fid, 4)
+        if fid >= min_fid:
+            return desc
+    return None
+
+
 def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx=None) -> dict:
     """Classify the generator producing a SID register's per-frame value.
 
@@ -1137,12 +1211,20 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
     result = {"addr": int(sid_addr), "store_pcs": pcs, "n_writes": int(len(wr))}
     voice, reg_off = _voice_of(sid_addr)
 
-    if len(ticks) == 0 or len(wr) == 0:
-        result.update(type="CONST", value=None)
+    if len(ticks) == 0 or len(wr) == 0 or len(np.unique(wr["value"])) == 1:
+        empty = len(ticks) == 0 or len(wr) == 0
+        result.update(type="CONST", value=None if empty else int(wr["value"][0]))
         return result
-    if len(np.unique(wr["value"])) == 1:
-        result.update(type="CONST", value=int(wr["value"][0]))
-        return result
+
+    # defMON global-filter cutoff: a signed SMC accumulator emitted through a
+    # clamp -- neither a plain feeder cell nor a self-reseeding BACC. Recover it
+    # from the routine's operand cells (signature- and fidelity-gated) before the
+    # generic paths can over-fit it.
+    if 0xD415 <= int(sid_addr) <= 0xD418:
+        cutoff = _defmon_cutoff(trace, sid_addr, series, pcs, ctx)
+        if cutoff is not None:
+            result.update(cutoff)
+            return result
 
     feeder, ffrac = _best_feeder(series, ctx.stateseq)
     if feeder is not None and ffrac >= 0.5:
@@ -2612,6 +2694,51 @@ def _recon_feeder(desc, n, sampler) -> np.ndarray:
     return sampler.at_write(desc["cell"], desc["sid"]) & 0xFF
 
 
+def _recon_cutoff(desc, n, sampler) -> np.ndarray:
+    """Regenerate a defMON filter-cutoff register from its SMC micro-routine cells.
+
+    The player runs a 16-bit self-modifying accumulator (``lo``/``hi`` operand
+    cells stepped by ``slo``/``shi`` with the direction set by an ADC/SBC opcode
+    cell) then emits ``clamp(hi + imm + carry, base) * scale`` to the SID. The hi
+    store is observable (``hi`` sampled at the write instant), so only the carry
+    out of the hi add/sub -- which the trailing ``adc #imm`` folds in -- is
+    recomputed from the step cells. Clamp threshold and fill share the ``base``
+    cell (the ``cmp`` operand overlaps the bound-load byte); ``scale`` is the
+    SID-model post-shift (``asl`` x2 on 6581, ``nop`` x1 on 8580).
+    """
+    if sampler is None:
+        return np.zeros(n, dtype=np.int64)
+    c = desc["cells"]
+    sid = int(desc["sid"])
+
+    def s(addr):
+        return sampler.at_write(int(addr), sid).astype(np.int64) & 0xFF
+
+    hi, lo = s(c["hi"]), s(c["lo"])
+    slo, shi = s(c["slo"]), s(c["shi"])
+    op_lo, op_hi = s(c["op_lo"]), s(c["op_hi"])
+    imm = s(c["imm"])  # SMC'd per instrument (a signed cutoff offset)
+    ilo, ihi = np.roll(lo, 1), np.roll(hi, 1)
+    # Carry out of the hi add/sub -- folded into d416 by the trailing adc #imm.
+    # Recompute it from the step cells when the opcode cells are captured; where
+    # the SMC opcode sampled stale (frozen sweep / pre-first-write), fall back to
+    # the 16-bit accumulator direction (a decrease is a no-borrow subtract -> 1).
+    add_lo = op_lo == 0x69
+    carry_lo = np.where(add_lo, (ilo + slo) > 0xFF, (ilo - slo - 1) >= 0).astype(np.int64)
+    add_hi = op_hi == 0x69
+    hi_sum = np.where(add_hi, ihi + shi + carry_lo, ihi - shi - (1 - carry_lo))
+    carry_rec = np.where(add_hi, hi_sum > 0xFF, hi_sum >= 0).astype(np.int64)
+    accum = hi * 256 + lo
+    carry_dir = (accum < np.roll(accum, 1)).astype(np.int64)
+    valid = np.isin(op_lo, (0x69, 0xE9)) & np.isin(op_hi, (0x69, 0xE9))
+    carry_hi = np.where(valid, carry_rec, carry_dir)
+    base = int(desc["base"])
+    scale = int(desc.get("scale", 1))
+    a = (hi + imm + carry_hi) & 0xFF
+    emit = np.where((a < base) | (a >= 0x80), base, a)
+    return ((emit * scale) & 0xFF).astype(np.int64)
+
+
 def _recon_xor(desc, n, sampler) -> np.ndarray:
     """Regenerate a ``cellA XOR cellB`` CTRL register from its two captured cells."""
     if sampler is None:
@@ -2694,6 +2821,7 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
             "COMPOSITE": _recon_composite,
             "PITCHWALK": _recon_pitchwalk,
             "FEEDER": _recon_feeder,
+            "CUTOFF": _recon_cutoff,
             "XOR": _recon_xor,
             "AND": _recon_and,
             "OR": _recon_or,
