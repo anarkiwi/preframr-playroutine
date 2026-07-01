@@ -66,6 +66,9 @@ _PERFECT = {
     ("MusicAssembler", "Torpedo.sid"),
     ("MusicAssembler", "Pozitronic.sid"),
     ("defMON", "Wasps.sid"),
+    ("defMON", "Vacuole.sid"),
+    ("defMON", "Stargazer.sid"),
+    ("defMON", "Automatas.sid"),
 }
 
 # DMC / GoatTracker2 per-voice register strides: $D400 + 7*voice.
