@@ -35,7 +35,19 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   patched libsidplayfp: cycle-stamped SID writes (PC-tagged), CIA/VIC interrupts,
   CPU vectors, play-window-scoped RAM read/write logs, PC coverage, RAM image.
 - **Recovery primitives.** `CONST`, `SEQ`, `BACC`, `TABLE_WALK`, `COMPOSITE`,
-  `PITCHWALK`, `FEEDER` (any per-frame register recovered as an exact latched
+  `PITCHWALK`, `CUTOFF` (the defMON global filter cutoff `$D416` — a
+  self-modifying signed accumulator emitted through a clamp — regenerated from
+  observables: `d416 = clamp((hi + imm + carry_hi) & 0xFF, base) * scale`, where
+  `hi=$10be` is the accumulator's hi byte sampled at the write instant,
+  `imm=$10ca` is the per-frame SMC'd offset — the per-note SEQ base — `carry_hi`
+  is the carry out of the hi add/sub recomputed from the step/opcode operand
+  cells using **pre-store-operand** sampling (the operand the routine read, not a
+  roll of the post-store value — this makes the carry and the `A<base` clamp
+  exact across note reseeds), `base=$10ce` is the clamp threshold/fill, and
+  `scale=$10d4` is the SID-model post-shift (`asl` ×2 on 6581, `nop` ×1 on 8580);
+  signature- and fidelity-gated (≥0.999) and routed only for `$D415`–`$D418`, so
+  it never over-fits another player — recovers defMON _Vacuole_, _Stargazer_,
+  _Automatas_ byte-exact), `FEEDER` (any per-frame register recovered as an exact latched
   copy of a captured RAM feeder cell — voice CTRL waveform/gate shadows and the
   global RES/FILT immediate, not just the filter sweep `$D415`–`$D418`:
   relabels an XSTATE-with-exact-cell, and replaces an imperfect
@@ -48,7 +60,10 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   sibling of `XOR`), `OR` (a register recovered as `cellA | cellB` or
   `cell | const` — the `mode | volume` MODE/VOL `$D418` idiom where a filter-mode
   nibble is OR-folded onto the master volume; sibling of `XOR`/`AND`, recovers
-  JCH _Dreams_ and lifts Stargazer/Automatas `$D418`), the **AND-pair
+  JCH _Dreams_ and lifts Stargazer/Automatas `$D418`; its leading-latch prelude
+  boundary uses each cell's first *live* write-instant frame (`first_live_frame`),
+  not merely its first-written frame, so a cell that first appears later in its
+  own pre-latch run reconstructs byte-exact through the note reseeds), the **AND-pair
   value-forcing overrides** for CTRL (a value-membership predicate that forces
   the recovered byte to the captured onset/hard-restart value — e.g. `$08`/`$81`
   — on the frames a DMC player patches it, so the wave×gate base round-trips
@@ -102,11 +117,15 @@ Built and merged (PRs #2/#7/#8/#9/#10/#11/#12/#13/#15/#16/#18):
   identical (frozen-reference parity test), keeping CI time bounded as fixtures
   grow.
 
-**Round-trip landscape** (whole-song): 17 perfect (Doctagop, In_My_Head, Only_3,
-Denarius, Tom_Tom, 24th_Amaranth, Dreams, Hawkeye, Wasps, the five GoatTracker2
-tunes Grid_Runner, Day_6_in_Kleve_Hades, Raindrops, Tunnelbound,
-Cauldron_II_Remix, plus the three MusicAssembler tunes Let_It_Bee, Torpedo,
-Pozitronic). The three newly perfect tunes:
+**Round-trip landscape** (whole-song): 20 perfect (Doctagop, In_My_Head, Only_3,
+Denarius, Tom_Tom, 24th_Amaranth, Dreams, Hawkeye, Wasps, Vacuole, Stargazer,
+Automatas, the five GoatTracker2 tunes Grid_Runner, Day_6_in_Kleve_Hades,
+Raindrops, Tunnelbound, Cauldron_II_Remix, plus the three MusicAssembler tunes
+Let_It_Bee, Torpedo, Pozitronic). The three newest perfect tunes —
+**Vacuole**, **Stargazer**, **Automatas** (all defMON) — are recovered by the
+`CUTOFF` primitive: their global filter cutoff `$D416`, previously written off as
+an instrumentation gap, is regenerated exactly from observables (see below).
+Earlier newly-perfect milestones:
 - **Wasps** (defMON) — the **one-call-latency feeder**: an output-then-compute
   player whose feeder cell leads its SID register by one call, recovered by the
   one-call-shifted exact-copy match plus a prelude boundary extended to the
@@ -115,8 +134,9 @@ Pozitronic). The three newly perfect tunes:
   `$08`/`$81` onset/hard-restart **value-forcing overrides** (the AND-pair plus a
   value-membership override predicate), and the FREQ hard-restart composites
   recovered exactly. The sibling DMC tune **Guns_n_Ghosts** gets the same CTRL
-  recovery but is held off perfect (0.99999) by its `$D416` filter cutoff — the
-  documented instrumentation gap below.
+  recovery but is held off perfect (0.99999) by its `$D416` filter cutoff — a
+  near-exact `FEEDER`, a genuinely-imperfect register (not the defMON SMC routine
+  the `CUTOFF` primitive recovers).
 - **Dreams** (JCH_NewPlayer) — MODE/VOL `$D418` recovered via the new `OR`
   primitive (`mode | volume`).
 
@@ -126,10 +146,11 @@ player) and the FutureComposer FREQ / PITCHWALK cases. The defMON tunes rose to
 sequencer (`$D404`/`$D40B`/`$D412`) and the `COMPOSITE` mod-guard stopped a
 phase-residual cell from polluting the FREQ operands; the defMON PW **ping-pong**
 sweep (Vacuole 0.94→0.98) and the FutureComposer **tick-banded** PW sweep
-(Hawkeye → perfect) are recovered `BACC` modes. The remaining gaps are the
-bespoke players, the FutureComposer / defMON FREQ slide (vibrato/portamento) and
-the global `$D416` filter-cutoff (see Next steps — an instrumentation gap, not a
-missing primitive).
+(Hawkeye → perfect) are recovered `BACC` modes, and the defMON global `$D416`
+filter cutoff is now recovered exactly by the `CUTOFF` primitive (Vacuole,
+Stargazer, Automatas → perfect). The remaining gaps are the bespoke players, the
+FutureComposer FREQ slide (vibrato/portamento) and the FC `$D416` reflect idiom
+(see Next steps).
 
 ## Next steps
 
@@ -143,7 +164,8 @@ missing primitive).
      `pingpong` mode (saturate to a fixed boundary clamp + reverse, independent
      up/down steps) recovers the defMON PW sweep, per-note-segmented
      (`segmented_pingpong`); Vacuole 0.94→0.98, no regression on the 5 perfect
-     tunes. The other defMON FREQ-slide / filter-cutoff gaps below still apply.
+     tunes. (Its `$D416` filter cutoff is now recovered by `CUTOFF` below; the
+     defMON FREQ-slide gap still applies.)
    - **FutureComposer PW → BACC with table-indexed stride** — ✅ **done** (#24):
      `segmented_tickband` generalizes the stride to `step = rate_table[tick]`,
      the tick synthesized from note-on resets (the FC pinning invariant), the
@@ -152,18 +174,18 @@ missing primitive).
      0.96→0.997; no regression. The same tick foundation still needs extending to
      the FC **FREQ slide** (vibrato/portamento) and the CTRL-wave / filter-segment
      lanes (`step = table[tick]` paced by `$1942`), the dominant remaining FC gaps.
-   - **defMON + FC `$D416` filter-cutoff → currently unrecoverable from the
-     trace (instrumentation gap, not a missing primitive).** Its opcode-directed
-     16-bit reflecting accumulator lives in the CPU **A-register**: the
-     `ASL`/`STA` cutoff flows through registers and is stored straight to `$D416`,
-     never landing in RAM. The documented accumulator cells `$10b6/$10be` do
-     **not** track `$D416` (best match across all 110 logged RAM cells <0.3), and
-     while the sign/step bytes are observable in the SMC-immediate log the reflect
-     **phase** is not. Closing it needs `sidtrace` to capture the A-register /
-     pre-`ASL` cutoff value at the store site — until then this blocks **Vacuole,
-     Stargazer, Automatas, Manchester, Tune_06** and holds DMC **Guns_n_Ghosts**
-     just off perfect (0.99999, sole residual register) despite its CTRL/FREQ
-     recovering exactly.
+   - **defMON `$D416` filter-cutoff → `CUTOFF` primitive** — ✅ **done**: the
+     signed self-modifying accumulator emitted through a clamp is regenerated
+     from observables — `d416 = clamp((hi + imm + carry_hi) & 0xFF, base) *
+     scale` — with the hi byte and per-frame `imm` sampled at the write instant,
+     the hi add/sub **carry recomputed from the pre-store operand + step/opcode
+     cells** (exact across note reseeds), and `base`/`scale` from the routine's
+     cmp/shift operand cells. Signature- and fidelity-gated and routed only for
+     `$D415`–`$D418`. Recovers **Vacuole, Stargazer, Automatas** byte-exact (all
+     → **new perfect tunes**). The FC `$D416` cutoff (Manchester, Tune_06) uses a
+     different reflect idiom and is not covered by this signature, and DMC
+     **Guns_n_Ghosts** stays just off perfect (0.99999) — its `$D416` is a
+     near-exact `FEEDER`, a genuinely-imperfect register, not this SMC routine.
 
    Each RAM-resident gap names the exact accumulator/table/opcode cell, so a new
    primitive is **unit-testable against ground truth**, not just
@@ -171,9 +193,10 @@ missing primitive).
    primitive + exact-cell `FEEDER`), the DMC CTRL onset/hard-restart bytes
    (recovered by the **AND-pair value-forcing overrides**), the JCH MODE/VOL
    `$D418` (recovered by the `OR` primitive), the MusicAssembler cell-fed PW
-   (held-seed prelude) and the defMON output-then-compute feeder (one-call-latency
-   feeder) are now done. The residual gaps are the `$D416` instrumentation gap
-   above plus the bespoke cases, which share no machinery: the FutureComposer
+   (held-seed prelude), the defMON output-then-compute feeder (one-call-latency
+   feeder) and the defMON `$D416` filter cutoff (the `CUTOFF` primitive) are now
+   done. The residual gaps are the FC `$D416` reflect idiom plus the bespoke
+   cases, which share no machinery: the FutureComposer
    vibrato/portamento FREQ slide (recover depth/rate from the already-logged SMC
    immediate writes — `$12F7`), **A_Mind_Is_Born** (generative modulation we do
    not model, 0.991), **Blackout**, and **Commando** ~0.78 (Hubbard's reflected
