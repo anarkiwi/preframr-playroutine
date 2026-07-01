@@ -2145,7 +2145,10 @@ def _attach_or_prelude(desc, series, ctx, cells, max_latches: int = 6):
     sampler = ctx.sampler
     if sampler is None:
         return
-    ends = [sampler.cell_first_frame(int(c)) for c in cells]
+    # first_live_frame, not cell_first_frame: a cell first written later in its
+    # first frame than the register's store still reads its power-on default at the
+    # write instant, so the seed drives that frame too (the gate-off boundary).
+    ends = [sampler.first_live_frame(int(c), desc["sid"]) for c in cells]
     end = max(ends) if ends else 0
     n = len(series)
     if not 0 < end < n:
@@ -2331,8 +2334,12 @@ def voice_events(trace, kind="auto") -> dict:
 # -- per-frame cell sampling (for reconstruction) -------------------------
 
 
-def _carry_at(cycles, values, sample_cycles) -> np.ndarray:
-    """Value of a cell (last write strictly before each sample cycle)."""
+def _carry_at(cycles, values, sample_cycles, back: int = 1) -> np.ndarray:
+    """Value of a cell ``back`` writes before each sample cycle (1 = the last).
+
+    ``back=2`` returns the write immediately preceding the last one at/before the
+    sample -- the pre-update operand a read-modify-write store leaves behind.
+    """
     out = np.zeros(len(sample_cycles), dtype=np.int64)
     if len(cycles) == 0:
         return out
@@ -2340,8 +2347,8 @@ def _carry_at(cycles, values, sample_cycles) -> np.ndarray:
     wc = cycles[order]
     wv = values[order].astype(np.int64)
     pos = np.searchsorted(wc, sample_cycles, side="right")
-    taken = pos > 0
-    idx = np.clip(pos - 1, 0, len(wv) - 1)
+    taken = pos >= back
+    idx = np.clip(pos - back, 0, len(wv) - 1)
     out[taken] = wv[idx][taken]
     return out
 
@@ -2363,6 +2370,7 @@ class _CellSampler:
         self._eof: dict = {}
         self._writecyc: dict = {}
         self._atwrite: dict = {}
+        self._operand: dict = {}
         self._written: dict = {}
 
     def _cell_writes(self, addr):
@@ -2401,6 +2409,22 @@ class _CellSampler:
             cyc, val = self._cell_writes(int(cell_addr))
             self._atwrite[key] = _carry_at(cyc, val, sample)
         return self._atwrite[key]
+
+    def operand(self, cell_addr, sid_addr) -> np.ndarray:
+        """Value of ``cell_addr`` one write before ``sid_addr``'s write instant.
+
+        A read-modify-write player reads an operand, updates it, then stores it
+        back before the SID write, so :meth:`at_write` captures the post-update
+        value; the pre-update operand it read is the write immediately preceding
+        that store. A note reseed writes the cell earlier in the frame, so this is
+        the correct input for the routine's recurrence (``roll(at_write)`` is not).
+        """
+        key = (int(cell_addr), int(sid_addr))
+        if key not in self._operand:
+            sample = self.write_cycles(sid_addr) + np.uint64(2)
+            cyc, val = self._cell_writes(int(cell_addr))
+            self._operand[key] = _carry_at(cyc, val, sample, back=2)
+        return self._operand[key]
 
     def cell_first_frame(self, cell_addr) -> int:
         """Frame index of a RAM cell's first write (``0`` if never written)."""
@@ -2714,22 +2738,26 @@ def _recon_cutoff(desc, n, sampler) -> np.ndarray:
     def s(addr):
         return sampler.at_write(int(addr), sid).astype(np.int64) & 0xFF
 
-    hi, lo = s(c["hi"]), s(c["lo"])
+    def pre(addr):
+        return sampler.operand(int(addr), sid).astype(np.int64) & 0xFF
+
+    hi, lo = s(c["hi"]), s(c["lo"])  # post-store accumulator (what adc #imm emits)
     slo, shi = s(c["slo"]), s(c["shi"])
     op_lo, op_hi = s(c["op_lo"]), s(c["op_hi"])
     imm = s(c["imm"])  # SMC'd per instrument (a signed cutoff offset)
-    ilo, ihi = np.roll(lo, 1), np.roll(hi, 1)
+    ihi, ilo = pre(c["hi"]), pre(c["lo"])  # operand the routine read (pre-store)
     # Carry out of the hi add/sub -- folded into d416 by the trailing adc #imm.
-    # Recompute it from the step cells when the opcode cells are captured; where
-    # the SMC opcode sampled stale (frozen sweep / pre-first-write), fall back to
-    # the 16-bit accumulator direction (a decrease is a no-borrow subtract -> 1).
+    # Recompute it from the read operand and step cells when the opcode cells are
+    # captured; where the SMC opcode sampled stale (frozen sweep / pre-first-write),
+    # fall back to the 16-bit accumulator direction (a decrease is a no-borrow
+    # subtract -> 1). Using the pre-store operand (not roll of the post-store value)
+    # makes the carry -- and the A<base clamp -- exact across note reseeds.
     add_lo = op_lo == 0x69
     carry_lo = np.where(add_lo, (ilo + slo) > 0xFF, (ilo - slo - 1) >= 0).astype(np.int64)
     add_hi = op_hi == 0x69
     hi_sum = np.where(add_hi, ihi + shi + carry_lo, ihi - shi - (1 - carry_lo))
     carry_rec = np.where(add_hi, hi_sum > 0xFF, hi_sum >= 0).astype(np.int64)
-    accum = hi * 256 + lo
-    carry_dir = (accum < np.roll(accum, 1)).astype(np.int64)
+    carry_dir = ((hi * 256 + lo) < (ihi * 256 + ilo)).astype(np.int64)
     valid = np.isin(op_lo, (0x69, 0xE9)) & np.isin(op_hi, (0x69, 0xE9))
     carry_hi = np.where(valid, carry_rec, carry_dir)
     base = int(desc["base"])

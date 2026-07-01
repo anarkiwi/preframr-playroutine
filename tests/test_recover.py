@@ -1945,3 +1945,24 @@ def test_cutoff_signature_gate_rejects_non_routine():
         )
     trace = _build_trace(recs, ram_writes=ramwr, ram=img)
     assert analyze(trace)[0xD416]["type"] != "CUTOFF"
+
+
+def test_sampler_operand_pre_store():
+    # operand() returns the cell write immediately before the register's store
+    # instant (the pre-update value the routine read), while at_write() returns the
+    # post-update store -- the distinction that makes the cutoff carry exact across
+    # a note reseed (which writes the accumulator cell earlier in the frame).
+    from preframr_playroutine.recover import _CellSampler
+
+    cell, sid = 0x40, 0xD416
+    recs, ramwr = [], []
+    for i in range(5):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, cell, 10 + i))  # reseed / carried operand
+        ramwr.append(_ra(tick + 8, cell, 100 + i))  # routine store (post-update)
+        recs.append(_ev(tick + 20, SID_WRITE, reg=0x16, value=0, addr=sid, aux=0x1200))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    samp = _CellSampler(trace, trace.tick_cycles("auto"))
+    assert list(samp.at_write(cell, sid)) == [100, 101, 102, 103, 104]
+    assert list(samp.operand(cell, sid)) == [10, 11, 12, 13, 14]
