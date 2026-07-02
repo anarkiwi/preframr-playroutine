@@ -1230,7 +1230,7 @@ def test_find_override_value_membership():
     ctx = _ctx_with_cells({0x30: wave})
     terms = _find_override(forced, ctx)
     assert terms is not None
-    assert any(t[1] == "in" and set(t[2]) == set(member) for t in terms), terms
+    assert any(t["kind"] == "in" and set(t["values"]) == set(member) for t in terms), terms
     out = np.zeros(n, dtype=np.int64)
     ov = {"predicate": terms, "force": 0x99}
     applied = _apply_overrides(out, [ov], ctx.sampler)

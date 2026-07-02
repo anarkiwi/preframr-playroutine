@@ -34,6 +34,7 @@ from collections import namedtuple
 
 import numpy as np
 
+from . import ir
 from .trace import WIN_IRQ, WIN_NMI
 
 # Per-voice CTRL (gate) register addresses.
@@ -1555,8 +1556,9 @@ def _find_override(forced, ctx, max_terms: int = 3):
     ``cell in {v0,..}`` (recovered set of <= ``max_set`` distinct cell values, e.g.
     the per-voice waveform shadow whose value selects the instruments that
     hard-restart) captures a force gated by a handful of states no single
-    equality/bit can express. Returns ``[(cell, mask, value) | (cell, "in",
-    (v0,..)), ...]`` or ``None``.
+    equality/bit can express. Returns a list of typed predicate dicts
+    (``{"kind":"eq"|"bit"|"in", ...}``) or ``None``; :func:`ir._apply_overrides`
+    still accepts the legacy tuple forms too.
     """
     if int(forced.sum()) == 0:
         return None
@@ -1570,17 +1572,29 @@ def _find_override(forced, ctx, max_terms: int = 3):
         fc = col[forced]
         uniq = np.unique(fc)
         if len(uniq) == 1:
-            cands.append((col == int(uniq[0]), (int(addrs[j]), 0xFF, int(uniq[0]))))
+            cands.append(
+                (col == int(uniq[0]), {"kind": "eq", "cell": int(addrs[j]), "value": int(uniq[0])})
+            )
         elif 2 <= len(uniq) <= max_set and len(uniq) < len(np.unique(col)):
             # A force gated by the cell holding one of a few states (recall 1.0 by
             # construction); the greedy precision/strict-improvement gating below
             # rejects it unless it genuinely tightens the selection.
-            cands.append((np.isin(col, uniq), (int(addrs[j]), "in", tuple(int(x) for x in uniq))))
+            cands.append(
+                (
+                    np.isin(col, uniq),
+                    {"kind": "in", "cell": int(addrs[j]), "values": tuple(int(x) for x in uniq)},
+                )
+            )
         for b in range(8):
             bit = (fc >> b) & 1
             if bit.min() == bit.max():
                 val = int(bit[0]) << b
-                cands.append(((col & (1 << b)) == val, (int(addrs[j]), 1 << b, val)))
+                cands.append(
+                    (
+                        (col & (1 << b)) == val,
+                        {"kind": "bit", "cell": int(addrs[j]), "mask": 1 << b, "value": val},
+                    )
+                )
     sel = np.ones(len(forced), dtype=bool)
     terms = []
     precision = n_forced / max(1, int(sel.sum()))
@@ -2645,22 +2659,12 @@ def _recon_table(desc, n, sampler) -> np.ndarray:
 
 
 def _apply_overrides(out, overrides, sampler) -> np.ndarray:
-    """Force values where each override's cell-predicate conjunction holds."""
-    if not overrides or sampler is None:
-        return out
-    n = len(out)
-    for ov in overrides:
-        sel = np.ones(n, dtype=bool)
-        for cell, cmask, cval in ov.get("predicate", []):
-            col = sampler.eof(cell)
-            # ``cmask == "in"`` marks a value-membership term (cval is the value
-            # tuple); an integer ``cmask`` is the historical bit/equality test.
-            if cmask == "in":
-                sel &= np.isin(col, np.asarray(cval, dtype=col.dtype))
-            else:
-                sel &= (col & cmask) == cval
-        out = np.where(sel, int(ov["force"]), out)
-    return out
+    """Force values where each override's cell-predicate conjunction holds.
+
+    Delegates to the single implementation in :mod:`preframr_playroutine.ir`,
+    which accepts both legacy predicate tuples and the typed-dict form.
+    """
+    return ir._apply_overrides(out, overrides, sampler)  # pylint: disable=protected-access
 
 
 def _comp_part(part, n, sampler) -> np.ndarray:
@@ -2834,35 +2838,8 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
     from ``trace`` (or a shared ``sampler``); ``XSTATE`` has no single-generator
     model yet and returns ``None``.
     """
-    n = len(ticks)
-    kind = descriptor.get("type")
     smp = _sampler_for(ticks, trace, sampler)
-    if kind == "CONST":
-        value = descriptor.get("value")
-        recon = np.full(n, 0 if value is None else int(value), dtype=np.int64)
-    elif kind == "SEQ":
-        recon = _recon_seq(descriptor, n)
-    else:
-        builders = {
-            "BACC": _recon_bacc,
-            "TABLE_WALK": _recon_table,
-            "COMPOSITE": _recon_composite,
-            "PITCHWALK": _recon_pitchwalk,
-            "FEEDER": _recon_feeder,
-            "CUTOFF": _recon_cutoff,
-            "XOR": _recon_xor,
-            "AND": _recon_and,
-            "OR": _recon_or,
-        }
-        if kind in builders:
-            recon = builders[kind](descriptor, n, smp)
-        # XSTATE: not yet modelled -- best effort is the closest observable feeder
-        # cell sampled at the write instant (or nothing if none was recorded).
-        elif kind == "XSTATE" and smp is not None and descriptor.get("cell") is not None:
-            recon = smp.at_write(descriptor["cell"], descriptor["sid"]) & 0xFF
-        else:
-            return None  # no model yet for this descriptor
-    return _default_until_first_write(recon, descriptor, smp)
+    return ir.evaluate(ir.to_ir(descriptor), len(ticks), smp)
 
 
 def _default_until_first_write(recon, descriptor, sampler):

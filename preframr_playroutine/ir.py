@@ -25,7 +25,9 @@ Node schemas (plain dicts; numpy arrays allowed as values)::
 
 import numpy as np
 
-from . import recover
+# NOTE: the low-level recurrence kernels and ``combine_lohi`` live in
+# ``recover`` and are imported lazily inside the functions that use them --
+# ``recover`` imports this module, so a module-level import would be circular.
 
 # -- bounded-accumulator recurrence (ported from recover._recon_bacc_full) ----
 
@@ -44,6 +46,8 @@ def _run_recurrence(
     direction=None,
 ) -> np.ndarray:
     """Regenerate one bounded-accumulator segment from a seed."""
+    from . import recover  # pylint: disable=import-outside-toplevel,cyclic-import
+
     if length <= 0:
         return np.empty(0, dtype=np.int64)
     if mode == "pingpong" and hi > lo:
@@ -69,6 +73,8 @@ def _run_recurrence(
 
 def _recon_tickband(desc, n) -> np.ndarray:
     """Regenerate a tick-banded reflecting sweep from its per-segment rate tables."""
+    from . import recover  # pylint: disable=import-outside-toplevel,cyclic-import
+
     resets = list(desc.get("resets", [0]))
     seeds = list(desc.get("seeds", []))
     dirs = list(desc.get("directions", []))
@@ -267,6 +273,8 @@ def _ev_cell(node, n, sampler):
 
 
 def _ev_lohi(node, n, sampler):
+    from . import recover  # pylint: disable=import-outside-toplevel,cyclic-import
+
     return recover.combine_lohi(evaluate(node["lo"], n, sampler), evaluate(node["hi"], n, sampler))
 
 
@@ -421,9 +429,12 @@ def _cutoff_ir(d):
 
 
 def _table_walk_ir(d):
-    if d.get("cursor_addr") is None:
+    if d.get("cursor") is not None:  # a literal cursor series (test fixtures)
+        idx = {"op": "literal", "data": d["cursor"]}
+    elif d.get("cursor_addr") is not None:
+        idx = {"op": "cell", "addr": d["cursor_addr"], "sample": "eof", "sid": d.get("addr")}
+    else:
         return _post({"op": "const", "value": 0}, d)
-    idx = {"op": "cell", "addr": d["cursor_addr"], "sample": "eof", "sid": d.get("addr")}
     t = {
         "op": "table",
         "data": d["table"],
