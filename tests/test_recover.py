@@ -214,6 +214,65 @@ def test_state_sequence_explicit_addrs():
     assert ss.grid[2, 0] == 42
 
 
+# -- state_sequence group-by optimization parity --------------------------
+
+from preframr_playroutine.recover import (  # noqa: E402
+    _carry_series,
+    _changing_cells,
+    _window_kind,
+)
+
+
+def _ref_state_sequence_grid(trace, kind, addrs):
+    """Frozen pre-optimization per-address boolean scan of recover.state_sequence."""
+    ticks = trace.tick_cycles(kind).astype(np.uint64)
+    wr = trace.ram_writes(_window_kind(kind))
+    if addrs is None:
+        addrs = _changing_cells(wr)
+    else:
+        addrs = np.array(sorted({int(a) for a in addrs}), dtype=np.uint16)
+    grid = np.zeros((len(ticks), len(addrs)), dtype=np.uint8)
+    if len(ticks) and len(addrs) and len(wr):
+        for j, a in enumerate(addrs):
+            sel = wr[wr["addr"] == a]
+            if len(sel):
+                grid[:, j] = _carry_series(sel["cycle"], sel["value"], ticks).astype(np.uint8)
+    return addrs, grid
+
+
+def _make_state_seq_trace(rng):
+    """Random IRQ ticks plus RAM writes across many cells (some constant)."""
+    n_frames = int(rng.integers(20, 120))
+    recs = [_ev(_frame_cycle(i) + 2, CPU_VECTOR, value=VEC_IRQ) for i in range(n_frames)]
+    n_cells = int(rng.integers(1, 12))
+    cells = rng.choice(np.arange(0x0002, 0x0400), size=n_cells, replace=False)
+    ramwr = []
+    for a in cells:
+        n_wr = int(rng.integers(0, 6))
+        const = rng.integers(0, 2) == 0  # a cell that never changes -> excluded
+        val0 = int(rng.integers(0, 256))
+        for _ in range(n_wr):
+            f = int(rng.integers(0, n_frames))
+            off = int(rng.integers(3, 40))
+            v = val0 if const else int(rng.integers(0, 256))
+            ramwr.append(_ra(_frame_cycle(f) + off, int(a), v))
+    if not ramwr:
+        ramwr.append(_ra(_frame_cycle(0) + 5, int(cells[0]), 7))
+    return _build_trace(recs, ram_writes=ramwr), [int(a) for a in cells]
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_state_sequence_groupby_parity(seed):
+    rng = np.random.default_rng(2000 + seed)
+    for _ in range(6):
+        trace, cells = _make_state_seq_trace(rng)
+        for addrs in (None, cells, cells[:1], [int(cells[0]), 0xFFFF]):
+            ref_addrs, ref_grid = _ref_state_sequence_grid(trace, "auto", addrs)
+            ss = state_sequence(trace, addrs=addrs)
+            assert np.array_equal(np.asarray(ss.addrs), np.asarray(ref_addrs)), (seed, addrs)
+            assert np.array_equal(ss.grid, ref_grid), (seed, addrs)
+
+
 # -- segmented BACC / feeder cells / read-log table walk ------------------
 
 
