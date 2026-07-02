@@ -689,16 +689,20 @@ def _witness_cols(node, n, sampler):
 
 
 def _pack_rows(cols) -> np.ndarray:
-    """Pack byte columns into one structured (void) key per frame.
+    """Pack byte columns into one key per frame for ``np.unique`` / ``searchsorted``.
 
-    Unlike a base-256 int64 (capped at 7 columns) a structured view packs an
-    arbitrary number of byte columns into a per-frame key that ``np.unique`` /
-    ``np.searchsorted`` order lexicographically -- so a wide dataflow cone (a 16-bit
-    SMC accumulator, an unrolled multi-site writer) is memoised without a column
-    cap.
+    Up to eight byte columns fit one ``uint64`` (fast integer ordering); a wider
+    cone (a 16-bit SMC accumulator, an unrolled multi-site writer) packs into a
+    structured (void) key ordered lexicographically -- so the witness key has no
+    column cap.
     """
     if not cols:
-        return np.zeros(0)
+        return np.zeros(0, dtype=np.uint64)
+    if len(cols) <= 8:
+        enc = np.zeros(len(cols[0]), dtype=np.uint64)
+        for j, col in enumerate(cols):
+            enc |= (np.asarray(col, dtype=np.uint64) & np.uint64(0xFF)) << np.uint64(8 * j)
+        return enc
     stacked = np.ascontiguousarray(np.stack([np.asarray(c, dtype=np.uint8) for c in cols], axis=1))
     return stacked.view([("", np.uint8)] * stacked.shape[1]).ravel()
 

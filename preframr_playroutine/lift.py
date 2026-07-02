@@ -566,15 +566,13 @@ _WITNESS_CAP = 16
 _WITNESS_POOL = 40
 
 
-def _pure_count(enc, target) -> int:
-    """Frames in groups (by input tuple ``enc``) whose output is constant.
+def _pure_from_inv(inv, target) -> int:
+    """Frames in output-constant groups, given a per-frame group index ``inv``.
 
-    Adding an input column only splits groups, so this is monotone -- the greedy
-    objective for selecting the determining input subset. Equals ``n`` iff the
-    columns determine the register (an exact witness).
+    A group (frames sharing an input tuple) is pure iff its outputs are all equal;
+    adding a column only splits groups, so this is monotone -- the greedy objective.
+    Equals ``n`` iff the inputs determine the register (an exact witness).
     """
-    _uniq, inv = np.unique(enc, return_inverse=True)
-    inv = np.asarray(inv).ravel()
     k = int(inv.max()) + 1 if len(inv) else 0
     gmin = np.full(k, np.iinfo(np.int64).max, dtype=np.int64)
     gmax = np.full(k, np.iinfo(np.int64).min, dtype=np.int64)
@@ -586,28 +584,32 @@ def _pure_count(enc, target) -> int:
 def _select_determining(cols, target, cap=_WITNESS_CAP):
     """Greedily pick up to ``cap`` columns maximising output-determining frames.
 
-    Returns the chosen column indices (cone order, ties to earliest). Only the
-    inputs that actually reduce collisions are kept, so noise cells never dilute
-    the witness key -- the memoised mapping is exact whenever the cone determines
-    the output (GENERIC_RECOVERY.md 3.5 premises 1-3), else maximally pure.
+    Returns the chosen column indices (cone order, ties to earliest). Only inputs
+    that reduce collisions are kept, so noise cells never dilute the witness key --
+    the memoised mapping is exact whenever the cone determines the output
+    (GENERIC_RECOVERY.md 3.5 premises 1-3), else maximally pure. The chosen columns'
+    group index is cached and each candidate folds in one more byte column with a
+    single int64 ``np.unique`` (no per-step structured-void sort), keeping the
+    search fast on the longest fixtures (millions of frames x dozens of read-PCs).
     """
     n = len(target)
-    chosen, chosen_cols, best = [], [], -1
-    while len(chosen) < cap:
-        add, add_score = None, best
+    chosen = []
+    chosen_inv = np.zeros(n, dtype=np.int64)
+    best = -1
+    while len(chosen) < cap and best < n:
+        add, add_inv, add_score = None, None, best
         for i, col in enumerate(cols):
             if i in chosen:
                 continue
-            score = _pure_count(_encode_rows(chosen_cols + [col]), target)
+            inv = np.asarray(np.unique(chosen_inv * 256 + col, return_inverse=True)[1]).ravel()
+            score = _pure_from_inv(inv, target)
             if score > add_score:
-                add, add_score = i, score
+                add, add_inv, add_score = i, inv, score
         if add is None:
             break
         chosen.append(add)
-        chosen_cols.append(cols[add])
+        chosen_inv = add_inv
         best = add_score
-        if best >= n:
-            break
     return chosen
 
 
@@ -615,8 +617,8 @@ def _witness_from_specs(series, specs, sid_addr, ctx):
     """Build a Tier-3 witness descriptor from a code-derived input cone.
 
     Samples each input spec per frame (RAM cell / SMC immediate / live chip read /
-    per-frame read-PC value), greedily keeps the determining subset (<= 7 -- one
-    int64 key), then memoises the observed ``inputs -> value`` mapping. Exact when
+    per-frame read-PC value), greedily keeps the determining subset, then memoises
+    the observed ``inputs -> value`` mapping. Exact when
     the cone determines the register (the totality guarantee); a residual collision
     leaves that key at its first observed value (scored below 1.0, so a fitting
     tree still wins).
