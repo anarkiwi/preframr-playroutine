@@ -13,7 +13,7 @@ import pytest
 
 from preframr_playroutine import Trace
 
-from _minisid import build_ioprobe_psid, build_psid
+from _minisid import LIFT_CLAMP_STORE_PC, build_ioprobe_psid, build_lift_clamp_psid, build_psid
 
 SIDTRACE = shutil.which("sidtrace") or "/usr/local/bin/sidtrace"
 HAVE_SIDTRACE = os.path.exists(SIDTRACE)
@@ -173,6 +173,38 @@ def test_stack_flag(tmp_path):
         open(default_prefix + ".ramwr.bin", "rb") as fb,
     ):
         assert fa.read() == fb.read()
+
+
+def test_lift_clamp_recovered_on_real_trace(tmp_path):
+    # End-to-end Phase-7 lifter on genuine sidtrace output: the clamp player emits
+    # min(counter, $40) to $D400. The emit-slice lifter disassembles the real RAM
+    # image within the real executed-PC coverage, symbolically slices the store to a
+    # cmpsel tree, and reconstructs the register frame-exactly; the arbiter then
+    # recovers $D400 to fidelity 1.0 (no XSTATE).
+    from preframr_playroutine import analyze, round_trip
+    from preframr_playroutine import ir, lift
+    from preframr_playroutine.recover import _build_context, _register_series
+
+    trace = Trace.load(_trace(tmp_path, build_lift_clamp_psid(), name="clamp"))
+    ctx = _build_context(trace)
+    series = _register_series(trace, 0xD400, ctx.kind)[1]
+
+    expr = lift.lift_store(
+        trace.ram_image(),
+        ctx.covered_pcs,
+        LIFT_CLAMP_STORE_PC,
+        0xD400,
+        lift._smc_predicate(ctx),
+    )
+    assert expr is not None and expr["op"] == "cmpsel"
+    tree = ir._post(expr, {"addr": 0xD400, "sid": 0xD400}, width_mask=0xFF)
+    recon = ir.evaluate(tree, ctx.n_frames, ctx.sampler)
+    assert np.array_equal(recon, series)
+    assert np.any(series == 0x40) and np.any(series < 0x40)  # the clamp actually bit
+
+    result = analyze(trace)
+    assert result[0xD400]["type"] != "XSTATE"
+    assert round_trip(trace)[0xD400] == 1.0
 
 
 def test_v2_analyze_classifies(tmp_path):

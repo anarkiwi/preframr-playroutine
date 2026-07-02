@@ -36,6 +36,7 @@ from typing import NamedTuple
 import numpy as np
 
 from . import ir
+from . import lift
 from .trace import WIN_IRQ, WIN_NMI
 
 # Per-voice CTRL (gate) register addresses.
@@ -596,6 +597,11 @@ class RecoverContext(NamedTuple):
     # proposer): ``latents[voice] = {"tick", "cursors", "note_cell"}`` plus a
     # song-level ``latents["global"] = {"counter_addr", "counter_step"}``.
     latents: object = None
+    # Executed-PC coverage set and the written-RAM-cell set, used by the Phase-7
+    # emit-slice lifter (:mod:`preframr_playroutine.lift`) to disassemble only real
+    # code and to recognise self-modifying (SMC) immediate operands.
+    covered_pcs: object = None
+    written_cells: object = None
 
     def latent_cursor(self, voice, addr):
         """The (voice, "cursor", addr) latent id if ``addr`` is a grouped cursor."""
@@ -1505,6 +1511,10 @@ def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContex
     latents = _build_latents(stateseq, note_on, n_frames)
     sampler = _CellSampler(trace, stateseq.ticks)
     sampler.latents = latents
+    cov = trace.coverage_pcs()
+    covered = frozenset(int(p) for p in cov.tolist()) if len(cov) else frozenset()
+    rw = trace.ram_writes(_window_kind(kind))
+    written = frozenset(int(a) for a in np.unique(rw["addr"]).tolist()) if len(rw) else frozenset()
     return RecoverContext(
         kind=kind,
         stateseq=stateseq,
@@ -1517,6 +1527,8 @@ def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContex
         sampler=sampler,
         reads_near=_reads_near_store(trace, stateseq.ticks, kind),
         latents=latents,
+        covered_pcs=covered,
+        written_cells=written,
     )
 
 
@@ -2138,10 +2150,41 @@ def _arbitrate(cands, series, sid_addr, ctx, base):
     for cand, _tree, _recon, key in scored:
         if best_key is None or key > best_key:
             best, best_key = cand, key
+    best = _maybe_lift(best, best_key, series, sid_addr, ctx, base)
     result = dict(base)
     if best is not None:
         result.update(best)
     return result
+
+
+def _maybe_lift(best, best_key, series, sid_addr, ctx, base):
+    """Run the Phase-7 lifter LAST, only for a still-imperfect register.
+
+    The emit-slice lifter / dynamic witness is the most general and most expensive
+    proposer, so it runs only when every value-stream proposer left the register
+    below 1.0. It adopts ONLY on a STRICT fidelity improvement over the incumbent:
+    this keeps the fidelity ratchet safe (a lift never displaces an equal-fidelity
+    winner) and turns a previously-imperfect register perfect where the code lifts.
+    """
+    best_fid = best_key[0] if best_key else 0.0
+    if best_fid >= 1.0 - 1e-9:
+        return best
+    pcs = base.get("store_pcs", [])
+    s = np.asarray(series, dtype=np.int64)
+    for cand in lift.propose_lift(series, sid_addr, pcs, ctx):
+        scored = _score_candidate(cand, s, sid_addr, ctx)
+        if scored is None:
+            continue
+        cand, _tree, _recon, key = scored
+        # A Tier-2 lift adopts on any strict fidelity gain (a recovered generator);
+        # the Tier-3 witness adopts only when EXACT -- it is the totality backstop,
+        # not a partial-fit tool, so it never causes equal-or-partial churn.
+        exact = key[0] >= 1.0 - 1e-9
+        gain = key[0] > best_fid + 1e-9
+        adopt = gain and (cand.get("type") != "WITNESS" or exact)
+        if adopt and (best_key is None or key > best_key):
+            best, best_key, best_fid = cand, key, key[0]
+    return best
 
 
 def _score_candidate(cand, s, sid_addr, ctx):
