@@ -182,6 +182,21 @@ def test_lift_smc_immediate_scaled():
     assert np.array_equal(recon, series)
 
 
+def test_lift_inc_counter_then_clamp():
+    # Mirrors the minisid clamp player: INC $FB (RMW counter) ; LDA $FB ; CMP #$40 ;
+    # BCC +2 ; LDA #$40 ; STA $D400 -> min(counter, $40). The INC must not defeat
+    # the slice (the counter is read back through its cell).
+    img = np.zeros(65536, dtype=np.uint8)
+    prog = [0xE6, 0xFB, 0xA5, 0xFB, 0xC9, 0x40, 0x90, 0x02, 0xA9, 0x40, 0x8D, 0x00, 0xD4]
+    img[0x1003 : 0x1003 + len(prog)] = prog
+    covered = [0x1003, 0x1005, 0x1007, 0x1009, 0x100B, 0x100D]
+    frames = [(min(i % 256, 0x40), {0xFB: i % 256}) for i in range(1, 120)]
+    _tr, ctx, series = build_trace(img, covered, frames, 0xD400, 0x100D)
+    expr, recon = _lift_recon(img, covered, 0x100D, 0xD400, ctx)
+    assert expr["op"] == "cmpsel" and expr["cmp"] == "ult"
+    assert np.array_equal(recon, series)
+
+
 def test_lift_clamp_branch():
     img = np.zeros(65536, dtype=np.uint8)
     # LDA $10 ; CMP #$40 ; BCC +2 ; LDA #$40 ; STA $D400   -> min(a, 0x40)

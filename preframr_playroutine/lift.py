@@ -343,6 +343,15 @@ class _Slicer:
                 raise _Fail("inc/dec of undefined register")
             state[reg] = _binop("add", state[reg], _const(1 if name[0] == "I" else 0xFF))
             self._set_nz(state, state[reg])
+        elif name in ("INC", "DEC"):
+            # A read-modify-write on a RAM cell: the store back updates the cell,
+            # so a later LDA of it reads the post-update value through the sampler.
+            # Drop any stale symbolic value; the value is not needed by the store's
+            # A/X/Y chain (an INC'd counter is read via its cell).
+            if ins.mode in ("zp", "abs"):
+                state["mem"].pop(int(ins.operand), None)
+            state["nz"] = None
+            state["cmp"] = None
         elif name == "PHA":
             state["stack"].append(state["A"])
         elif name == "PLA":
