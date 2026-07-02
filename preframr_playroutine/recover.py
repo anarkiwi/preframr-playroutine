@@ -248,6 +248,68 @@ def _simulate_tickreflect(lo, hi, rate, start, direction, n):
     return out
 
 
+def _simulate_recur(  # pylint: disable=too-many-branches
+    lo, hi, seed, direction, length, boundary, step_kind, up=1, down=1, rate=None, modulus=None
+):
+    """One segment of the general ``step x boundary`` bounded-accumulator product.
+
+    ``step_kind`` selects the per-frame stride: ``const`` (``up``), ``updown``
+    (``up`` rising / ``down`` falling), or ``table`` (``rate[tick]``, holding the
+    last entry past its end). ``boundary`` selects the bound behaviour: ``wrap``
+    (modular), ``saw`` (reset to ``lo``), ``reflect`` (mirror the overshoot and
+    flip), or ``clampflip`` (saturate at the bound and flip). This single kernel
+    spans the full 12-cell product; the scalar-mode simulators above are its
+    fixture-exercised subset and stay byte-for-byte to preserve reconstruction.
+    """
+    out = np.empty(length, dtype=np.int64)
+    v = int(seed)
+    d = int(direction)
+    m = len(rate) if rate is not None else 0
+    span = hi - lo
+    for i in range(length):
+        out[i] = v
+        if step_kind == "table":
+            if m == 0:
+                continue
+            st = int(rate[i]) if i < m else int(rate[m - 1])
+        elif step_kind == "updown":
+            st = up if d > 0 else down
+        else:
+            st = up
+        nv = v + d * st
+        if boundary == "wrap":
+            mod = int(modulus) if modulus else (span + st if span > 0 else 1)
+            if mod > 0:
+                nv = lo + ((nv - lo) % mod)
+        elif boundary == "saw":
+            if nv > hi or nv < lo:
+                nv = lo
+        elif boundary == "reflect":
+            if nv > hi:
+                d = -d
+                nv = hi - (nv - hi)
+            elif nv < lo:
+                d = -d
+                nv = lo + (lo - nv)
+        else:  # clampflip
+            if nv > hi:
+                d = -d
+                nv = hi
+            elif nv < lo:
+                d = -d
+                nv = lo
+        v = nv
+    return out
+
+
+def _modal_int(values) -> int:
+    """Most common value in a list of ints (1 if empty)."""
+    if len(values) == 0:
+        return 1
+    vals, counts = np.unique(np.asarray(values, dtype=np.int64), return_counts=True)
+    return int(vals[counts.argmax()])
+
+
 def _dominant_signed_step(diffs: np.ndarray, positive: bool) -> int:
     """Most common positive (or |negative|) per-frame step."""
     arr = diffs[diffs > 0] if positive else -diffs[diffs < 0]
@@ -545,22 +607,39 @@ def _strip_holds(seg: np.ndarray) -> np.ndarray:
     return seg[i:j]
 
 
-def segmented_bacc(series, reset_frames, min_residual: float = 0.6, min_segments: int = 3):
-    """Recover a note-reseeded bounded accumulator from a per-frame series.
+def _segment_bounds(series, resets):
+    """Segment boundaries: internal discontinuities plus note-on reseeds.
 
-    The series is segmented at note-on ``reset_frames`` and at internal
-    discontinuities (the seed jumps), each segment is trimmed of its constant
-    hold runs and fitted with :func:`fit_bacc`. BACC is recovered when a
-    consistent step is found across a majority of fittable segments. Returns a
-    BACC dict (``step``/``mode``/``lo``/``hi``/``residual`` plus ``n_segments``/
-    ``n_fit``/``segmented=True``) or ``None``.
+    Segmentation keys on BOTH the seed-jump discontinuities and the note-on
+    ``resets`` (gate edges): a legato / tie note reseeds the accumulator without a
+    gate edge, so gates alone miss it, and a mid-note reseed has no gate edge at
+    all. This one segmentation feeds every step x boundary hypothesis below.
     """
-    series = np.asarray(series, dtype=np.int64).ravel()
-    if len(series) < 8:
-        return None
+    n = len(series)
     cuts = set(int(x) for x in _discontinuities(series))
-    cuts.update(int(x) for x in reset_frames if 0 < int(x) < len(series))
-    bounds = [0] + sorted(cuts) + [len(series)]
+    cuts.update(int(x) for x in resets if 0 < int(x) < n)
+    return [0] + sorted(cuts) + [n]
+
+
+def _seg_state(series, bounds):
+    """Per-segment (reset frame, seed, start direction, up step, |down| step)."""
+    resets, seeds, dirs, ups, downs = [], [], [], [], []
+    for k in range(len(bounds) - 1):
+        seg = series[bounds[k] : bounds[k + 1]]
+        d = np.diff(seg)
+        nz = d[d != 0]
+        up = _dominant_signed_step(d, True)
+        down = _dominant_signed_step(d, False)
+        resets.append(int(bounds[k]))
+        seeds.append(int(seg[0]))
+        dirs.append(1 if (len(nz) == 0 or nz[0] > 0) else -1)
+        ups.append(int(up or down or 1))
+        downs.append(int(down or up or 1))
+    return resets, seeds, dirs, ups, downs
+
+
+def _recur_const(series, bounds, min_residual: float = 0.6, min_segments: int = 3):
+    """Const-step boundary vote: {saw, wrap, reflect, clampflip} at one shared step."""
     fits = []
     n_try = 0
     for k in range(len(bounds) - 1):
@@ -627,38 +706,15 @@ def _seg_fidelity(desc, series) -> float:
     return float(np.mean(recon == np.asarray(series, dtype=np.int64)))
 
 
-def segmented_pingpong(series, reset_frames, min_residual: float = 0.6, min_reversing: int = 2):
-    """Recover a per-note clamp-and-flip (ping-pong) sweep (defMON PW).
-
-    Each note seeds the accumulator and sets its own signed rate, so step and
-    direction vary per segment while the floor/ceiling clamp is shared. Unlike
-    :func:`segmented_bacc`, no single modal step is required: every segment keeps
-    its own step/direction. The shared bounds/clamps are taken from the segments
-    that actually reverse (where the clamp is observed). Returns a ``pingpong``
-    BACC descriptor with per-segment ``steps``/``down_steps``/``directions`` or
-    ``None`` when too few segments reverse.
-    """
-    series = np.asarray(series, dtype=np.int64).ravel()
-    if len(series) < 8:
-        return None
-    cuts = set(int(x) for x in _discontinuities(series))
-    cuts.update(int(x) for x in reset_frames if 0 < int(x) < len(series))
-    bounds = [0] + sorted(cuts) + [len(series)]
-    resets, seeds, steps, downs, dirs = [], [], [], [], []
+def _recur_updown(series, bounds, min_residual: float = 0.6, min_reversing: int = 2):
+    """Up/down-step clamp-and-flip: per-note signed rate, shared floor/ceiling."""
+    resets, seeds, dirs, steps, downs = _seg_state(series, bounds)
     reversing = []
     for k in range(len(bounds) - 1):
         seg = series[bounds[k] : bounds[k + 1]]
-        d = np.diff(seg)
-        nz = d[d != 0]
-        up = _dominant_signed_step(d, True)
-        down = _dominant_signed_step(d, False)
-        resets.append(int(bounds[k]))
-        seeds.append(int(seg[0]))
-        steps.append(int(up or down or 1))
-        downs.append(int(down or up or 1))
-        dirs.append(1 if (len(nz) == 0 or nz[0] > 0) else -1)
         strip = _strip_holds(seg)
-        if len(strip) >= 4 and up and down:
+        d = np.diff(seg)
+        if len(strip) >= 4 and _dominant_signed_step(d, True) and _dominant_signed_step(d, False):
             fit = _fit_pingpong(strip, int(strip.min()), int(strip.max()))
             if fit is not None and fit["residual"] >= min_residual:
                 reversing.append(fit)
@@ -689,57 +745,20 @@ def segmented_pingpong(series, reset_frames, min_residual: float = 0.6, min_reve
     }
 
 
-def segmented_tickband(series, reset_frames, min_segments: int = 6):
-    """Recover a tick-banded reflecting sweep (Future Composer PW LO/HI).
-
-    The accumulator is reseeded at every note-on; within a note its per-frame
-    stride is a step-function of the per-voice tick (frames since that note-on) --
-    ``step = rate_table[tick]`` -- and the direction mirror-reflects at the
-    recovered PW bounds. The tick is synthesized directly from the note-on
-    ``reset_frames`` (a sawtooth reset at each note), so no RAM cursor cell is
-    needed. Each note segment yields its own tick-rate vector (the absolute
-    per-frame diffs) and start direction; the vectors are de-duplicated into a
-    small table set shared across notes -- a real player has only a handful of
-    rate programs, so a tick-banded sweep collapses to a few tables while noise
-    does not. Returns a ``tickband`` BACC descriptor or ``None``.
-
-    Guarded to never steal a constant-step fit: the stride must genuinely vary
-    with the tick on a majority of segments, and the shared table set must stay
-    small relative to the segment count (else the per-segment vectors are not a
-    reused program and the candidate is rejected).
-    """
-    series = np.asarray(series, dtype=np.int64).ravel()
-    n = len(series)
-    if n < 8:
-        return None
-    resets = sorted({int(x) for x in reset_frames if 0 < int(x) < n})
-    bounds = [0] + resets + [n]
-    n_seg = len(bounds) - 1
-    if n_seg < min_segments:
-        return None
-    lo16, hi16 = int(series.min()), int(series.max())
-    if hi16 <= lo16:
-        return None
-    seg_resets, seeds, dirs, rate_vecs = [], [], [], []
+def _rate_tables(series, bounds):
+    """Per-segment abs-stride vectors deduplicated into a shared program set."""
+    seeds, dirs, rate_vecs = [], [], []
     varying = 0
-    for k in range(n_seg):
-        a, b = bounds[k], bounds[k + 1]
-        seg = series[a:b]
+    for k in range(len(bounds) - 1):
+        seg = series[bounds[k] : bounds[k + 1]]
         d = np.diff(seg)
         nz = d[d != 0]
         rate = np.abs(d).astype(np.int64)
-        seg_resets.append(int(a))
         seeds.append(int(seg[0]))
         dirs.append(1 if (len(nz) == 0 or nz[0] > 0) else -1)
         rate_vecs.append(rate)
         if len(np.unique(rate[rate != 0])) > 1:
             varying += 1
-    # A tick-banded stride genuinely varies within a note; a constant per-note
-    # stride is a plain saw/reflect (handled by the scalar modes). Require the
-    # within-note variation on a majority of segments so this never steals a
-    # clean constant-step fit.
-    if varying < max(3, 0.3 * n_seg):
-        return None
     tables, index, seg_tables = [], {}, []
     for rate in rate_vecs:
         key = rate.tobytes()
@@ -747,8 +766,29 @@ def segmented_tickband(series, reset_frames, min_segments: int = 6):
             index[key] = len(tables)
             tables.append(rate)
         seg_tables.append(index[key])
-    # The rate vectors must be a reused program (few tables, many notes); noise
-    # gives a distinct vector per note and is rejected here.
+    return seeds, dirs, tables, seg_tables, varying
+
+
+def _recur_table(series, bounds, min_segments: int = 6):
+    """Tick-indexed stride (``step = rate_table[tick]``) reflecting sweep.
+
+    The tick-banded generator (Future Composer PW) reseeds per segment and reads
+    its stride from a small set of shared rate tables. The old anti-theft gates
+    (a majority of segments must genuinely vary within the note; the shared table
+    set must stay small) are kept as a cheap prefilter, and the shared-table cost
+    is ALSO charged by ``ir.complexity`` (many distinct rate tables = high cost),
+    so the arbiter, not the gate, is the final adopter.
+    """
+    n = len(series)
+    n_seg = len(bounds) - 1
+    if n_seg < min_segments:
+        return None
+    lo16, hi16 = int(series.min()), int(series.max())
+    if hi16 <= lo16:
+        return None
+    seeds, dirs, tables, seg_tables, varying = _rate_tables(series, bounds)
+    if varying < max(3, 0.3 * n_seg):
+        return None
     if len(tables) > max(8, 0.5 * n_seg):
         return None
     desc = {
@@ -758,16 +798,110 @@ def segmented_tickband(series, reset_frames, min_segments: int = 6):
         "lo": lo16,
         "hi": hi16,
         "segmented": True,
-        "resets": seg_resets,
+        "resets": [int(b) for b in bounds[:-1]],
         "seeds": seeds,
         "directions": dirs,
         "rate_tables": tables,
         "seg_tables": seg_tables,
         "n_segments": int(n_seg),
     }
-    recon = _recon_tickband(desc, n)
-    desc["residual"] = float(np.mean(recon == series))
+    desc["residual"] = float(np.mean(_recon_tickband(desc, n) == series))
     return desc
+
+
+_STEP_KINDS = ("const", "updown", "table")
+_BOUNDARIES = ("wrap", "saw", "reflect", "clampflip")
+
+
+def _recur_product(series, bounds, min_segments: int = 3, min_residual: float = 0.95):
+    """Best cell of the full ``step x boundary`` product as one ``product`` BACC.
+
+    Covers the axis cells the scalar/tickband modes above cannot spell (e.g.
+    ``updown x wrap``, ``table x clampflip``). Every hypothesis shares the single
+    segmentation; per-segment seeds/directions/steps and deduplicated rate tables
+    are extracted once, then each of the 12 (step_kind, boundary) cells is
+    simulated and scored, and the best-reconstructing cell is emitted.
+
+    Cheap prefilters keep this from degenerating into a universal per-frame data
+    replayer: a genuine reseeded generator has several segments and reconstructs
+    almost exactly, and a ``table`` step is adopted only when its rate program is
+    reused across segments and genuinely varies within a note (the former
+    tickband anti-theft guards, now applied per hypothesis). The rate-table
+    capture is additionally MDL-charged, so a scalar closed form still wins where
+    both fit."""
+    n = len(series)
+    lo, hi = int(series.min()), int(series.max())
+    n_seg = len(bounds) - 1
+    if hi <= lo or n_seg < min_segments:
+        return None
+    # Guard against a fragmented series (a bounce over-segmented at every
+    # discontinuity): if the segments are tiny, a shared step + per-segment seeds
+    # merely replays the captured seed values rather than fitting a generator.
+    if n / n_seg < 6:
+        return None
+    resets, seeds, dirs, ups, downs = _seg_state(series, bounds)
+    _s, _d, tables, seg_tables, varying = _rate_tables(series, bounds)
+    # A reused, within-note-varying rate program (few shared tables) is a genuine
+    # tick-indexed stride; a distinct dense vector per segment is a replay -- allow
+    # the ``table`` step only when it is the former.
+    table_ok = varying >= max(3, 0.3 * n_seg) and len(tables) <= max(8, 0.5 * n_seg)
+    # The step model is SHARED across segments (a single modal up/down), only the
+    # reseed state (seed, direction) is per-segment. This is the anti-overfit
+    # constraint: capturing a distinct step per segment would let the product
+    # replay any bouncing series; a genuine reseeded generator reuses one rate.
+    up = _modal_int(ups)
+    down = _modal_int(downs)
+    common = {
+        "type": "BACC",
+        "mode": "product",
+        "lo": lo,
+        "hi": hi,
+        "segmented": True,
+        "resets": resets,
+        "seeds": seeds,
+        "directions": dirs,
+        "rate_tables": tables,
+        "seg_tables": seg_tables,
+        "n_segments": int(n_seg),
+        "step": up,
+        "down_step": down,
+    }
+    best_res, best_desc = -1.0, None
+    for step_kind in _STEP_KINDS:
+        if step_kind == "table" and not table_ok:
+            continue
+        for boundary in _BOUNDARIES:
+            desc = dict(common, step_kind=step_kind, boundary=boundary)
+            recon = ir._recon_product(desc, n)  # pylint: disable=protected-access
+            res = float(np.mean(recon == series))
+            if res > best_res:
+                best_res, best_desc = res, desc
+    if best_desc is None or best_res < min_residual:
+        return None
+    best_desc["residual"] = best_res
+    return best_desc
+
+
+def _segmented_recur(series, resets):
+    """Unified segmented recurrence fitter: ONE segmentation
+    (:func:`_segment_bounds`) feeds the whole step x boundary product, sharing the
+    vote/consistency logic. Returns candidate BACC descriptors -- the const-step
+    boundary vote, the up/down clamp-flip, and the tick-indexed reflect -- for the
+    arbiter to score (the general product cell is added by :func:`_bacc_candidate`
+    only when these scalar modes leave the series imperfect)."""
+    series = np.asarray(series, dtype=np.int64).ravel()
+    if len(series) < 8:
+        return []
+    bounds = _segment_bounds(series, resets)
+    out = []
+    for desc in (
+        _recur_const(series, bounds),
+        _recur_updown(series, bounds),
+        _recur_table(series, bounds),
+    ):
+        if desc is not None:
+            out.append(desc)
+    return out
 
 
 def _read_log_tables(trace, ram, max_span: int = 256, cap: int = 96) -> list:
@@ -1059,7 +1193,9 @@ def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContex
     )
 
 
-def _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx):
+def _bacc_candidate(
+    trace, sid_addr, series, voice, reg_off, ctx
+):  # pylint: disable=too-many-branches
     """Recover a BACC on the register or its 16-bit lo/hi partner.
 
     Tries, in order: a global :func:`fit_bacc` (a non-reseeded accumulator), then
@@ -1080,19 +1216,24 @@ def _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx):
     series = np.asarray(series, dtype=np.int64)
     # Candidate accumulators, 16-bit (lo/hi combined) first so it wins ties: the
     # combined form is the true generator domain (a fast-wrapping 8-bit byte fits
-    # spuriously but reconstructs poorly). Pick the one that best regenerates the
-    # register's own series rather than the one with the most fittable segments.
+    # spuriously but reconstructs poorly). The segmented candidates share one
+    # segmentation (:func:`_segment_bounds`) and cover the step x boundary product;
+    # the up/down clamp-flip is tried before the const vote and tick-indexed
+    # reflect (the 16-bit domain), while the 8-bit series only offers the const
+    # vote -- preserving the pre-unification candidate set so a richer model never
+    # steals a register that the scalar/bitwise paths already own.
     cands = []
     if combined is not None:
-        cands.append((fit_bacc(combined), combined, 16, role))
-        cands.append((segmented_pingpong(combined, resets), combined, 16, role))
-        cands.append((segmented_bacc(combined, resets), combined, 16, role))
-        # A tick-banded reflecting sweep (FC PW): per-frame stride = rate[tick].
-        # Appended after the scalar-step modes so it loses ties (never steals a
-        # clean constant-step fit) and only wins on strictly higher fidelity.
-        cands.append((segmented_tickband(combined, resets), combined, 16, role))
+        cb = np.asarray(combined, dtype=np.int64)
+        cands.append((fit_bacc(cb), cb, 16, role))
+        if len(cb) >= 8:
+            b16 = _segment_bounds(cb, resets)
+            cands.append((_recur_updown(cb, b16), cb, 16, role))
+            cands.append((_recur_const(cb, b16), cb, 16, role))
+            cands.append((_recur_table(cb, b16), cb, 16, role))
     cands.append((fit_bacc(series), series, 8, "full"))
-    cands.append((segmented_bacc(series, resets), series, 8, "full"))
+    if len(series) >= 8:
+        cands.append((_recur_const(series, _segment_bounds(series, resets)), series, 8, "full"))
     best = None
     best_fid = -1.0
     for fit, src, width, crole in cands:
@@ -1102,6 +1243,24 @@ def _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx):
         fid = _candidate_fidelity(finished, series, crole)
         if fid > best_fid:
             best, best_fid = finished, fid
+    # General step x boundary product cell: only when the scalar/tickband modes
+    # leave the series imperfect (bounds the per-frame simulate cost and keeps the
+    # perfect set on its unchanged scalar descriptors). It only replaces ``best``
+    # on strictly higher fidelity, so it never regresses a register.
+    if best_fid < 0.999:
+        for src, width, crole in ((combined, 16, role), (series, 8, "full")):
+            if src is None:
+                continue
+            arr = np.asarray(src, dtype=np.int64)
+            if len(arr) < 8:
+                continue
+            prod = _recur_product(arr, _segment_bounds(arr, resets))
+            if prod is None:
+                continue
+            finished = _bacc_finish(prod, arr, width, crole)
+            fid = _candidate_fidelity(finished, series, crole)
+            if fid > best_fid:
+                best, best_fid = finished, fid
     return best
 
 
@@ -1224,6 +1383,8 @@ _PRIORITY = (
     "XOR",
     "AND",
     "OR",
+    "ADD",
+    "SUB",
     "SEQ",
     "FEEDER",
     "XSTATE",
@@ -1331,17 +1492,45 @@ def _propose_table_walk(series, wr, ctx, sid_addr):
     return out
 
 
-def _propose_pairs(sid_addr, series, reg_off, ctx):
-    """Bitwise-fold proposers: XOR/AND for CTRL, OR for any per-frame register."""
+def _propose_binop(sid_addr, series, ctx):
+    """Unified fold proposer: ``{or, and, xor, add, sub} x {cell, const}``.
+
+    Replaces the three copy-paste pair searches. ONE entropy prefilter (cells
+    with <= 24 distinct values -- the union of the former XOR/AND/OR caps),
+    sampled at the SID-write instant and subsampled for the scan then verified on
+    all frames. Generalizes ``_or_pair``'s per-bit-optimal constant to every
+    bitwise op (``and``/``xor`` choose each constant bit independently) and
+    searches a small residual-histogram constant set for ``add``/``sub``. Routing
+    hints (matching the former ``_propose_pairs``): XOR/AND are CTRL idioms and
+    are offered only for CTRL; OR/ADD/SUB apply to any per-frame register. The
+    arbiter, not the proposer, adopts."""
+    ss = ctx.stateseq
+    if ss.grid.shape[1] == 0 or ctx.sampler is None:
+        return []
+    s = np.asarray(series, dtype=np.int64) & 0xFF
+    n = len(s)
+    grid = ss.grid
+    addrs = ss.addrs
+    cols = [j for j in range(grid.shape[1]) if len(np.unique(grid[:, j])) <= _BINOP_MAX_DISTINCT]
+    if not cols:
+        return []
+    mat_full = np.stack(
+        [ctx.sampler.at_write(int(addrs[j]), sid_addr).astype(np.int64) & 0xFF for j in cols],
+        axis=1,
+    )
+    sample = np.unique(np.linspace(0, n - 1, min(n, 512)).astype(np.int64))
+    mat = mat_full[sample]
+    ss_s = s[sample]
+    bits = (1 << np.arange(8)).astype(np.int64)
+    sb = (ss_s[:, None] & bits) > 0
+
+    _voice, reg_off = _voice_of(sid_addr)
+    ops = ["or", "add", "sub"] + (["xor", "and"] if reg_off == _CTRL else [])
     out = []
-    if reg_off == _CTRL:
-        for prop in (_xor_pair, _and_pair):
-            desc = prop(sid_addr, series, ctx)
-            if desc is not None:
-                out.append(desc)
-    or_d = _or_pair(sid_addr, series, ctx)
-    if or_d is not None:
-        out.append(or_d)
+    for fn in ops:
+        cand = _binop_best(fn, cols, addrs, mat, ss_s, sb, s, sid_addr, ctx)
+        if cand is not None:
+            out.append(cand)
     return out
 
 
@@ -1377,7 +1566,7 @@ def _register_proposals(trace, sid_addr, series, wr, pcs, voice, reg_off, on_fra
         cands += _propose_recurrence(trace, sid_addr, series, voice, reg_off, ctx)
         cands += _propose_table_walk(series, wr, ctx, sid_addr)
         cands += _propose_composite(trace, sid_addr, series, ctx, reg_off)
-        cands += _propose_pairs(sid_addr, series, reg_off, ctx)
+        cands += _propose_binop(sid_addr, series, ctx)
         cands += _propose_seq(series, sid_addr, reg_off, on_frames, wr, ctx)
         cands += _propose_feeder(series, sid_addr, ctx)
     return cands
@@ -1998,112 +2187,97 @@ def _composite8(sid_addr, series, ctx):
     return desc
 
 
-def _xor_pair(sid_addr, series, ctx):
-    """Recover a CTRL register written as ``cellA XOR cellB`` (or ``None``).
+_BINOP_MAX_DISTINCT = 24
+_BINOP_TYPE = {"or": "OR", "and": "AND", "xor": "XOR", "add": "ADD", "sub": "SUB"}
 
-    A common gate/test/waveform idiom (defMON, and any player that flips control
-    bits with an eor mask rather than rewriting the whole byte) computes
-    ``CTRL = base XOR eor`` from two captured RAM cells. Neither cell alone
-    reproduces CTRL, so the per-frame machinery (table-walk / feeder / SEQ) can
-    only partly fit it; the exact-XOR of the right pair reproduces it byte-for-
-    byte. Searches low-entropy (control-like) cells, sampled at the SID-write
-    instant, over a frame subsample, then verifies the best pair on all frames.
-    The prefilter (low-entropy cells) is cheap; adoption is the arbiter's job.
-    """
-    ss = ctx.stateseq
-    if ss.grid.shape[1] == 0 or ctx.sampler is None:
-        return None
-    s = np.asarray(series, dtype=np.int64) & 0xFF
-    n = len(s)
-    grid = ss.grid
-    addrs = ss.addrs
-    # Control bytes toggle among a handful of values; that prefilter bounds the
-    # pair search to O(m^2 * subsample), independent of trace length.
-    cols = [j for j in range(grid.shape[1]) if len(np.unique(grid[:, j])) <= 24]
-    if len(cols) < 2:
-        return None
-    mat_full = np.stack(
-        [ctx.sampler.at_write(int(addrs[j]), sid_addr).astype(np.int64) & 0xFF for j in cols],
-        axis=1,
-    )
-    sample = np.unique(np.linspace(0, n - 1, min(n, 512)).astype(np.int64))
-    mat = mat_full[sample]
-    ss_s = s[sample]
-    best = (-1.0, None, None)
+
+def _binop_apply(fn, a, b):
+    """Apply an 8-bit fold ``a fn b`` (broadcasting), wrapping to a byte."""
+    if fn == "or":
+        r = a | b
+    elif fn == "and":
+        r = a & b
+    elif fn == "xor":
+        r = a ^ b
+    elif fn == "sub":
+        r = a - b
+    else:
+        r = a + b
+    return r & 0xFF
+
+
+def _binop_bit_const(a_bits, t_bits, fn):
+    """Per-bit optimal 8-bit constant for a bitwise ``fn(cell, const)``.
+
+    Each constant bit is chosen independently to maximise agreement (as
+    ``_or_pair`` did for OR): OR sets a bit when the target is 1 more often than
+    the cell already agrees; AND keeps a bit when the cell agrees more often than
+    forcing 0; XOR flips a bit when the complement agrees more often."""
+    n = t_bits.shape[0]
+    agree = (a_bits == t_bits).sum(axis=0)  # frames cell bit == target bit
+    ones = t_bits.sum(axis=0)  # frames target bit == 1
+    if fn == "or":
+        kbit = ones >= agree
+    elif fn == "and":
+        kbit = agree >= (n - ones)  # keep (== cell) vs force 0 (agrees where target 0)
+    else:  # xor
+        kbit = (n - agree) > agree
+    return int((kbit.astype(np.int64) * (1 << np.arange(8))).sum())
+
+
+def _binop_add_consts(a, t, sub, cap: int = 4):
+    """Small constant set for ``add``/``sub`` from the residual histogram.
+
+    ``add``: ``t = cell + k`` -> ``k = t - cell``; ``sub``: ``t = cell - k`` ->
+    ``k = cell - t``. Returns the most common residual bytes."""
+    diff = (a - t) if sub else (t - a)
+    resid = diff & 0xFF
+    vals, counts = np.unique(resid, return_counts=True)
+    order = np.argsort(counts)[::-1][:cap]
+    return [int(v) for v in vals[order]]
+
+
+def _binop_best(fn, cols, addrs, mat, ss_s, sb, s, sid_addr, ctx):
+    """Best ``fn`` fold (cell op cell / cell op const) over the subsample, then
+    verified on all frames and built into a descriptor (or ``None``)."""
+    best = (-1.0, None, None, None)  # frac, ai, bi, const
+    bit_pos = (1 << np.arange(8)).astype(np.int64)
     for ai in range(len(cols)):
-        f = (mat[:, ai][:, None] ^ mat == ss_s[:, None]).mean(axis=0)
-        k = int(f.argmax())
-        if f[k] > best[0]:
-            best = (float(f[k]), ai, k)
-    _frac, ai, bi = best
-    if ai is None or ai == bi:
+        a = mat[:, ai]
+        if fn in ("or", "and", "xor"):
+            ab = (a[:, None] & bit_pos) > 0
+            k = _binop_bit_const(ab, sb, fn)
+            fk = float(np.mean(_binop_apply(fn, a, k) == ss_s))
+        else:
+            fk, k = -1.0, 0
+            for c in _binop_add_consts(a, ss_s, fn == "sub"):
+                fc = float(np.mean(_binop_apply(fn, a, c) == ss_s))
+                if fc > fk:
+                    fk, k = fc, c
+        if fk > best[0]:
+            best = (fk, ai, None, int(k))
+        f = (_binop_apply(fn, a[:, None], mat) == ss_s[:, None]).mean(axis=0)
+        bi = int(f.argmax())
+        if f[bi] > best[0] and bi != ai:
+            best = (float(f[bi]), ai, bi, None)
+    _frac, ai, bi, k = best
+    if ai is None:
         return None
-    recon = (mat_full[:, ai] ^ mat_full[:, bi]) & 0xFF
-    fid = float(np.mean(recon == s))
-    return {
-        "type": "XOR",
-        "cell_a": int(addrs[cols[ai]]),
-        "cell_b": int(addrs[cols[bi]]),
-        "sid": int(sid_addr),
-        "residual": fid,
-    }
-
-
-def _and_pair(sid_addr, series, ctx):
-    """Recover a CTRL register written as ``waveCell AND gateCell`` (or ``None``).
-
-    The GoatTracker2 idiom ``CTRL = chnwave AND chngate`` masks a waveform shadow
-    cell with a gate cell holding ``$FF`` (pass) or ``$FE`` (force gate-off). The
-    gate cell is near-binary while the waveform cell carries many distinct bytes,
-    so the search is asymmetric: each low-entropy gate-like cell (``<= 4`` values)
-    is AND-ed against every control-like candidate cell (``<= 32`` values),
-    sampled at the SID-write instant over a frame subsample, then the best pair
-    is verified on all frames. The asymmetric entropy prefilter is cheap;
-    adoption is the arbiter's job.
-    """
-    ss = ctx.stateseq
-    if ss.grid.shape[1] == 0 or ctx.sampler is None:
-        return None
-    s = np.asarray(series, dtype=np.int64) & 0xFF
-    n = len(s)
-    grid = ss.grid
-    addrs = ss.addrs
-    uniq = [len(np.unique(grid[:, j])) for j in range(grid.shape[1])]
-    cols = [j for j in range(grid.shape[1]) if uniq[j] <= 32]
-    gates = [j for j in range(grid.shape[1]) if uniq[j] <= 4]
-    if not cols or not gates:
-        return None
-    full = {
-        j: ctx.sampler.at_write(int(addrs[j]), sid_addr).astype(np.int64) & 0xFF
-        for j in set(cols) | set(gates)
-    }
-    sample = np.unique(np.linspace(0, n - 1, min(n, 512)).astype(np.int64))
-    ss_s = s[sample]
-    cand = np.stack([full[j][sample] for j in cols], axis=1)
-    best = (-1.0, None, None)
-    for g in gates:
-        gv = full[g][sample]
-        f = ((gv[:, None] & cand) == ss_s[:, None]).mean(axis=0)
-        k = int(f.argmax())
-        if f[k] > best[0]:
-            best = (float(f[k]), g, cols[k])
-    _frac, gj, cj = best
-    if gj is None or gj == cj:
-        return None
-    desc = {
-        "type": "AND",
-        "cell_a": int(addrs[cj]),
-        "cell_b": int(addrs[gj]),
-        "sid": int(sid_addr),
-        "overrides": [],
-    }
-    work = _and_recon_masked(desc, ctx)
-    desc["residual"] = float(np.mean(work == s))
-    # The steady CTRL is wave AND gate; the note-onset / hard-restart frames force
-    # a control byte the shadow never carries. Recover those as value-forcing
-    # overrides (same greedy, strictly-improving pass as the table-walk path) so a
-    # gated wave-table CTRL written through a shadow cell recovers byte-exact.
-    recover_overrides(desc, s, ctx, 4, mask=ctx.sampler.written_mask(desc["sid"]))
+    desc = {"type": _BINOP_TYPE[fn], "cell_a": int(addrs[cols[ai]]), "sid": int(sid_addr)}
+    cells = [desc["cell_a"]]
+    if bi is None:
+        desc["const"] = int(k)
+    else:
+        desc["cell_b"] = int(addrs[cols[bi]])
+        cells.append(desc["cell_b"])
+    if fn == "and":
+        desc["overrides"] = []
+        desc["residual"] = float(np.mean(_and_recon_masked(desc, ctx) == s))
+        recover_overrides(desc, s, ctx, 4, mask=ctx.sampler.written_mask(desc["sid"]))
+    else:
+        attach_prelude(desc, s, ctx, cells)
+        recon = ir.evaluate(ir.to_ir(desc), len(s), ctx.sampler)
+        desc["residual"] = float(np.mean(recon == s))
     return desc
 
 
@@ -2112,71 +2286,6 @@ def _and_recon_masked(desc, ctx) -> np.ndarray:
     base = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
     written = ctx.sampler.written_mask(desc["sid"])
     return np.where(written, base, 0)
-
-
-def _or_pair(sid_addr, series, ctx):
-    """Recover a register written as ``cellA | cellB`` or ``cell | const``.
-
-    The global MODE/VOL register ``$D418`` is blitted as ``filter_mode | volume``
-    (JCH ``$1793 | $1009``; defMON ``mode | $0F``) -- a bitwise OR of a captured
-    cell with another captured cell or a constant nibble, sampled at the SID-write
-    instant. Neither operand alone reproduces it, so the per-frame machinery only
-    partly fits it; the exact OR reproduces it byte-for-byte. Mirrors
-    :func:`_xor_pair`/:func:`_and_pair`: searches low-entropy (control-like) cells
-    over a frame subsample, fitting each against every other cell and against its
-    per-bit-optimal constant, then verifies the best model (plus any held-seed
-    prelude) on all frames. The low-entropy prefilter is cheap; adoption is the
-    arbiter's job.
-    """
-    ss = ctx.stateseq
-    if ss.grid.shape[1] == 0 or ctx.sampler is None:
-        return None
-    s = np.asarray(series, dtype=np.int64) & 0xFF
-    n = len(s)
-    grid = ss.grid
-    addrs = ss.addrs
-    cols = [j for j in range(grid.shape[1]) if len(np.unique(grid[:, j])) <= 24]
-    if not cols:
-        return None
-    mat_full = np.stack(
-        [ctx.sampler.at_write(int(addrs[j]), sid_addr).astype(np.int64) & 0xFF for j in cols],
-        axis=1,
-    )
-    sample = np.unique(np.linspace(0, n - 1, min(n, 512)).astype(np.int64))
-    mat = mat_full[sample]
-    ss_s = s[sample]
-    bits = (1 << np.arange(8)).astype(np.int64)
-    sb = (ss_s[:, None] & bits) > 0
-    best = (-1.0, None, None, None)  # (frac, ai, bi, const)
-    for ai in range(len(cols)):
-        a = mat[:, ai]
-        # cell | const: each bit set in the constant always matches series' 1-bits;
-        # leaving it clear matches where the cell already agrees -- pick per bit.
-        ab = (a[:, None] & bits) > 0
-        kbits = sb.sum(axis=0) >= (sb == ab).sum(axis=0)
-        k = int((kbits.astype(np.int64) * bits).sum())
-        fk = float(np.mean(((a | k) & 0xFF) == ss_s))
-        if fk > best[0]:
-            best = (fk, ai, None, k)
-        # cell | cell
-        f = (((a[:, None] | mat) & 0xFF) == ss_s[:, None]).mean(axis=0)
-        bi = int(f.argmax())
-        if f[bi] > best[0] and bi != ai:
-            best = (float(f[bi]), ai, bi, None)
-    _frac, ai, bi, k = best
-    if ai is None:
-        return None
-    desc = {"type": "OR", "cell_a": int(addrs[cols[ai]]), "sid": int(sid_addr)}
-    cells = [desc["cell_a"]]
-    if bi is None:
-        desc["const"] = int(k)
-    else:
-        desc["cell_b"] = int(addrs[cols[bi]])
-        cells.append(desc["cell_b"])
-    attach_prelude(desc, s, ctx, cells)
-    recon = ir.evaluate(ir.to_ir(desc), n, ctx.sampler)
-    desc["residual"] = float(np.mean(recon == s))
-    return desc
 
 
 # -- event/state correlation ----------------------------------------------
