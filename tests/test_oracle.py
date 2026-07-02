@@ -13,7 +13,7 @@ import pytest
 
 from preframr_playroutine import Trace
 
-from _minisid import build_psid
+from _minisid import build_ioprobe_psid, build_psid
 
 SIDTRACE = shutil.which("sidtrace") or "/usr/local/bin/sidtrace"
 HAVE_SIDTRACE = os.path.exists(SIDTRACE)
@@ -21,16 +21,20 @@ HAVE_SIDTRACE = os.path.exists(SIDTRACE)
 pytestmark = pytest.mark.skipif(not HAVE_SIDTRACE, reason="sidtrace binary not available")
 
 
-def _run(tmp_path, speed, seconds=2.0):
-    sid = tmp_path / "mini.sid"
-    sid.write_bytes(build_psid(speed=speed))
-    prefix = str(tmp_path / "mini")
+def _trace(tmp_path, sid_bytes, name="mini", seconds=2.0, extra=()):
+    sid = tmp_path / f"{name}.sid"
+    sid.write_bytes(sid_bytes)
+    prefix = str(tmp_path / name)
     subprocess.run(
-        [SIDTRACE, "--seconds", str(seconds), "--out", prefix, str(sid)],
+        [SIDTRACE, "--seconds", str(seconds), "--out", prefix, *extra, str(sid)],
         check=True,
         capture_output=True,
     )
-    return Trace.load(prefix)
+    return prefix
+
+
+def _run(tmp_path, speed, seconds=2.0):
+    return Trace.load(_trace(tmp_path, build_psid(speed=speed), seconds=seconds))
 
 
 def test_vbi_oracle(tmp_path):
@@ -112,6 +116,63 @@ def test_v2_artifacts_present(tmp_path):
     pc_col = trace.sid_write_pc()
     assert len(pc_col) == len(trace.sid_writes())
     assert np.any(pc_col != 0)
+
+
+def test_io_probe(tmp_path):
+    trace = Trace.load(_trace(tmp_path, build_ioprobe_psid(), name="probe"))
+    iord = trace.io_reads()
+    assert len(iord) > 0
+    read_addrs = set(iord["addr"].tolist())
+    assert {0xD41B, 0xDC04, 0xD020} <= read_addrs
+    # The noise oscillator moves: osc3 readbacks are not constant.
+    osc3 = iord[iord["addr"] == 0xD41B]
+    assert len(np.unique(osc3["value"])) >= 2
+    write_addrs = set(trace.io_writes()["addr"].tolist())
+    assert {0xD020, 0xD402} <= write_addrs
+    # osc3 -> PW-lo copy: each $D402 SID write equals the value of the nearest
+    # preceding $D41B read (the chip-node ground truth).
+    pw = trace.sid_writes()
+    pw = pw[pw["addr"] == 0xD402]
+    assert len(pw) > 0
+    idx = np.searchsorted(osc3["cycle"], pw["cycle"], side="left") - 1
+    assert np.all(idx >= 0)
+    assert np.array_equal(pw["value"], osc3["value"][idx])
+
+
+def test_io_logs_deterministic(tmp_path):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    pa = _trace(a, build_ioprobe_psid(), name="probe")
+    pb = _trace(b, build_ioprobe_psid(), name="probe")
+    for suffix in (".bin", ".ramwr.bin", ".cov.bin", ".ram", ".iord.bin", ".iowr.bin"):
+        with open(pa + suffix, "rb") as fa, open(pb + suffix, "rb") as fb:
+            assert fa.read() == fb.read(), suffix
+
+
+def test_ram_log_purity(tmp_path):
+    # Byte-identity contract: default flags keep I/O and stack out of the RAM log.
+    trace = _run(tmp_path, speed=0)
+    addrs = trace.ram_writes()["addr"]
+    assert len(addrs) > 0
+    assert not np.any((addrs & 0xF000) == 0xD000)
+    assert not np.any((addrs & 0xFF00) == 0x0100)
+
+
+def test_stack_flag(tmp_path):
+    default_prefix = _trace(tmp_path, build_psid(speed=0), name="default")
+    plain_prefix = _trace(tmp_path, build_psid(speed=0), name="plain")
+    stack_prefix = _trace(tmp_path, build_psid(speed=0), name="stack", extra=("--stack",))
+    stack_addrs = Trace.load(stack_prefix).ram_writes()["addr"]
+    assert np.any((stack_addrs & 0xFF00) == 0x0100)
+    plain_addrs = Trace.load(plain_prefix).ram_writes()["addr"]
+    assert not np.any((plain_addrs & 0xFF00) == 0x0100)
+    with (
+        open(plain_prefix + ".ramwr.bin", "rb") as fa,
+        open(default_prefix + ".ramwr.bin", "rb") as fb,
+    ):
+        assert fa.read() == fb.read()
 
 
 def test_v2_analyze_classifies(tmp_path):
