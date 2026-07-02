@@ -17,7 +17,8 @@ Node schemas (plain dicts; numpy arrays allowed as values)::
     {"op":"seq", "frames":[...], "values":[...]}
     {"op":"cell", "addr":int, "sample":"write"|"eof"|"operand", "sid":int}
     {"op":"lohi", "lo":node, "hi":node}
-    {"op":"table", "data":uint8[], "index":node, "stride":int, "offset":int}
+    {"op":"table", "data":uint8[], "index":node, "stride":int, "offset":int,
+     "index_mask":int|None}   # table[(idx & index_mask)*stride + offset]
     {"op":"binop", "fn":"or"|"and"|"xor"|"add"|"sub", "a":node, "b":node}
     {"op":"recur", ...}    # every BACC field; ports _recon_bacc_full (incl tickband)
     {"op":"cutoff", ...}   # every CUTOFF field; ports _recon_cutoff
@@ -202,12 +203,59 @@ def _recon_product(desc, n, sampler=None) -> np.ndarray:
     return out
 
 
+def _recon_phase(desc, n, sampler=None) -> np.ndarray:
+    """Regenerate a boundary-folded sweep phase-locked to a GLOBAL frame counter.
+
+    The Commando-class reflected triangle (Hubbard): the register value is a pure
+    function of a free-running global counter (``index``, +k/frame, NO note resets)
+    folded through a boundary -- ``value = fold(seed + step * counter)``. Because
+    the phase comes from the global counter (not a per-note tick), it stays correct
+    across gaps where another mux arm drives the register, which a per-segment
+    reseeded recurrence cannot reproduce.
+    """
+    if n <= 0:
+        return np.zeros(max(0, n), dtype=np.int64)
+    lo, hi = int(desc["lo"]), int(desc["hi"])
+    step = int(desc.get("step", 1))
+    seeds = desc.get("seeds") or [desc.get("seed", 0)]
+    seed = int(desc.get("seed", seeds[0]))
+    boundary = desc.get("boundary", "reflect")
+    tick = _global_tick(desc, n, sampler)
+    if tick is None:
+        tick = np.arange(n, dtype=np.int64)
+    return phase_fold(lo, hi, step, seed, boundary, tick)
+
+
+def phase_fold(lo, hi, step, seed, boundary, tick) -> np.ndarray:
+    """Pure ``value = fold(seed + step*tick)`` over ``[lo, hi]`` (see _recon_phase).
+
+    The single source of truth shared by :func:`_recon_phase` and the recover-side
+    phase fitter (``recover._fit_phase``), so ground truth and recovery cannot drift.
+    """
+    lo, hi, step, seed = int(lo), int(hi), int(step), int(seed)
+    span = hi - lo
+    t = np.asarray(tick, dtype=np.int64)
+    if span <= 0:
+        return np.full(len(t), lo, dtype=np.int64)
+    phase = seed + step * t
+    if boundary == "wrap":
+        mod = span + step if step > 0 else span + 1
+        return lo + np.mod(phase, max(1, mod))
+    if boundary == "saw":
+        return lo + np.mod(phase, span + 1)
+    period = 2 * span
+    p = np.mod(phase, period)
+    return lo + np.where(p <= span, p, period - p)
+
+
 def _recon_bacc_full(desc, n, sampler=None) -> np.ndarray:
     """Regenerate the full (8- or 16-bit) accumulator series from its descriptor."""
     if desc.get("mode") == "tickband":
         return _recon_tickband(desc, n, sampler)
     if desc.get("mode") == "product":
         return _recon_product(desc, n, sampler)
+    if desc.get("mode") == "phase":
+        return _recon_phase(desc, n, sampler)
     resets = list(desc.get("resets", [0]))
     seeds = list(desc.get("seeds", [desc.get("phase", desc.get("lo", 0))]))
     if not resets or resets[0] != 0:
@@ -510,6 +558,13 @@ def _resolve_index(index, n, sampler, voice=None) -> np.ndarray:
 def _ev_table(node, n, sampler):
     table = np.asarray(node["data"], dtype=np.int64)
     index = _resolve_index(node["index"], n, sampler, node.get("voice"))
+    imask = node.get("index_mask")
+    if imask is not None:
+        # Mask the resolved index before the lookup (``table[idx & mask]``): a
+        # captured cell (AMIB's LFSR/melody state -- CAPTURED DATA, never fit) used
+        # as a table cursor via ``$F7[cell & 7]``. The lookup is the generator; the
+        # masked cell stays an ordinary captured input.
+        index = index & int(imask)
     idx = np.clip(index * int(node["stride"]) + int(node["offset"]), 0, len(table) - 1)
     return table[idx]
 
@@ -898,6 +953,7 @@ def _table_walk_ir(d):
         "index": idx,
         "stride": int(d.get("stride", 1)),
         "offset": int(d.get("cursor_offset", 0)),
+        "index_mask": None if d.get("index_mask") is None else int(d["index_mask"]),
     }
     if d.get("gate_addr") is not None:
         second = {"op": "cell", "addr": d["gate_addr"], "sample": "eof", "sid": d.get("addr")}

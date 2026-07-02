@@ -1758,12 +1758,88 @@ def _propose_seq(series, sid_addr, reg_off, on_frames, wr, ctx):
     return [_finish_seq(desc, series)]
 
 
+def _phase_source(ctx):
+    """``(counter_series, index_id)`` for the song's global frame counter, or None.
+
+    The global counter latent (:func:`_global_counter`) is a cell advancing +k
+    every frame with NO note resets; ``index_id`` is its address (or ``"frame"``
+    for the synthesized frame index) -- the ``recur`` phase source for a
+    Commando-class reflected triangle.
+    """
+    g = ctx.latents.get("global") if ctx.latents else None
+    if not g:
+        return None
+    addr = g.get("counter_addr")
+    if addr is None:
+        return np.arange(ctx.n_frames, dtype=np.int64), "frame"
+    if ctx.sampler is None:
+        return None
+    return ctx.sampler.eof(int(addr)).astype(np.int64), int(addr)
+
+
+def _fit_phase(series, counter, index_id, max_step: int = 8):
+    """Fit ``value = fold(seed + step*counter)`` phase-locked to a global counter.
+
+    Searches boundary x step with an analytically-solved phase ``seed`` (both
+    reflect branches), scoring against the exact global-counter series. Returns a
+    ``phase``-mode BACC descriptor (index = the counter) or ``None``. The generator
+    is the fold; the counter is a derivable global index (cheap in MDL), never
+    replayed per-frame modulation.
+    """
+    s = np.asarray(series, dtype=np.int64).ravel()
+    c = np.asarray(counter, dtype=np.int64).ravel()
+    n = len(s)
+    if n < 8 or len(c) != n:
+        return None
+    lo, hi = int(s.min()), int(s.max())
+    span = hi - lo
+    if span < 2 or len(np.unique(s)) < 3:
+        return None
+    best_res, best = -1.0, None
+    for boundary in ("reflect", "saw", "wrap"):
+        period = 2 * span if boundary == "reflect" else (span + 1)
+        base = int(s[0] - lo)
+        branches = [base] + ([period - base] if boundary == "reflect" else [])
+        for step in range(1, max_step + 1):
+            for br in branches:
+                seed = int((br - step * int(c[0])) % period)
+                recon = ir.phase_fold(lo, hi, step, seed, boundary, c)
+                res = float(np.mean(recon == s))
+                if res > best_res:
+                    best_res = res
+                    best = {
+                        "type": "BACC",
+                        "mode": "phase",
+                        "lo": lo,
+                        "hi": hi,
+                        "step": int(step),
+                        "seed": int(seed),
+                        "seeds": [int(seed)],
+                        "resets": [0],
+                        "boundary": boundary,
+                        "index": index_id,
+                        "residual": res,
+                    }
+    if best is None or best_res < 0.95:
+        return None
+    return best
+
+
 def _propose_recurrence(trace, sid_addr, series, voice, reg_off, ctx):
     """BACC proposer: the bare recurrence, plus a captured-cell (+prelude) variant."""
+    out = []
+    src = _phase_source(ctx)
+    if src is not None:
+        phase = _fit_phase(np.asarray(series, dtype=np.int64), src[0], src[1])
+        if phase is not None:
+            phase["addr"] = int(sid_addr)
+            phase["width"] = 8
+            phase["byte_role"] = "full"
+            out.append(phase)
     bacc = _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx)
     if bacc is None:
-        return []
-    out = [dict(bacc)]
+        return out
+    out.append(dict(bacc))
     cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
     if cell is not None and frac >= 0.5:
         trial = dict(bacc)
@@ -1820,6 +1896,120 @@ def _propose_table_walk(series, wr, ctx, sid_addr):
         recover_overrides(cand, series, ctx, sid_addr=sid_addr)
         out.append(cand)
     return out
+
+
+def _pow2_mask(span: int) -> int:
+    """Smallest ``2**k - 1`` mask able to index a ``span``-length table."""
+    m = 1
+    while m < span:
+        m <<= 1
+    return m - 1
+
+
+def _find_table_in_image(ram, tab, gate, present=None):
+    """First image offset where a contiguous window equals ``tab`` (under ``gate``).
+
+    Grounds a masked-cursor lookup in a REAL RAM table rather than a table
+    fabricated from the data -- the anti-overfit gate for :func:`_masked_table_lookup`.
+    ``present`` (per-index bool) marks the table slots the data actually determined;
+    unobserved slots are wildcards in the match.
+    """
+    span = len(tab)
+    if ram is None or span == 0 or span > len(ram):
+        return None
+    r = ram.astype(np.int64) & int(gate)
+    t = np.asarray(tab, dtype=np.int64) & int(gate)
+    windows = np.lib.stride_tricks.sliding_window_view(r, span)
+    eq = windows == t[None, :]
+    if present is not None:
+        eq = eq | ~np.asarray(present, dtype=bool)[None, :]
+    pos = np.nonzero(np.all(eq, axis=1))[0]
+    return int(pos[0]) if len(pos) else None
+
+
+def _masked_table_lookup(series, ctx, sid_addr, masks=(3, 7, 15, 31), max_cols: int = 96):
+    """Masked captured-cell table lookup: ``register = table[(cell & mask)]``.
+
+    The AMIB bass idiom ``$F7[cell & 7]``: a captured cell (the LFSR / melody
+    state -- CAPTURED DATA, replayed as an ordinary ``cell@eof`` input, NEVER fit
+    as a recurrence) masked to a small power-of-two range indexes a real RAM table.
+    Recovers the table from the (masked-cell -> register) mapping, then REQUIRES it
+    to exist in the RAM image (grounding the lookup) before adopting; the lookup is
+    the generator, the masked cell stays captured. Returns ``[TABLE_WALK]`` or ``[]``.
+    """
+    ss = ctx.stateseq
+    ram = ctx.ram
+    if ss.grid.shape[1] == 0 or ctx.sampler is None or ram is None:
+        return []
+    s = np.asarray(series, dtype=np.int64).ravel() & 0xFF
+    n = len(s)
+    if n < 8 or len(np.unique(s)) < 3:
+        return []
+    cols = list(ctx.candidate_cols(sid_addr))[:max_cols]
+    grid = ss.grid.astype(np.int64)
+    best, best_res = None, 0.98
+    for j in cols:
+        col = grid[:, j]
+        if int(col.max()) < 4 or len(np.unique(col)) < 3:
+            continue
+        for mask in masks:
+            # The mask must genuinely fold the cell (its range overflows the table);
+            # a cell already within ``[0, mask]`` is a plain cursor handled by
+            # ``_propose_table_walk`` -- masking it would only steal a legit walk.
+            if int(col.max()) <= mask:
+                continue
+            mv = col & mask
+            if len(np.unique(mv)) < 3:
+                continue
+            for gate in (0xFF, 0xFE):
+                res, tab, present = _mask_table_from_data(mv, s & gate, mask + 1, n)
+                if res <= best_res:
+                    continue
+                base = _find_table_in_image(ram, tab, gate, present)
+                if base is None:
+                    continue
+                img = ram[base : base + mask + 1].astype(np.int64)
+                fit = float(np.mean((img[np.clip(mv, 0, mask)] & gate) == (s & gate)))
+                if fit > best_res:
+                    best_res = fit
+                    best = (int(ss.addrs[j]), int(mask), int(gate), int(base))
+    if best is None:
+        return []
+    addr, mask, gate, base = best
+    desc = {
+        "type": "TABLE_WALK",
+        "base": base,
+        "stride": 1,
+        "length": int(mask + 1),
+        "loop": 0,
+        "table": ram[base : base + mask + 1].copy(),
+        "mask": int(gate),
+        "cursor_addr": addr,
+        "cursor_offset": 0,
+        "index_mask": mask,
+        "addr": int(sid_addr),
+        "overrides": [],
+        "residual": float(best_res),
+    }
+    _recover_gate(desc, series, ctx, sid_addr)
+    recover_overrides(desc, series, ctx, sid_addr=sid_addr)
+    return [desc]
+
+
+def _mask_table_from_data(mv, sg, span, n):
+    """(coverage, table, present) recovering ``table[m]`` = modal value per index ``m``.
+
+    Coverage is the fraction of frames the deterministic ``(cell & mask) -> value``
+    mapping explains; a genuine lookup is near-deterministic (coverage ~ 1), a
+    coincidence is not -- so the caller's high floor rejects fabricated tables.
+    Vectorized via one ``(span, 256)`` joint histogram (no per-index python loop):
+    ``present`` marks the indices the data actually observed.
+    """
+    hist = np.bincount(mv * 256 + sg, minlength=span * 256).reshape(span, 256)
+    tab = hist.argmax(axis=1).astype(np.int64)
+    matched = int(hist.max(axis=1).sum())
+    present = hist.sum(axis=1) > 0
+    return matched / max(1, n), tab, present
 
 
 def _annotate_cursor_latent(desc, ctx, sid_addr):
@@ -1911,10 +2101,12 @@ def _register_proposals(trace, sid_addr, series, wr, pcs, voice, reg_off, on_fra
         cands += _propose_pitchwalk(trace, sid_addr, reg_off, ctx)
         cands += _propose_composite(trace, sid_addr, series, ctx, reg_off)
         cands += _propose_recurrence(trace, sid_addr, series, voice, reg_off, ctx)
+        cands += _masked_table_lookup(series, ctx, sid_addr)
         cands += _propose_feeder(series, sid_addr, ctx)
     else:
         cands += _propose_recurrence(trace, sid_addr, series, voice, reg_off, ctx)
         cands += _propose_table_walk(series, wr, ctx, sid_addr)
+        cands += _masked_table_lookup(series, ctx, sid_addr)
         cands += _propose_composite(trace, sid_addr, series, ctx, reg_off)
         cands += _propose_binop(sid_addr, series, ctx)
         cands += _propose_seq(series, sid_addr, reg_off, on_frames, wr, ctx)

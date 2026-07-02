@@ -339,6 +339,42 @@ def program_series(rows, seed, n):
     return out
 
 
+def phase_triangle_series(counter, lo, hi, step, seed, boundary="reflect"):
+    """Reference for ``ir.phase_fold``: ``value = fold(seed + step*counter)``.
+
+    A deliberately INDEPENDENT (scalar-loop) reimplementation of the phase-locked
+    boundary fold so the global-frame-counter recur test builds ground truth here
+    and recovers it in ``recover._fit_phase`` -- a bug in one is not masked by the
+    other. ``boundary`` in {reflect, saw, wrap}; ``counter`` is the global
+    +k/frame phase source (Commando-class reflected triangle)."""
+    c = np.asarray(counter, dtype=np.int64)
+    span = int(hi - lo)
+    out = np.empty(len(c), dtype=np.int64)
+    for i, cv in enumerate(c):
+        phase = int(seed) + int(step) * int(cv)
+        if boundary == "wrap":
+            mod = span + int(step) if step > 0 else span + 1
+            out[i] = lo + phase % max(1, mod)
+        elif boundary == "saw":
+            out[i] = lo + phase % (span + 1)
+        else:
+            period = 2 * span
+            p = phase % period
+            out[i] = lo + (p if p <= span else period - p)
+    return out
+
+
+def masked_lookup_series(cell_vals, table, mask):
+    """Reference for a masked captured-cell table lookup: ``table[cell & mask]``.
+
+    The AMIB bass idiom ``$F7[cell & 7]`` -- the captured cell (LFSR / melody
+    state) masked to the table span. Independent of ``recover._masked_table_lookup``
+    (which recovers this shape from the trace)."""
+    c = np.asarray(cell_vals, dtype=np.int64) & int(mask)
+    t = np.asarray(table, dtype=np.int64)
+    return t[np.clip(c, 0, len(t) - 1)]
+
+
 def recur_series(  # pylint: disable=too-many-arguments
     lo,
     hi,

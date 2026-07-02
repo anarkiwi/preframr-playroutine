@@ -2452,6 +2452,102 @@ def test_product_divide_table_step(seed):
     _assert_product_roundtrip(desc, series)
 
 
+# -- Phase 6d: index sources + predicate masks -----------------------------
+
+
+@pytest.mark.parametrize(
+    "step,lo,hi,period,boundary",
+    [
+        (1, 0, 30, 40, "reflect"),
+        (1, 4, 20, 24, "reflect"),
+        (1, 0, 15, 24, "saw"),
+    ],
+)
+def test_phase_recur_global_counter(step, lo, hi, period, boundary):
+    # Commando-class reflected triangle phase-locked to a GLOBAL frame counter
+    # (+k/frame, NO note resets). The counter WRAPS out of phase with the fold, so
+    # a per-frame reseeded recurrence cannot reproduce the wrap-induced jump -- only
+    # the global-counter phase source recovers it byte-exactly.
+    from _minisid import phase_triangle_series
+    from preframr_playroutine import ir
+    from preframr_playroutine.recover import _build_context
+
+    n = 200
+    counter = (np.arange(n, dtype=np.int64)) % period
+    reg = phase_triangle_series(counter, lo, hi, step, 0, boundary)
+    counter_cell = 0x40
+    recs, ramwr = [], []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, counter_cell, int(counter[i])))
+        recs.append(
+            _ev(tick + 12, SID_WRITE, reg=0, value=int(reg[i]) & 0xFF, addr=0xD400, aux=0x1500)
+        )
+    trace = _build_trace(recs, ram_writes=ramwr)
+    res = classify_register(trace, 0xD400)
+    assert res["type"] == "BACC" and res.get("mode") == "phase", res
+    assert res["index"] == counter_cell, res
+    assert res["boundary"] == boundary, res
+    ctx = _build_context(trace)
+    recon = ir.evaluate(ir.to_ir(res), n, ctx.sampler)
+    assert np.array_equal(recon, reg)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_masked_table_lookup_recovers_index_mask(seed):
+    # AMIB bass ``$F7[cell & 7]``: a captured cell (LFSR / melody state -- CAPTURED
+    # DATA) masked to a real 8-byte RAM table is the generator. Recovery must ground
+    # the lookup in the image, keep the cell as an ordinary captured input, and
+    # NEVER fit the cell as a recurrence. Randomized table + cell stream per seed.
+    from _minisid import masked_lookup_series
+
+    rng = np.random.default_rng(seed)
+    n = 160
+    table = rng.choice(np.arange(1, 250), size=8, replace=False).astype(np.uint8)
+    cell = rng.integers(0, 256, size=n).astype(np.int64)  # LFSR-like captured data
+    reg = masked_lookup_series(cell, table, 7)
+    base = 0x00F7
+    ram = np.zeros(65536, dtype=np.uint8)
+    ram[base : base + 8] = table
+    cell_addr = 0x14
+    recs, ramwr = [], []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        ramwr.append(_ra(tick + 4, cell_addr, int(cell[i])))
+        recs.append(
+            _ev(tick + 12, SID_WRITE, reg=0, value=int(reg[i]) & 0xFF, addr=0xD400, aux=0x1500)
+        )
+    trace = _build_trace(recs, ram_writes=ramwr, ram=ram)
+    res = classify_register(trace, 0xD400)
+    assert res["type"] == "TABLE_WALK", res
+    assert res["index_mask"] == 7, res
+    assert res["cursor_addr"] == cell_addr, res
+    assert res["base"] == base, res
+    assert np.array_equal(res["table"], table)
+
+
+def test_find_override_mask_predicate():
+    # The AMIB rhythm gate ``(ctr & $30) == 0`` where ``ctr`` is an ordinary
+    # counter: _find_override must build a MULTI-BIT mask-equality term (mask read
+    # off the cell's distinct-value structure, not a 256-mask brute force), and
+    # _apply_overrides must evaluate it.
+    from preframr_playroutine.recover import _find_override, _apply_overrides
+
+    n = 256
+    ctr = np.arange(n, dtype=np.int64) & 0xFF
+    forced = (ctr & 0x30) == 0
+    ctx = _ctx_with_cells({0x40: ctr})
+    terms = _find_override(forced, ctx)
+    assert terms is not None
+    assert any(t["kind"] == "mask" and t["mask"] == 0x30 and t["value"] == 0 for t in terms), terms
+    applied = _apply_overrides(
+        np.zeros(n, dtype=np.int64), [{"predicate": terms, "force": 0x99}], ctx.sampler
+    )
+    assert np.array_equal(applied == 0x99, forced)
+
+
 # -- unified binop proposer (add / sub / or / and / xor) -------------------
 
 
