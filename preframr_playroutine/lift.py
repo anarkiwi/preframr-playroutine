@@ -155,6 +155,7 @@ _STORE_REG = {"STA": "A", "STX": "X", "STY": "Y"}
 _LOAD_REG = {"LDA": "A", "LDX": "X", "LDY": "Y"}
 
 _MAX_INSTRS = 24  # bounded backward slice / per-path budget
+_MAX_STEPS = 512  # shared total-step budget across all forked branch paths
 _TABLE_SPAN = 256
 
 # Opcodes whose operand reads a value into the dataflow cone (Tier-3 witness).
@@ -255,6 +256,7 @@ class _Slicer:
         self.covered = covered
         self.sid = sid
         self.is_smc = is_smc
+        self._steps = [_MAX_STEPS]
 
     # -- operand grounding -------------------------------------------------
 
@@ -399,6 +401,10 @@ class _Slicer:
             "stack": [],
             "mem": {},
         }
+        # A shared total-step budget across all forked branch paths bounds the worst
+        # case (2^branches) so complex real-player code fails closed fast, keeping
+        # the per-tune analyze well under the CPU budget.
+        self._steps = [_MAX_STEPS]
         return self._exec(start_pc, store_pc, state, _MAX_INSTRS)
 
     def _load_mem(self, ins, state):
@@ -412,6 +418,9 @@ class _Slicer:
     def _exec(self, pc, store_pc, state, budget):  # pylint: disable=too-many-branches
         while budget > 0:
             budget -= 1
+            self._steps[0] -= 1
+            if self._steps[0] <= 0:
+                raise _Fail("total step budget exhausted")
             if pc == store_pc:
                 ins = decode(self.image, pc)
                 if ins is None or ins.name not in _STORE_REG:
