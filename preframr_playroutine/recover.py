@@ -1307,16 +1307,25 @@ def _propose_table_walk(series, wr, ctx, sid_addr):
     if tw is None:
         return []
     # The masked search scores under its gate mask, so it can pick a mask that
-    # clears a bit the register in fact always sets (a constant-1 bit): harmless
-    # to the masked score, fatal to the reconstruction. Force every constant-1
-    # bit back into the mask so evaluated fidelity is not thrown away.
+    # clears a bit the register in fact always sets (harmless to the masked score,
+    # fatal to the reconstruction). Emit an extra candidate that keeps every
+    # constant-1 series bit in the mask; the arbiter's evaluated fidelity chooses,
+    # so a genuine gated table (bit truly toggles -> no constant-1 bit -> only the
+    # scanned mask) is untouched while a dropped constant bit is repaired.
     s = np.asarray(series, dtype=np.int64) & 0xFF
     const_one = int(np.bitwise_and.reduce(s)) if len(s) else 0
-    tw["mask"] = int(tw.get("mask", 0xFF)) | const_one
-    tw["addr"] = int(sid_addr)
-    _recover_gate(tw, series, ctx)
-    recover_overrides(tw, series, ctx)
-    return [tw]
+    base_mask = int(tw.get("mask", 0xFF))
+    out = []
+    for mask in {base_mask, base_mask | const_one}:
+        cand = dict(tw)
+        cand["mask"] = int(mask)
+        cand["addr"] = int(sid_addr)
+        cand.pop("gate_addr", None)
+        cand["overrides"] = []
+        _recover_gate(cand, series, ctx)
+        recover_overrides(cand, series, ctx)
+        out.append(cand)
+    return out
 
 
 def _propose_pairs(sid_addr, series, reg_off, ctx):
