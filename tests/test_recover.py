@@ -552,6 +552,57 @@ def test_classify_const():
     assert res["value"] == 0x0F
 
 
+def test_arbiter_report_keys():
+    # Every arbitrated register carries the MDL report keys.
+    values = (np.arange(120) * 2) % 64
+    trace = _trace_with_register(values, sid_addr=0xD400)
+    res = classify_register(trace, 0xD400)
+    assert res["type"] == "BACC"
+    for key in ("score", "complexity", "captured_frames"):
+        assert key in res, key
+    # A clean recurrence wins with no replayed captured state.
+    assert res["captured_frames"] == 0
+    assert res["score"] == pytest.approx(1.0 - 1e-3 * res["complexity"])
+
+
+def test_mdl_cost_latch_cheap_replay_expensive():
+    # A SEQ latch list (few changes) is far cheaper than a per-frame feeder cell
+    # replaying a stream that changes every frame -- the captured-state cost is
+    # charged per change, not per frame held.
+    from preframr_playroutine import ir  # noqa: PLC0415
+
+    n = 200
+
+    class _Sampler:
+        def eof(self, _addr):
+            return np.arange(n, dtype=np.int64)  # changes every frame
+
+        def at_write(self, _addr, _sid):
+            return np.arange(n, dtype=np.int64)
+
+        def operand(self, _addr, _sid):
+            return np.arange(n, dtype=np.int64)
+
+        def written_mask(self, _sid):
+            return np.ones(n, dtype=bool)
+
+    smp = _Sampler()
+    seq = {
+        "op": "post",
+        "addr": 0xD404,
+        "expr": {"op": "seq", "frames": [0, 100], "values": [1, 2]},
+    }
+    feeder = {
+        "op": "post",
+        "addr": 0xD404,
+        "expr": {"op": "cell", "addr": 0x40, "sample": "write", "sid": 0xD404},
+    }
+    cx_seq, cap_seq = ir.cost_captured(seq, smp, n)
+    cx_feeder, cap_feeder = ir.cost_captured(feeder, smp, n)
+    assert cap_seq == 0 and cap_feeder == n
+    assert cx_seq < cx_feeder
+
+
 def test_classify_bacc():
     values = (np.arange(120) * 2) % 64
     trace = _trace_with_register(values, sid_addr=0xD400)
@@ -1148,9 +1199,13 @@ def test_composite_freq_base_only_no_spurious_mod():
         )
     trace = _build_trace(recs, ram_writes=ramwr)
     res = analyze(trace)
-    assert res[0xD400]["type"] == "COMPOSITE"
-    assert res[0xD400]["mod"] is None
-    assert res[0xD401]["mod"] is None
+    # The operand cell already carries the whole FREQ (no override needed), so the
+    # arbiter's minimal exact model is the single captured cell -- a spurious
+    # additive modulation would only lower fidelity, so it is never grafted on.
+    # (Pre-Phase-2 the cascade fixed this as a base-only COMPOSITE; the MDL arbiter
+    # now prefers the simpler single-cell description, still exact.)
+    for addr in (0xD400, 0xD401):
+        assert res[addr].get("mod") is None
     rt = round_trip(trace)
     assert rt[0xD400] == 1.0
     assert rt[0xD401] == 1.0

@@ -331,6 +331,149 @@ def evaluate(node, n, sampler):
     return _EVAL[op](node, n, sampler)
 
 
+# -- MDL description-length cost (Phase 2 arbiter) -----------------------------
+#
+# ``complexity(tree)`` is the description length the arbiter trades against
+# fidelity: node count (~1 each), override/predicate terms (~1 each), and the
+# *captured-state* cost of every value-replay cell -- ``CAPTURED_W *
+# changed_frames(cell) / n_frames``. Charging per *change* (not per frame held)
+# is deliberate: event-latched song data (SEQ latches, note streams, generative
+# melody output) is captured by design and stays cheap, while a feeder replaying
+# per-frame modulation is expensive. Structured generators (``recur``,
+# ``cutoff``) and derivable table indices/cursors carry only a small parameter
+# cost, so on equal fidelity the arbiter prefers a closed form over raw replay --
+# reproducing the old cascade's structured-first ordering. ``CAPTURED_W`` is
+# calibrated (up from the nominal 0.5) so a fully-modulated replay cell outweighs
+# a structured tree's node count; the calibration test pins this on the perfect
+# set.
+CAPTURED_W = 8.0
+INDEX_COST = 0.2  # a derivable cursor/index cell (not replayed modulation)
+PARAM_COST = 0.1  # a closed-form generator parameter (recur seed, cutoff cell)
+# A SEQ/prelude latch is captured event data charged *per latch* (absolute, not
+# per frame held) so event-latched song data stays cheap, yet a structured
+# generator that actually fits (recur/table walk) still wins the arbiter over a
+# latch list replaying its output. Modest, so genuine sparse latches stay cheaper
+# than a per-frame feeder.
+LATCH_COST = 2.0
+
+
+def _changed_frames(series) -> int:
+    """Number of value changes (+1) in a sampled cell series -- its latch count."""
+    s = np.asarray(series, dtype=np.int64).ravel()
+    if len(s) == 0:
+        return 0
+    return int(np.count_nonzero(np.diff(s) != 0)) + 1
+
+
+def _cell_changed(node, sampler, n) -> int:
+    """Changed-frame (latch) count of a ``cell`` node's sampled series."""
+    if sampler is None or not n:
+        return 0
+    return _changed_frames(_ev_cell(node, n, sampler))
+
+
+def _index_cost(node) -> float:
+    """Cost of a derivable table index/cursor subtree (nodes only, no capture)."""
+    if node is None:
+        return 0.0
+    op = node["op"]
+    if op == "cell":
+        return 1.0 + INDEX_COST
+    if op == "binop":
+        return 1.0 + _index_cost(node["a"]) + _index_cost(node["b"])
+    if op == "lohi":
+        return 1.0 + _index_cost(node["lo"]) + _index_cost(node["hi"])
+    if op == "table":
+        return 1.0 + _index_cost(node["index"])
+    return 1.0
+
+
+def _cc_post(node, sampler, n):
+    cost, cap = _cost_captured(node["expr"], sampler, n)
+    cost += 1.0
+    for ov in node.get("overrides", []):
+        cost += 1.0 + sum(1 for _ in _predicate_terms(ov.get("predicate", [])))
+    prelude = node.get("prelude")
+    if prelude and prelude.get("end"):
+        cost += LATCH_COST * len(prelude.get("values", [0]))
+    return cost, cap
+
+
+def _cc_seq(node, _sampler, _n):
+    return 1.0 + LATCH_COST * len(node.get("values", [])), 0
+
+
+def _cc_literal(node, _sampler, n):
+    cf = _changed_frames(node["data"])
+    return 1.0 + CAPTURED_W * cf / max(1, n or len(node["data"]) or 1), cf
+
+
+def _cc_cell(node, sampler, n):
+    cf = _cell_changed(node, sampler, n)
+    return 1.0 + CAPTURED_W * cf / max(1, n or 1), cf
+
+
+def _cc_lohi(node, sampler, n):
+    cl, capl = _cost_captured(node["lo"], sampler, n)
+    ch, caph = _cost_captured(node["hi"], sampler, n)
+    return 1.0 + cl + ch, capl + caph
+
+
+def _cc_binop(node, sampler, n):
+    ca, capa = _cost_captured(node["a"], sampler, n)
+    cb, capb = _cost_captured(node["b"], sampler, n)
+    return 1.0 + ca + cb, capa + capb
+
+
+def _cc_table(node, _sampler, _n):
+    return 1.0 + _index_cost(node["index"]), 0
+
+
+def _cc_recur(node, _sampler, _n):
+    return 1.0 + PARAM_COST * (len(node.get("seeds", [])) + len(node.get("resets", []))), 0
+
+
+def _cc_cutoff(node, _sampler, _n):
+    return 1.0 + PARAM_COST * len(node.get("cells", {})), 0
+
+
+_COST = {
+    "post": _cc_post,
+    "const": lambda node, _s, _n: (1.0, 0),
+    "seq": _cc_seq,
+    "literal": _cc_literal,
+    "cell": _cc_cell,
+    "lohi": _cc_lohi,
+    "binop": _cc_binop,
+    "table": _cc_table,
+    "recur": _cc_recur,
+    "cutoff": _cc_cutoff,
+}
+
+
+def _cost_captured(node, sampler, n):
+    """(description-length cost, captured-frame total) of a node tree."""
+    if node is None:
+        return 0.0, 0
+    handler = _COST.get(node["op"])
+    return handler(node, sampler, n) if handler else (1.0, 0)
+
+
+def cost_captured(node, sampler=None, n_frames=None):
+    """``(complexity, captured_frames)`` of a node tree in a single pass."""
+    return _cost_captured(node, sampler, n_frames)
+
+
+def complexity(node, sampler=None, n_frames=None) -> float:
+    """MDL description-length cost of a node tree (see module note)."""
+    return _cost_captured(node, sampler, n_frames)[0]
+
+
+def captured_frames(node, sampler=None, n_frames=None) -> int:
+    """Total captured (replayed) latch-frames referenced by a node tree."""
+    return _cost_captured(node, sampler, n_frames)[1]
+
+
 def _eval_post(node, n, sampler):
     """Apply the fixed post-pipeline: mask, byte extract, overrides, prelude, default."""
     v = evaluate(node["expr"], n, sampler)

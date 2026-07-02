@@ -38,6 +38,15 @@ try:
 except (OSError, ValueError):
     _SNAPSHOT = {}
 
+_CLASS_SNAPSHOT_PATH = os.path.join(
+    os.path.dirname(__file__), "fixtures", "classification_snapshot.json"
+)
+try:
+    with open(_CLASS_SNAPSHOT_PATH, encoding="utf-8") as _fh:
+        _CLASS_SNAPSHOT = json.load(_fh)
+except (OSError, ValueError):
+    _CLASS_SNAPSHOT = {}
+
 if not CATALOG:
     pytest.skip("tests/fixtures/tunes.json missing", allow_module_level=True)
 if not HAVE_SIDTRACE:
@@ -109,7 +118,10 @@ def _assert_register_classes(entry, trace, result):
 
     if family == "DMC":
         # dmc-generators.md: AD/SR per-note SEQ; PW 16-bit up/down BACC; CTRL a
-        # waveform table walk (AND-ed with the gate mask). A sustained voice can
+        # waveform table walk (AND-ed with the gate mask). The MDL arbiter may
+        # express that gated waveform directly as the documented ``chnwave AND
+        # chngate`` fold (an ``AND`` descriptor) when it reconstructs at least as
+        # well -- both are the same gated-waveform generator. A sustained voice can
         # be a 1-entry waveform loop, presenting as a CONST CTRL -- allow it, but
         # require at least one active voice to recover as a real TABLE_WALK. The
         # whole-song fixture renders without --reads, so this exercises the
@@ -120,7 +132,7 @@ def _assert_register_classes(entry, trace, result):
             assert t == "BACC", (hex(addr), t)
         ctrl_types = _types(result, _CTRL)
         for addr, t in ctrl_types.items():
-            assert t in ("TABLE_WALK", "CONST"), (hex(addr), t)
+            assert t in ("TABLE_WALK", "AND", "CONST"), (hex(addr), t)
         assert "TABLE_WALK" in ctrl_types.values(), ctrl_types
         for addr in _AD + _SR + _PW + _CTRL:
             assert fid[addr] >= 0.99, (hex(addr), result[addr]["type"], fid[addr])
@@ -209,6 +221,32 @@ def test_real_tune_perfect(entry, tmp_path_factory):
 
     assert not xstate, [hex(a) for a in xstate]
     assert rt["overall"] == 1.0, (rt["overall"], rt["unmodeled"][:4])
+
+
+_PERFECT_ENTRIES = [e for e in CATALOG if _key(e) in _PERFECT]
+
+
+@pytest.mark.parametrize("entry", _PERFECT_ENTRIES, ids=[_ids(e) for e in _PERFECT_ENTRIES])
+def test_arbiter_calibration(entry, tmp_path_factory):
+    """Phase-2 calibration: on the perfect set the MDL arbiter's winning
+    descriptor type per register is UNCHANGED vs the pre-Phase-2 cascade
+    (recorded in classification_snapshot.json). This pins that LAMBDA / CAPTURED_W
+    reproduce the hand-ordered priors on known-good tunes. Absent key (committed
+    empty snapshot) -> skip, so CI stays green until the snapshot is populated in
+    the Docker/HVSC environment, exactly like the fidelity ratchet.
+    """
+    snap = _CLASS_SNAPSHOT.get(_ids(entry))
+    if snap is None:
+        pytest.skip("classification snapshot not populated")
+    if not fetchable(entry):
+        pytest.skip(f"tune not fetchable: {entry['path']}")
+    work = tmp_path_factory.mktemp("hvsc")
+    _sid, _prefix, trace = _render(entry, work)
+    result = analyze(trace)
+    for reg, expected in snap.get("regs", {}).items():
+        addr = int(reg, 16)
+        got = result.get(addr, {}).get("type")
+        assert got == expected, (reg, got, expected)
 
 
 @pytest.mark.parametrize("entry", _ANCHORS, ids=[_ids(e) for e in _ANCHORS])
