@@ -1577,6 +1577,7 @@ _PRIORITY = (
     "OR",
     "ADD",
     "SUB",
+    "SELECT",
     "SEQ",
     "FEEDER",
     "XSTATE",
@@ -1793,27 +1794,44 @@ def _arbitrate(cands, series, sid_addr, ctx, base):
     winner carries ``score``/``complexity``/``captured_frames`` for the report.
     """
     s = np.asarray(series, dtype=np.int64)
-    n = ctx.n_frames
-    best, best_key = None, None
-    for cand in cands:
-        if cand is None:
-            continue
-        cand = dict(cand)
-        cand["addr"] = int(sid_addr)
-        tree = ir.to_ir(cand)
-        recon = ir.evaluate(tree, n, ctx.sampler)
-        fid = 1.0 if not n else (0.0 if recon is None else float(np.mean(recon == s)))
-        cx, cap = ir.cost_captured(tree, ctx.sampler, n)
-        cand["complexity"] = round(cx, 4)
-        cand["captured_frames"] = int(cap)
-        cand["score"] = round(fid - _LAMBDA * cx, 6)
-        key = (fid, -cx, -_type_priority(cand.get("type", "")))
+    scored = [_score_candidate(cand, s, sid_addr, ctx) for cand in cands]
+    scored = [e for e in scored if e is not None]
+    scored += [
+        _score_candidate(sel, s, sid_addr, ctx) for sel in propose_select(scored, s, sid_addr, ctx)
+    ]
+    scored = [e for e in scored if e is not None]
+    best = None
+    best_key = None
+    for cand, _tree, _recon, key in scored:
         if best_key is None or key > best_key:
             best, best_key = cand, key
     result = dict(base)
     if best is not None:
         result.update(best)
     return result
+
+
+def _score_candidate(cand, s, sid_addr, ctx):
+    """Score one candidate descriptor: ``(cand, tree, recon, sort_key)`` or ``None``.
+
+    Annotates the descriptor with ``score``/``complexity``/``captured_frames`` and
+    returns its reconstruction so the arbiter (and :func:`propose_select`) can
+    reuse the fidelity/correct-frame sets without re-evaluating.
+    """
+    if cand is None:
+        return None
+    n = ctx.n_frames
+    cand = dict(cand)
+    cand["addr"] = int(sid_addr)
+    tree = ir.to_ir(cand)
+    recon = ir.evaluate(tree, n, ctx.sampler)
+    fid = 1.0 if not n else (0.0 if recon is None else float(np.mean(recon == s)))
+    cx, cap = ir.cost_captured(tree, ctx.sampler, n)
+    cand["complexity"] = round(cx, 4)
+    cand["captured_frames"] = int(cap)
+    cand["score"] = round(fid - _LAMBDA * cx, 6)
+    key = (fid, -cx, -_type_priority(cand.get("type", "")))
+    return cand, tree, recon, key
 
 
 def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx=None) -> dict:
@@ -2018,6 +2036,63 @@ def _best_feeder_at_write(series, sid_addr, ctx):
     return best_addr, best_recon, best_frac
 
 
+def _candidate_terms(forced, ctx, sid_addr=None, max_set: int = 6):
+    """Typed cell-predicate terms true on every ``forced`` frame (recall 1.0).
+
+    Returns ``[(pred_bool_array, term_dict), ...]`` over the read-log-narrowed
+    candidate cells: full-byte equality (``eq``), single-bit tests (``bit``),
+    small value-membership (``in``), and a multi-bit **mask-equality** term
+    (``mask``) whose mask is the set of bits that stay constant across the forced
+    frames (< 8 of them, i.e. a genuine multi-bit tap such as ``(ctr & $30) ==
+    0``). The mask is read off the cell's distinct-value structure -- never a
+    256-mask brute force. Shared by :func:`_find_override` and
+    :func:`propose_select`.
+    """
+    grid = ctx.stateseq.grid.astype(np.int64)
+    addrs = ctx.stateseq.addrs
+    cands = []
+    for j in ctx.candidate_cols(sid_addr):
+        col = grid[:, j]
+        fc = col[forced]
+        if len(fc) == 0:
+            continue
+        cell = int(addrs[j])
+        uniq = np.unique(fc)
+        if len(uniq) == 1:
+            cands.append((col == int(uniq[0]), {"kind": "eq", "cell": cell, "value": int(uniq[0])}))
+        elif 2 <= len(uniq) <= max_set and len(uniq) < len(np.unique(col)):
+            # A force gated by the cell holding one of a few states (recall 1.0 by
+            # construction); the greedy precision/strict-improvement gating below
+            # rejects it unless it genuinely tightens the selection.
+            cands.append(
+                (
+                    np.isin(col, uniq),
+                    {"kind": "in", "cell": cell, "values": tuple(int(x) for x in uniq)},
+                )
+            )
+        const_mask = 0
+        for b in range(8):
+            bit = (fc >> b) & 1
+            if bit.min() == bit.max():
+                val = int(bit[0]) << b
+                const_mask |= 1 << b
+                cands.append(
+                    (
+                        (col & (1 << b)) == val,
+                        {"kind": "bit", "cell": cell, "mask": 1 << b, "value": val},
+                    )
+                )
+        if 2 <= _bits_set(const_mask) < 8:
+            mval = int(fc[0]) & const_mask
+            cands.append(
+                (
+                    (col & const_mask) == mval,
+                    {"kind": "mask", "cell": cell, "mask": int(const_mask), "value": mval},
+                )
+            )
+    return cands
+
+
 def _find_override(forced, ctx, max_terms: int = 3, sid_addr=None):
     """A conjunction of cell predicates that fires exactly on ``forced`` frames.
 
@@ -2033,39 +2108,8 @@ def _find_override(forced, ctx, max_terms: int = 3, sid_addr=None):
     """
     if int(forced.sum()) == 0:
         return None
-    grid = ctx.stateseq.grid.astype(np.int64)
-    addrs = ctx.stateseq.addrs
     n_forced = int(forced.sum())
-    max_set = 6
-    cands = []
-    for j in ctx.candidate_cols(sid_addr):
-        col = grid[:, j]
-        fc = col[forced]
-        uniq = np.unique(fc)
-        if len(uniq) == 1:
-            cands.append(
-                (col == int(uniq[0]), {"kind": "eq", "cell": int(addrs[j]), "value": int(uniq[0])})
-            )
-        elif 2 <= len(uniq) <= max_set and len(uniq) < len(np.unique(col)):
-            # A force gated by the cell holding one of a few states (recall 1.0 by
-            # construction); the greedy precision/strict-improvement gating below
-            # rejects it unless it genuinely tightens the selection.
-            cands.append(
-                (
-                    np.isin(col, uniq),
-                    {"kind": "in", "cell": int(addrs[j]), "values": tuple(int(x) for x in uniq)},
-                )
-            )
-        for b in range(8):
-            bit = (fc >> b) & 1
-            if bit.min() == bit.max():
-                val = int(bit[0]) << b
-                cands.append(
-                    (
-                        (col & (1 << b)) == val,
-                        {"kind": "bit", "cell": int(addrs[j]), "mask": 1 << b, "value": val},
-                    )
-                )
+    cands = _candidate_terms(forced, ctx, sid_addr)
     sel = np.ones(len(forced), dtype=bool)
     terms = []
     precision = n_forced / max(1, int(sel.sum()))
@@ -2126,6 +2170,160 @@ def _override_descriptor(forced_byte, ctx, sid_addr=None):
     force_val = int(vals[counts.argmax()])
     terms = _find_override(forced_byte == force_val, ctx, sid_addr=sid_addr)
     return None if terms is None else {"predicate": terms, "force": force_val}
+
+
+# -- select (mux) proposer ----------------------------------------------------
+#
+# A ``select`` muxes two or three partial hypotheses per-frame by a recovered
+# cell predicate (WEMUSIC A/B sets, DMC slide-vs-vibrato FREQ, FC's FREQ emit
+# blocks, MusicAssembler PW mode-select). Arms come from the arbiter's scored
+# runner-up trees, augmented with residual feeder cells for pure A/B/C feeder
+# muxes. Three overfit guards (all required): each arm must explain >= a frame
+# floor, its separating predicate is MDL-charged (see ``ir._cc_select``), and the
+# mux is emitted only as one more arbiter candidate -- so it is adopted only when
+# it BEATS the best single-arm tree on score, never on fidelity alone.
+_SELECT_ARM_FLOOR = 0.05  # each arm must explain >= 5% of frames
+_SELECT_MAX_ARMS = 2  # predicate arms beyond the default -> up to 3 mux branches
+
+
+def _residual_feeder_arm(residual, s, sid_addr, ctx):
+    """A feeder (captured-cell) arm best reproducing ``s`` on the ``residual`` frames.
+
+    Returns ``(tree, correct_mask)`` for the best state cell (sampled at the write
+    instant) over the residual frames, or ``None``. Lets a pure A/B/C feeder mux
+    (each mode selecting a different captured cell) recover without any single
+    proposer having surfaced the per-mode cells.
+    """
+    ss = ctx.stateseq
+    if ss is None or ss.grid.shape[1] == 0 or ctx.sampler is None:
+        return None
+    cols = np.asarray(ctx.candidate_cols(sid_addr), dtype=np.int64)
+    if len(cols) == 0 or int(residual.sum()) == 0:
+        return None
+    grid = ss.grid.astype(np.int64)
+    t = np.asarray(s, dtype=np.int64) & 0xFF
+    eof_match = (grid[residual] == t[residual, None]).mean(axis=0)
+    order = cols[np.argsort(eof_match[cols])[::-1][:8]]
+    best_addr, best_frac = None, -1.0
+    for j in order:
+        cell = int(ss.addrs[j])
+        recon = ctx.sampler.at_write(cell, sid_addr).astype(np.int64) & 0xFF
+        frac = float(np.mean(recon[residual] == t[residual]))
+        if frac > best_frac:
+            best_addr, best_frac = cell, frac
+    if best_addr is None or best_frac <= 0.0:
+        return None
+    tree = ir.to_ir(
+        {"type": "FEEDER", "addr": int(sid_addr), "sid": int(sid_addr), "cell": best_addr}
+    )
+    recon = ir.evaluate(tree, ctx.n_frames, ctx.sampler)
+    if recon is None:
+        return None
+    return tree, (np.asarray(recon, dtype=np.int64) == np.asarray(s, dtype=np.int64))
+
+
+def _try_select_arm(correct, assigned, covered, ctx, sid_addr):
+    """Return ``(predicate, assigned, covered)`` if this arm is net-positive.
+
+    ``gain`` is the currently-wrong frames the arm could still claim; a separating
+    predicate is recovered with the shared :func:`_find_override` machinery. Only
+    the frames the arm claims first (``hold & ~assigned``) take its value, mirroring
+    the evaluator's first-match precedence. Rejected unless it clears the >=5% floor
+    and strictly increases the covered-correct count.
+    """
+    n = ctx.n_frames
+    floor = max(1, int(_SELECT_ARM_FLOOR * n))
+    gain = correct & ~covered & ~assigned
+    if int(gain.sum()) < floor:
+        return None
+    pred = _find_override(gain, ctx, sid_addr=sid_addr)
+    if pred is None:
+        return None
+    hold = ir.predicate_mask(pred, ctx.sampler, n)
+    new_covered = np.where(hold & ~assigned, correct, covered)
+    if int(new_covered.sum()) <= int(covered.sum()):
+        return None
+    return pred, assigned | hold, new_covered
+
+
+def _fill_select_arms(pool, arms, covered, assigned, s, sid_addr, ctx):
+    """Greedily fill up to ``_SELECT_MAX_ARMS`` arms, runner-up trees then feeders.
+
+    Mutates ``arms`` in place (appending ``(predicate, tree)``) and returns the
+    updated ``(covered, assigned)`` first-match state.
+    """
+    n = ctx.n_frames
+    floor = max(1, int(_SELECT_ARM_FLOOR * n))
+    for tree, correct in pool:
+        if len(arms) >= _SELECT_MAX_ARMS:
+            return covered, assigned
+        got = _try_select_arm(correct, assigned, covered, ctx, sid_addr)
+        if got is not None:
+            pred, assigned, covered = got
+            arms.append((pred, tree))
+    while len(arms) < _SELECT_MAX_ARMS and int((~covered).sum()) >= floor:
+        arm = _residual_feeder_arm(~covered, s, sid_addr, ctx)
+        if arm is None:
+            break
+        tree, correct = arm
+        got = _try_select_arm(correct, assigned, covered, ctx, sid_addr)
+        if got is None:
+            break
+        pred, assigned, covered = got
+        arms.append((pred, tree))
+    return covered, assigned
+
+
+def propose_select(scored, series, sid_addr, ctx):
+    """Mux the arbiter's runner-up trees (and residual feeders) into a ``select``.
+
+    ``scored`` is the arbiter's ``[(cand, tree, recon, key), ...]``. The
+    highest-fidelity tree is the default arm; further arms are the runner-up trees
+    whose correct-frame set covers frames the default gets wrong, separated by a
+    recovered cell predicate, then residual feeder cells for any frames still
+    unexplained. Returns ``[]`` (no mux) when the default is already exact or no
+    net-positive separated arm exists.
+    """
+    n = ctx.n_frames
+    if not n or ctx.sampler is None or ctx.stateseq is None or ctx.stateseq.grid.shape[1] == 0:
+        return []
+    s = np.asarray(series, dtype=np.int64)
+    entries = []
+    for _cand, tree, recon, _key in scored:
+        if recon is not None and len(recon) == n:
+            correct = np.asarray(recon, dtype=np.int64) == s
+            entries.append((float(correct.mean()), tree, correct))
+    if not entries:
+        return []
+    entries.sort(key=lambda e: -e[0])
+    base_fid, base_tree, base_correct = entries[0]
+    if base_fid >= 1.0 - 1e-9:
+        return []
+    assigned = np.zeros(n, dtype=bool)
+    covered = base_correct.copy()
+    arms = []
+    pool = [(tree, correct) for _fid, tree, correct in entries[1:] if id(tree) != id(base_tree)]
+    covered, assigned = _fill_select_arms(pool, arms, covered, assigned, s, sid_addr, ctx)
+    if not arms:
+        return []
+    desc = {
+        "type": "SELECT",
+        "addr": int(sid_addr),
+        "sid": int(sid_addr),
+        "arms": arms,
+        "default_tree": base_tree,
+    }
+    # Third overfit guard: adopt only if the mux BEATS the best single-arm tree on
+    # SCORE (fidelity - LAMBDA*complexity), not on fidelity alone -- the predicate
+    # terms and both arm subtrees are MDL-charged, so a mux buying a few frames at
+    # a large complexity cost is rejected here before it reaches the arbiter.
+    sel_fid = float(covered.mean())
+    sel_cx = ir.complexity(ir.to_ir(desc), ctx.sampler, n)
+    sel_score = sel_fid - _LAMBDA * sel_cx
+    best_single = max(float(c.get("score", 0.0)) for c, _t, _r, _k in scored)
+    if sel_score <= best_single:
+        return []
+    return [desc]
 
 
 def _anchor_bases(cur_s, val_s, cmax, ram, ramhist, n_anchors=16, cap=256):

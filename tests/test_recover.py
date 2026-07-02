@@ -30,7 +30,7 @@ from preframr_playroutine.recover import (
     _segmented_recur,
 )
 from preframr_playroutine.trace import CPU_VECTOR
-from _minisid import recur_series
+from _minisid import recur_series, select_feeder_mux
 
 PAL_FRAME = 985248.444 / 50.0
 PAL_META = {"cpu_hz": 985248.444, "effective_model": "PAL"}
@@ -497,6 +497,82 @@ def test_classify_pitchwalk_with_override():
     rt = round_trip(trace)
     assert rt[0xD400] == 1.0
     assert rt[0xD401] == 1.0
+
+
+def _build_mux_trace(reg, cells, sid_addr=0xD402):
+    """Trace whose ``sid_addr`` register is ``reg`` with ``cells`` written each frame."""
+    recs = []
+    ramwr = []
+    for i, v in enumerate(reg):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        for cell, series in cells.items():
+            ramwr.append(_ra(tick + 6, int(cell), int(series[i])))
+        recs.append(
+            _ev(tick + 12, SID_WRITE, reg=sid_addr & 0x1F, value=int(v), addr=sid_addr, aux=0x1400)
+        )
+    return _build_trace(recs, ram_writes=ramwr)
+
+
+def _select_pred_cells(desc):
+    """The set of RAM cells referenced by every arm predicate of a SELECT desc."""
+    cells = set()
+    for pred, _tree in desc["arms"]:
+        for term in pred:
+            cells.add(int(term["cell"]))
+    return cells
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 7])
+def test_classify_select_two_arm_toggle(seed):
+    # A 2-arm mux: a toggle cell selects which of two captured feeder cells the
+    # register copies each frame. Neither cell alone reproduces it; recovery is a
+    # SELECT with one predicate arm gated on the toggle cell, round-tripping exact.
+    rng = np.random.default_rng(seed)
+    sel_cell = 0x0060
+    arm_cells = [0x0061, 0x0062]
+    reg, cells = select_feeder_mux(rng, 200, arm_cells, sel_cell, mode_values=[0, 1])
+    trace = _build_mux_trace(reg, cells, sid_addr=0xD402)
+    res = classify_register(trace, 0xD402)
+    assert res["type"] == "SELECT", res["type"]
+    assert len(res["arms"]) == 1
+    assert _select_pred_cells(res) == {sel_cell}
+    assert round_trip(trace)[0xD402] == 1.0
+
+
+@pytest.mark.parametrize("seed", [0, 3, 5, 9])
+def test_classify_select_three_arm_mode(seed):
+    # A 3-arm mux: a mode byte in {0x00,0x10,0x20} selects one of three captured
+    # feeder cells. Recovery is a SELECT with two predicate arms (default + 2),
+    # each gated on the mode cell, round-tripping exact.
+    rng = np.random.default_rng(seed)
+    sel_cell = 0x0070
+    arm_cells = [0x0071, 0x0072, 0x0073]
+    reg, cells = select_feeder_mux(rng, 240, arm_cells, sel_cell, mode_values=[0x00, 0x10, 0x20])
+    trace = _build_mux_trace(reg, cells, sid_addr=0xD402)
+    res = classify_register(trace, 0xD402)
+    assert res["type"] == "SELECT", res["type"]
+    assert len(res["arms"]) == 2
+    assert _select_pred_cells(res) == {sel_cell}
+    assert round_trip(trace)[0xD402] == 1.0
+
+
+def test_select_magic_value_fitter_fails():
+    # Anti-overfit: a fitter that only recovered the arms without the selector
+    # predicate (equivalently, dropping the mux) cannot reproduce the register.
+    # The single best feeder cell is strictly below 1.0, so SELECT is required.
+    rng = np.random.default_rng(4)
+    reg, cells = select_feeder_mux(rng, 200, [0x0081, 0x0082], 0x0080, mode_values=[0, 1])
+    trace = _build_mux_trace(reg, cells, sid_addr=0xD402)
+    res = classify_register(trace, 0xD402)
+    assert res["type"] == "SELECT"
+    # each captured arm cell alone matches well under 1.0
+    ticks = trace.tick_cycles("auto")
+    for cell in (0x0081, 0x0082):
+        feeder = {"type": "FEEDER", "addr": 0xD402, "sid": 0xD402, "cell": cell}
+        recon = reconstruct_register(feeder, ticks, trace=trace)
+        assert float(np.mean(recon == reg)) < 0.95
+    assert round_trip(trace)[0xD402] == 1.0
 
 
 def test_reconstruct_pitchwalk_no_sampler_zeros():

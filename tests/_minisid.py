@@ -200,6 +200,32 @@ def recur_segment(lo, hi, seed, direction, length, boundary, step_kind, up=1, do
     return np.array(out, dtype=np.int64)
 
 
+def select_feeder_mux(rng, n, arm_cells, sel_cell, mode_values):
+    """Ground truth for a k-arm feeder mux (a ``select`` over captured cells).
+
+    Each entry of ``arm_cells`` is a RAM address whose per-frame value is drawn
+    from a distinct byte band (so no single cell reproduces the whole register and
+    the arms never collide); ``sel_cell`` holds one of ``mode_values`` each frame
+    and picks which arm cell the register copies. Deterministic given ``rng``.
+
+    Returns ``(reg, {cell_addr: series})`` where ``reg`` is the emitted register
+    series and the dict carries every arm cell plus the selector cell -- the RAM
+    write streams the trace must replay. A fitter that only latches magic byte
+    values (rather than recovering the selector predicate) cannot reproduce this,
+    since the arm data is randomized per seed.
+    """
+    k = len(arm_cells)
+    assert len(mode_values) == k, "one mode value per arm"
+    band = 256 // (k + 1)
+    arm_data = [(rng.integers(1, band, size=n) + j * band).astype(np.int64) for j in range(k)]
+    mode_idx = rng.integers(0, k, size=n)
+    sel_series = np.array([int(mode_values[m]) for m in mode_idx], dtype=np.int64)
+    reg = np.array([int(arm_data[mode_idx[i]][i]) for i in range(n)], dtype=np.int64)
+    cells = {int(c): arm_data[j] for j, c in enumerate(arm_cells)}
+    cells[int(sel_cell)] = sel_series
+    return reg, cells
+
+
 def recur_series(lo, hi, seeds, length, boundary, step_kind, up=1, down=1, rate=None):
     """A reseeded multi-note product series and its note-on reset frames.
 
