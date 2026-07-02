@@ -1,5 +1,5 @@
 diff --git a/Makefile.am b/Makefile.am
-index 0a5b033..d575286 100644
+index 0a5b033b..d575286c 100644
 --- a/Makefile.am
 +++ b/Makefile.am
 @@ -84,6 +84,8 @@ src/simpleMixer.h \
@@ -12,7 +12,7 @@ index 0a5b033..d575286 100644
  src/sidrandom.h \
  src/stringutils.h \
 diff --git a/src/c64/CIA/timer.h b/src/c64/CIA/timer.h
-index d3cad84..0eca5c9 100644
+index d3cad840..0eca5c97 100644
 --- a/src/c64/CIA/timer.h
 +++ b/src/c64/CIA/timer.h
 @@ -206,6 +206,13 @@ public:
@@ -30,7 +30,7 @@ index d3cad84..0eca5c9 100644
       * Get PB6/PB7 Flipflop state.
       *
 diff --git a/src/c64/CPU/mos6510.cpp b/src/c64/CPU/mos6510.cpp
-index 10bec1a..f51a614 100644
+index 10bec1a1..f8edb033 100644
 --- a/src/c64/CPU/mos6510.cpp
 +++ b/src/c64/CPU/mos6510.cpp
 @@ -24,6 +24,7 @@
@@ -90,18 +90,22 @@ index 10bec1a..f51a614 100644
  }
  
  /**
-@@ -566,6 +602,19 @@ void MOS6510::FetchHighEffAddrY2()
+@@ -566,6 +602,23 @@ void MOS6510::FetchHighEffAddrY2()
  void MOS6510::FetchEffAddrDataByte()
  {
      Cycle_Data = cpuRead(Cycle_EffectiveAddress);
 +
 +    if (m_instrInPlay) UNLIKELY
 +    {
-+        if (((Cycle_EffectiveAddress & 0xff00) != 0x0100)
-+            && ((Cycle_EffectiveAddress & 0xf000) != 0xd000))
++        InstrumentSink *sink = getInstrumentSink();
++        if (sink != nullptr)
 +        {
-+            InstrumentSink *sink = getInstrumentSink();
-+            if (sink != nullptr && sink->wantReads())
++            if ((Cycle_EffectiveAddress & 0xf000) == 0xd000)
++                sink->ioRead(eventScheduler.getTime(EVENT_CLOCK_PHI2),
++                             m_instrCurPC, Cycle_EffectiveAddress, Cycle_Data,
++                             m_instrWindowKind);
++            else if (((Cycle_EffectiveAddress & 0xff00) != 0x0100
++                      || sink->wantStack()) && sink->wantReads())
 +                sink->ramRead(eventScheduler.getTime(EVENT_CLOCK_PHI2),
 +                              m_instrCurPC, Cycle_EffectiveAddress, Cycle_Data,
 +                              m_instrWindowKind);
@@ -111,7 +115,7 @@ index 10bec1a..f51a614 100644
  
  /**
 diff --git a/src/c64/CPU/mos6510.h b/src/c64/CPU/mos6510.h
-index 91fb40e..6ecee1f 100644
+index 91fb40e6..248d8381 100644
 --- a/src/c64/CPU/mos6510.h
 +++ b/src/c64/CPU/mos6510.h
 @@ -31,6 +31,7 @@
@@ -145,13 +149,13 @@ index 91fb40e..6ecee1f 100644
 +    {
 +        if (m_instrInPlay) UNLIKELY
 +        {
-+            // Exclude the stack page and the IO area ($Dxxx; SID writes are
-+            // logged separately). Everything else (zero page, data, and the
-+            // code region for self-modifying code) is recorded.
-+            if (((addr & 0xff00) != 0x0100) && ((addr & 0xf000) != 0xd000))
++            InstrumentSink *sink = getInstrumentSink();
++            if (sink != nullptr)
 +            {
-+                InstrumentSink *sink = getInstrumentSink();
-+                if (sink != nullptr)
++                if ((addr & 0xf000) == 0xd000)
++                    sink->ioWrite(eventScheduler.getTime(EVENT_CLOCK_PHI2),
++                                  m_instrCurPC, addr, data, m_instrWindowKind);
++                else if ((addr & 0xff00) != 0x0100 || sink->wantStack())
 +                    sink->ramWrite(eventScheduler.getTime(EVENT_CLOCK_PHI2),
 +                                   m_instrCurPC, addr, data, m_instrWindowKind);
 +            }
@@ -162,7 +166,7 @@ index 91fb40e..6ecee1f 100644
      void reset();
  
 diff --git a/src/c64/VIC_II/mos656x.h b/src/c64/VIC_II/mos656x.h
-index 4bc2c1d..46fea70 100644
+index 4bc2c1d0..46fea700 100644
 --- a/src/c64/VIC_II/mos656x.h
 +++ b/src/c64/VIC_II/mos656x.h
 @@ -315,6 +315,12 @@ protected:
@@ -179,7 +183,7 @@ index 4bc2c1d..46fea70 100644
      virtual void interrupt(bool state) = 0;
      virtual void setBA(bool state) = 0;
 diff --git a/src/c64/c64.cpp b/src/c64/c64.cpp
-index b96881a..de624d0 100644
+index b96881a8..de624d08 100644
 --- a/src/c64/c64.cpp
 +++ b/src/c64/c64.cpp
 @@ -148,6 +148,8 @@ void c64::setCiaModel(cia_model_t model)
@@ -202,7 +206,7 @@ index b96881a..de624d0 100644
      sidBankMap_t::iterator it = extraSidBanks.find(idx);
      if (it != extraSidBanks.end())
 diff --git a/src/c64/c64cia.h b/src/c64/c64cia.h
-index 5e752f8..77f8ac5 100644
+index 5e752f89..77f8ac51 100644
 --- a/src/c64/c64cia.h
 +++ b/src/c64/c64cia.h
 @@ -30,6 +30,7 @@
@@ -242,7 +246,7 @@ index 5e752f8..77f8ac5 100644
  
  public:
 diff --git a/src/c64/c64sid.h b/src/c64/c64sid.h
-index 6e4a6b4..ab7d024 100644
+index 6e4a6b42..ab7d0241 100644
 --- a/src/c64/c64sid.h
 +++ b/src/c64/c64sid.h
 @@ -65,6 +65,10 @@ public:
@@ -257,7 +261,7 @@ index 6e4a6b4..ab7d024 100644
  
  }
 diff --git a/src/c64/c64vic.h b/src/c64/c64vic.h
-index c46d47a..5ce02dc 100644
+index c46d47a0..5ce02dc5 100644
 --- a/src/c64/c64vic.h
 +++ b/src/c64/c64vic.h
 @@ -30,6 +30,7 @@
@@ -284,7 +288,7 @@ index c46d47a..5ce02dc 100644
  
 diff --git a/src/instrument.cpp b/src/instrument.cpp
 new file mode 100644
-index 0000000..e6690b3
+index 00000000..e6690b31
 --- /dev/null
 +++ b/src/instrument.cpp
 @@ -0,0 +1,28 @@
@@ -318,10 +322,10 @@ index 0000000..e6690b3
 +}
 diff --git a/src/instrument.h b/src/instrument.h
 new file mode 100644
-index 0000000..3984ed4
+index 00000000..ecba3e60
 --- /dev/null
 +++ b/src/instrument.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,106 @@
 +/*
 + * This file is part of libsidplayfp, a SID player engine.
 + *
@@ -394,6 +398,21 @@ index 0000000..3984ed4
 +    /// An instruction executed inside a play window (for PC coverage).
 +    virtual void cpuExec(uint16_t pc, uint8_t kind) {}
 +
++    /// A CPU data read from the I/O area ($D000-$DFFF) inside a play window
++    /// (SID osc3/env3, CIA timers/ports, VIC registers). Always emitted when
++    /// a sink is installed (not gated by wantReads(); volume is tiny).
++    virtual void ioRead(int64_t cycle, uint16_t pc, uint16_t addr,
++                        uint8_t value, uint8_t kind) {}
++
++    /// A CPU write to the I/O area inside a play window. SID writes also
++    /// appear as sidWrite events; consumers filter as needed.
++    virtual void ioWrite(int64_t cycle, uint16_t pc, uint16_t addr,
++                         uint8_t value, uint8_t kind) {}
++
++    /// Whether stack-page ($0100-$01FF) accesses should flow into the RAM
++    /// write/read logs (dynamic PHA/PLA dataflow ground truth).
++    virtual bool wantStack() const { return false; }
++
 +    /// Whether the read log is wanted (gates the per-read overhead).
 +    virtual bool wantReads() const { return false; }
 +};
@@ -414,7 +433,7 @@ index 0000000..3984ed4
 +
 +#endif // LIBSIDPLAYFP_INSTRUMENT_H
 diff --git a/src/player.cpp b/src/player.cpp
-index c887043..d06ccb6 100644
+index c8870432..d06ccb63 100644
 --- a/src/player.cpp
 +++ b/src/player.cpp
 @@ -238,6 +238,13 @@ void Player::buffers(short** buffers) const
@@ -432,7 +451,7 @@ index c887043..d06ccb6 100644
  {
      // Make sure a tune is loaded
 diff --git a/src/player.h b/src/player.h
-index ab30df1..e329ad9 100644
+index ab30df1c..e329ad99 100644
 --- a/src/player.h
 +++ b/src/player.h
 @@ -156,6 +156,9 @@ public:
@@ -446,7 +465,7 @@ index ab30df1..e329ad9 100644
  
      unsigned int installedSIDs() const { return m_chips.size(); }
 diff --git a/src/sidemu.cpp b/src/sidemu.cpp
-index 2ff4951..8e340da 100644
+index 2ff49511..8e340dae 100644
 --- a/src/sidemu.cpp
 +++ b/src/sidemu.cpp
 @@ -22,6 +22,8 @@
@@ -471,7 +490,7 @@ index 2ff4951..8e340da 100644
  }
  
 diff --git a/src/sidemu.h b/src/sidemu.h
-index 5421ad2..6592e61 100644
+index 5421ad23..6592e615 100644
 --- a/src/sidemu.h
 +++ b/src/sidemu.h
 @@ -74,12 +74,18 @@ protected:
@@ -494,7 +513,7 @@ index 5421ad2..6592e61 100644
          m_builder(builder),
          m_error("N/A")
 diff --git a/src/sidplayfp/sidplayfp.cpp b/src/sidplayfp/sidplayfp.cpp
-index c04cfc4..3fa7639 100644
+index c04cfc44..3fa76396 100644
 --- a/src/sidplayfp/sidplayfp.cpp
 +++ b/src/sidplayfp/sidplayfp.cpp
 @@ -61,6 +61,11 @@ int sidplayfp::play(unsigned int cycles)
@@ -510,7 +529,7 @@ index c04cfc4..3fa7639 100644
  {
      return sidplayer.reset();
 diff --git a/src/sidplayfp/sidplayfp.h b/src/sidplayfp/sidplayfp.h
-index 8a3120d..b0c6a1f 100644
+index 8a3120dd..b0c6a1f5 100644
 --- a/src/sidplayfp/sidplayfp.h
 +++ b/src/sidplayfp/sidplayfp.h
 @@ -216,6 +216,14 @@ public:
