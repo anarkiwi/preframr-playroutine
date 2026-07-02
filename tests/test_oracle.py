@@ -183,3 +183,30 @@ def test_v2_analyze_classifies(tmp_path):
     # At least one SID register classified, with a generator-type summary.
     assert result["summary"]
     assert sum(result["summary"].values()) >= 1
+
+
+def test_reads_flag_narrowing(tmp_path):
+    # The --reads fixture: the player LDA $FB / STA $D400, so the read log names
+    # $FB as the one cell the $D400 store consumed. Narrowing must activate and
+    # must not drop fidelity versus the non-reads (fallback) recovery.
+    from preframr_playroutine import analyze, round_trip
+    from preframr_playroutine.recover import _build_context
+
+    reads = Trace.load(_trace(tmp_path, build_psid(speed=0), name="reads", extra=("--reads",)))
+    plain = Trace.load(_trace(tmp_path, build_psid(speed=0), name="plain"))
+
+    assert len(reads.ram_reads()) > 0  # --reads populated the read log
+    assert len(plain.ram_reads()) == 0  # default render omits it (fallback path)
+
+    ctx = _build_context(reads)
+    assert ctx.reads_near is not None  # read log -> narrowing active
+    assert 0x00FB in ctx.candidates(0xD400)  # the cell the store actually read
+    assert ctx.candidate_cols(0xD400)  # non-empty narrowed set
+
+    ctx_plain = _build_context(plain)
+    assert ctx_plain.reads_near is None  # no read log -> fallback
+    assert ctx_plain.candidates(0xD400) is None
+
+    # Same recovery quality with narrowing as without: $D400 stays perfect.
+    assert analyze(reads)["summary"]
+    assert round_trip(reads)[0xD400] == round_trip(plain)[0xD400] == 1.0

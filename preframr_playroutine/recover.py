@@ -31,6 +31,7 @@ against the oracle.
 from __future__ import annotations
 
 from collections import namedtuple
+from typing import NamedTuple
 
 import numpy as np
 
@@ -43,6 +44,12 @@ CTRL_ADDRS = {0: 0xD404, 1: 0xD40B, 2: 0xD412}
 _U64_MAX = np.uint64(np.iinfo(np.uint64).max)
 
 StateSequence = namedtuple("StateSequence", ["ticks", "addrs", "grid"])
+
+# Backward-slice window (CPU cycles) for read-log dataflow narrowing: the cells a
+# store's emitting code touched sit within its local instruction slice, well under
+# one play call. Capped here so the window never spans a whole call's per-frame
+# writes (which would readmit every changing cell).
+_SLICE_CYCLES = 512
 
 
 # -- per-frame binning ----------------------------------------------------
@@ -523,20 +530,47 @@ def _cursor_like(cursor: np.ndarray) -> bool:
 _FREQ_LO, _FREQ_HI, _PW_LO, _PW_HI, _CTRL, _AD, _SR = range(7)
 _LOHI_PARTNER = {_FREQ_LO: 1, _FREQ_HI: -1, _PW_LO: 1, _PW_HI: -1}
 
-RecoverContext = namedtuple(
-    "RecoverContext",
-    [
-        "kind",
-        "stateseq",
-        "ram",
-        "tables",
-        "cursor_cols",
-        "note_on",
-        "all_on",
-        "n_frames",
-        "sampler",
-    ],
-)
+
+class RecoverContext(NamedTuple):
+    """Precomputed per-trace recovery state, shared by every proposer."""
+
+    kind: str
+    stateseq: object
+    ram: object
+    tables: list
+    cursor_cols: list
+    note_on: dict
+    all_on: list
+    n_frames: int
+    sampler: object
+    # dict[sid_addr] -> frozenset of RAM cells the emitting code read/wrote near a
+    # store (read-log dataflow narrowing); None when no read log -> fall back to
+    # every changing cell.
+    reads_near: object = None
+
+    def candidates(self, sid_addr):
+        """Cells the emitting code read/wrote near a store to ``sid_addr``.
+
+        Returns a frozenset of RAM addresses when the read log narrowed the
+        search, or ``None`` (no narrowing -> consider every changing cell) in the
+        fallback path.
+        """
+        if self.reads_near is None or sid_addr is None:
+            return None
+        return self.reads_near.get(int(sid_addr), frozenset())
+
+    def candidate_cols(self, sid_addr):
+        """Column indices into ``stateseq.grid`` for the candidate cells.
+
+        The fallback returns every column; with a read log it returns only the
+        columns whose cell the emitting code actually touched near the store.
+        """
+        cand = self.candidates(sid_addr)
+        n = self.stateseq.grid.shape[1]
+        if cand is None:
+            return list(range(n))
+        addrs = self.stateseq.addrs
+        return [j for j in range(n) if int(addrs[j]) in cand]
 
 
 def _voice_of(sid_addr: int):
@@ -1170,6 +1204,56 @@ def _seq_correlation(series, on_frames, n_frames, lag: int = 2) -> tuple:
     return float(np.mean(onset[changes])), int(len(changes))
 
 
+def _window_cells(store_cycles, acc_cycles, acc_addrs, window) -> set:
+    """Cells whose read/write falls within ``window`` cycles before any store.
+
+    Vectorized over the whole access log: for each access find the first store
+    strictly after it (``searchsorted`` right), then keep the access when that
+    store is within ``window`` cycles. No per-store loop.
+    """
+    if len(store_cycles) == 0 or len(acc_cycles) == 0:
+        return set()
+    pos = np.searchsorted(store_cycles, acc_cycles, side="right")
+    inb = pos < len(store_cycles)
+    cov = np.zeros(len(acc_cycles), dtype=bool)
+    nxt = store_cycles[np.clip(pos, 0, len(store_cycles) - 1)]
+    cov[inb] = (nxt[inb] - acc_cycles[inb]) <= window
+    return {int(a) for a in np.unique(acc_addrs[cov])}
+
+
+def _reads_near_store(trace, ticks, kind):
+    """Map every stored SID address to the cells read/written just before it.
+
+    Returns ``None`` when the trace carries no read log (the CI default), so the
+    context falls back to the global changing-cells set. The window brackets the
+    store's local dataflow slice: at most one play call (the median tick period),
+    but capped at ``_SLICE_CYCLES`` -- a whole play call spans every per-frame
+    write, so an un-capped window would readmit every changing cell and narrow
+    nothing, whereas a store's backward slice (the LDA/SMC feeding it) sits within
+    a few dozen instructions.
+    """
+    rd = trace.ram_reads(_window_kind(kind))
+    if len(rd) == 0:
+        return None
+    if len(ticks) >= 2:
+        call = int(np.median(np.diff(ticks.astype(np.int64))))
+    else:
+        call = int(trace.frame_cycles)
+    window = min(call, _SLICE_CYCLES)
+    wr = trace.ram_writes(_window_kind(kind))
+    ro = np.argsort(rd["cycle"], kind="stable")
+    rc, ra = rd["cycle"][ro].astype(np.int64), rd["addr"][ro]
+    wo = np.argsort(wr["cycle"], kind="stable")
+    wc, wa = wr["cycle"][wo].astype(np.int64), wr["addr"][wo]
+    out = {}
+    sw = trace.sid_writes()
+    for addr in np.unique(sw["addr"]):
+        sc = np.sort(sw[sw["addr"] == addr]["cycle"].astype(np.int64))
+        cells = _window_cells(sc, rc, ra, window) | _window_cells(sc, wc, wa, window)
+        out[int(addr)] = frozenset(cells)
+    return out
+
+
 def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContext:
     """Precompute the per-trace recovery context once (shared by analyze)."""
     if stateseq is None:
@@ -1190,6 +1274,7 @@ def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContex
         all_on=all_on,
         n_frames=len(stateseq.ticks),
         sampler=_CellSampler(trace, stateseq.ticks),
+        reads_near=_reads_near_store(trace, stateseq.ticks, kind),
     )
 
 
@@ -1486,8 +1571,8 @@ def _propose_table_walk(series, wr, ctx, sid_addr):
         cand["addr"] = int(sid_addr)
         cand.pop("gate_addr", None)
         cand["overrides"] = []
-        _recover_gate(cand, series, ctx)
-        recover_overrides(cand, series, ctx)
+        _recover_gate(cand, series, ctx, sid_addr)
+        recover_overrides(cand, series, ctx, sid_addr=sid_addr)
         out.append(cand)
     return out
 
@@ -1511,7 +1596,9 @@ def _propose_binop(sid_addr, series, ctx):
     n = len(s)
     grid = ss.grid
     addrs = ss.addrs
-    cols = [j for j in range(grid.shape[1]) if len(np.unique(grid[:, j])) <= _BINOP_MAX_DISTINCT]
+    cols = [
+        j for j in ctx.candidate_cols(sid_addr) if len(np.unique(grid[:, j])) <= _BINOP_MAX_DISTINCT
+    ]
     if not cols:
         return []
     mat_full = np.stack(
@@ -1695,7 +1782,7 @@ def _finish_seq(result, series):
     return result
 
 
-def _recover_gate(tw, series, ctx):
+def _recover_gate(tw, series, ctx, sid_addr=None):
     """Find a gate-mask cell so ``CTRL = table[cursor] & gate`` reconstructs better.
 
     A waveform table walk is gated by a per-voice mask cell (``$FF`` pass /
@@ -1712,7 +1799,7 @@ def _recover_gate(tw, series, ctx):
     base_fid = float(np.mean(series == (tv & tw["mask"])))
     grid = ctx.stateseq.grid.astype(np.int64)
     best_fid, best_addr = base_fid, None
-    for j in range(grid.shape[1]):
+    for j in ctx.candidate_cols(sid_addr):
         col = grid[:, j]
         if int(col.max()) < 0xF0 or len(np.unique(col)) > 4:
             continue
@@ -1724,7 +1811,9 @@ def _recover_gate(tw, series, ctx):
         tw["residual"] = best_fid
 
 
-def recover_overrides(node, series, ctx, max_overrides: int = 3, mask=None, explained=None):
+def recover_overrides(
+    node, series, ctx, max_overrides: int = 3, mask=None, explained=None, sid_addr=None
+):
     """Greedy strictly-improving value-forcing override recovery over a base recon.
 
     A generator's table/pair/composite base can leave a handful of frames
@@ -1752,7 +1841,7 @@ def recover_overrides(node, series, ctx, max_overrides: int = 3, mask=None, expl
     for _ in range(max_overrides):
         hit = (series == work) if explained is None else explained
         forced = np.where(hit, -1, series).astype(np.int64)
-        ov = _override_descriptor(forced, ctx)
+        ov = _override_descriptor(forced, ctx, sid_addr)
         if ov is None or ov in overrides:
             break
         cand = _apply_overrides(cur, [ov], sampler)
@@ -1784,12 +1873,15 @@ def _best_feeder_at_write(series, sid_addr, ctx):
     ss = ctx.stateseq
     if ss.grid.shape[1] == 0 or ctx.sampler is None:
         return None, None, 0.0
+    cols = np.asarray(ctx.candidate_cols(sid_addr), dtype=np.int64)
+    if len(cols) == 0:
+        return None, None, 0.0
     grid = ss.grid.astype(np.int64)
     s = np.asarray(series, dtype=np.int64)
     eof_match = (grid == s[:, None]).mean(axis=0)
     lead = (grid == np.roll(s, -1)[:, None]).mean(axis=0)
-    rank = np.maximum(eof_match, lead)
-    order = np.argsort(rank)[::-1][:8]
+    rank = np.maximum(eof_match, lead)[cols]
+    order = cols[np.argsort(rank)[::-1][:8]]
     best_addr, best_recon, best_frac = None, None, -1.0
     for j in order:
         cell = int(ss.addrs[j])
@@ -1800,7 +1892,7 @@ def _best_feeder_at_write(series, sid_addr, ctx):
     return best_addr, best_recon, best_frac
 
 
-def _find_override(forced, ctx, max_terms: int = 3):
+def _find_override(forced, ctx, max_terms: int = 3, sid_addr=None):
     """A conjunction of cell predicates that fires exactly on ``forced`` frames.
 
     Candidate predicates (cell value-equality / single-bit tests / small
@@ -1820,7 +1912,7 @@ def _find_override(forced, ctx, max_terms: int = 3):
     n_forced = int(forced.sum())
     max_set = 6
     cands = []
-    for j in range(grid.shape[1]):
+    for j in ctx.candidate_cols(sid_addr):
         col = grid[:, j]
         fc = col[forced]
         uniq = np.unique(fc)
@@ -1876,9 +1968,13 @@ def _feeder_cell(target, sid_addr, ctx):
     ss = ctx.stateseq
     if ss.grid.shape[1] == 0:
         return None
+    cols = np.asarray(ctx.candidate_cols(sid_addr), dtype=np.int64)
+    if len(cols) == 0:
+        return None
     grid = ss.grid.astype(np.int64)
     t = np.asarray(target, dtype=np.int64) & 0xFF
-    order = np.argsort((grid == t[:, None]).mean(axis=0))[::-1][:8]
+    match = (grid == t[:, None]).mean(axis=0)[cols]
+    order = cols[np.argsort(match)[::-1][:8]]
     best_addr, best_frac = None, -1.0
     for j in order:
         cell = int(ss.addrs[j])
@@ -1888,7 +1984,7 @@ def _feeder_cell(target, sid_addr, ctx):
     return best_addr
 
 
-def _override_descriptor(forced_byte, ctx):
+def _override_descriptor(forced_byte, ctx, sid_addr=None):
     """A value-forcing override from the dominant residual byte (or ``None``).
 
     ``forced_byte`` is the register byte on frames the base failed to explain
@@ -1902,7 +1998,7 @@ def _override_descriptor(forced_byte, ctx):
     if counts.max() / counts.sum() < 0.5:
         return None
     force_val = int(vals[counts.argmax()])
-    terms = _find_override(forced_byte == force_val, ctx)
+    terms = _find_override(forced_byte == force_val, ctx, sid_addr=sid_addr)
     return None if terms is None else {"predicate": terms, "force": force_val}
 
 
@@ -2023,7 +2119,7 @@ def _pitch_walk(trace, sid_addr, reg_off, ctx):
     # independent (the table walk reconstructs over all frames either way).
     cols = [
         j
-        for j in range(grid.shape[1])
+        for j in ctx.candidate_cols(sid_addr)
         if grid[:, j].max() <= 95
         and grid[:, j].min() != grid[:, j].max()
         and len(np.unique(grid[:, j])) <= 64
@@ -2044,7 +2140,9 @@ def _pitch_walk(trace, sid_addr, reg_off, ctx):
     found.sort(reverse=True)
     best_desc, best_fid = None, -1.0
     for _frac, primary, base_lo, base_hi in found[:4]:
-        desc = _build_pitchwalk(role, base_lo, base_hi, primary, lo_o, hi_o, grid, addrs, ramu, ctx)
+        desc = _build_pitchwalk(
+            role, base_lo, base_hi, primary, lo_o, hi_o, grid, addrs, ramu, ctx, sid_addr
+        )
         if desc is None:
             continue
         if desc["residual"] > best_fid:
@@ -2052,7 +2150,9 @@ def _pitch_walk(trace, sid_addr, reg_off, ctx):
     return best_desc
 
 
-def _build_pitchwalk(role, base_lo, base_hi, primary, lo_o, hi_o, grid, addrs, ramu, ctx):
+def _build_pitchwalk(
+    role, base_lo, base_hi, primary, lo_o, hi_o, grid, addrs, ramu, ctx, sid_addr=None
+):
     """Assemble (and score) a PITCHWALK descriptor for one candidate pitch table."""
     span = abs(base_hi - base_lo) if base_hi != base_lo else 96
     tlen = int(
@@ -2082,7 +2182,7 @@ def _build_pitchwalk(role, base_lo, base_hi, primary, lo_o, hi_o, grid, addrs, r
     out = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
     oracle = lo_o if role == "lo" else hi_o
     forced = np.where(out == oracle, -1, oracle).astype(np.int64)
-    ov = _override_descriptor(forced, ctx)
+    ov = _override_descriptor(forced, ctx, sid_addr)
     if ov is not None:
         desc["overrides"].append(ov)
         out = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
@@ -2157,7 +2257,9 @@ def _composite16(trace, sid_addr, reg_off, ctx):
         # The 16-bit base+mod sum is what isolates the override frames (a note
         # onset / hard-restart), so score explained-ness on the whole word, not the
         # emitted byte; ``out_byte`` (== ``target_byte``) is the forced value.
-        recover_overrides(desc, target_byte, ctx, 1, explained=modelled == target)
+        recover_overrides(
+            desc, target_byte, ctx, 1, explained=modelled == target, sid_addr=sid_addr
+        )
         fid = float(np.mean(ir.evaluate(ir.to_ir(desc), n, ctx.sampler) == target_byte))
         desc["residual"] = fid
         if fid > best_fid:
@@ -2179,7 +2281,7 @@ def _composite8(sid_addr, series, ctx):
         "overrides": [],
     }
     forced = np.where(series == base_recon, -1, series).astype(np.int64)
-    ov = _override_descriptor(forced, ctx)
+    ov = _override_descriptor(forced, ctx, sid_addr)
     if ov is not None:
         desc["overrides"].append(ov)
     recon = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
@@ -2273,7 +2375,9 @@ def _binop_best(fn, cols, addrs, mat, ss_s, sb, s, sid_addr, ctx):
     if fn == "and":
         desc["overrides"] = []
         desc["residual"] = float(np.mean(_and_recon_masked(desc, ctx) == s))
-        recover_overrides(desc, s, ctx, 4, mask=ctx.sampler.written_mask(desc["sid"]))
+        recover_overrides(
+            desc, s, ctx, 4, mask=ctx.sampler.written_mask(desc["sid"]), sid_addr=sid_addr
+        )
     else:
         attach_prelude(desc, s, ctx, cells)
         recon = ir.evaluate(ir.to_ir(desc), len(s), ctx.sampler)
