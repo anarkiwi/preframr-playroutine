@@ -547,6 +547,22 @@ class RecoverContext(NamedTuple):
     # store (read-log dataflow narrowing); None when no read log -> fall back to
     # every changing cell.
     reads_near: object = None
+    # Shared per-voice latent state (recovered once, referenced by every
+    # proposer): ``latents[voice] = {"tick", "cursors", "note_cell"}`` plus a
+    # song-level ``latents["global"] = {"counter_addr", "counter_step"}``.
+    latents: object = None
+
+    def latent_cursor(self, voice, addr):
+        """The (voice, "cursor", addr) latent id if ``addr`` is a grouped cursor."""
+        if self.latents is None:
+            return None
+        lv = self.latents.get(voice)
+        if lv is None:
+            return None
+        for a, _series in lv.get("cursors", []):
+            if int(a) == int(addr):
+                return (int(voice), "cursor", int(addr))
+        return None
 
     def candidates(self, sid_addr):
         """Cells the emitting code read/wrote near a store to ``sid_addr``.
@@ -1254,6 +1270,92 @@ def _reads_near_store(trace, ticks, kind):
     return out
 
 
+def _synth_tick(on_frames, n) -> np.ndarray:
+    """A per-note wavetable tick: 0 at each note-on, +1 every following frame."""
+    tick = np.zeros(n, dtype=np.int64)
+    bounds = [0] + [int(f) for f in sorted(on_frames) if 0 < int(f) < n] + [n]
+    for k in range(len(bounds) - 1):
+        start, stop = bounds[k], bounds[k + 1]
+        tick[start:stop] = np.arange(stop - start, dtype=np.int64)
+    return tick
+
+
+def _cursor_resets_at(col, on_frames, max_lag: int = 2, min_frac: float = 0.6) -> bool:
+    """Whether ``col`` resets (a downward discontinuity) at this voice's note-ons."""
+    if not on_frames:
+        return False
+    disc = set(int(x) for x in _discontinuities(col))
+    hits = sum(any((int(f) + lag) in disc for lag in range(max_lag + 1)) for f in on_frames)
+    return hits / len(on_frames) >= min_frac
+
+
+def _global_counter(grid, addrs, n) -> dict:
+    """A cell advancing by a constant +k every frame without note resets.
+
+    The Commando-class global phase source: pick the column whose forward diff is
+    a single positive step on almost every frame (wraps allowed). Falls back to a
+    synthesized frame index (``counter_addr`` None, step 1).
+    """
+    out = {"counter_addr": None, "counter_step": 1}
+    if grid.shape[1] == 0 or n < 4:
+        return out
+    for j in range(grid.shape[1]):
+        col = grid[:, j]
+        d = np.diff(col)
+        pos = d[d > 0]
+        if len(pos) == 0:
+            continue
+        step = _modal_int(pos.tolist())
+        if step <= 0:
+            continue
+        # nearly every frame either advances by the modal step or wraps (large drop)
+        ok = (d == step) | (d < -step)
+        if float(np.mean(ok)) >= 0.9:
+            out = {"counter_addr": int(addrs[j]), "counter_step": int(step)}
+            break
+    return out
+
+
+def _build_latents(stateseq, note_on, n_frames) -> dict:
+    """Recover the shared per-voice latent state once (see :class:`RecoverContext`).
+
+    For each voice: the wavetable *tick* (synthesized from note-ons, then replaced
+    by a captured cell that matches it -- the captured cursor survives retrigger
+    nuances), the table *cursors* (``_cursor_columns`` grouped to the voice by
+    note-on reset correlation), and the ``note_cell`` holding the tick. A
+    song-level global counter (:func:`_global_counter`) is stored under
+    ``"global"``.
+    """
+    latents: dict = {}
+    if stateseq is None or stateseq.grid.shape[1] == 0:
+        grid = np.zeros((n_frames, 0), dtype=np.int64)
+        addrs = np.zeros(0, dtype=np.int64)
+    else:
+        grid = stateseq.grid.astype(np.int64)
+        addrs = stateseq.addrs
+    cursor_cols = _cursor_columns(stateseq)
+    for voice in CTRL_ADDRS:
+        ons = note_on.get(voice, [])
+        tick = _synth_tick(ons, n_frames)
+        note_cell = None
+        best_j, best_score = None, 0.99
+        for j in cursor_cols:
+            score = float(np.mean(grid[:, j] == tick))
+            if score > best_score:
+                best_score, best_j = score, j
+        if best_j is not None:
+            note_cell = int(addrs[best_j])
+            tick = grid[:, best_j].copy()
+        cursors = [
+            (int(addrs[j]), grid[:, j].copy())
+            for j in cursor_cols
+            if _cursor_resets_at(grid[:, j], ons)
+        ]
+        latents[voice] = {"tick": tick, "cursors": cursors, "note_cell": note_cell}
+    latents["global"] = _global_counter(grid, addrs, n_frames)
+    return latents
+
+
 def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContext:
     """Precompute the per-trace recovery context once (shared by analyze)."""
     if stateseq is None:
@@ -1264,6 +1366,10 @@ def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContex
     cursor_cols = _cursor_columns(stateseq)
     note_on = {v: _note_on_frames(trace, v, kind) for v in CTRL_ADDRS}
     all_on = sorted({f for frames in note_on.values() for f in frames})
+    n_frames = len(stateseq.ticks)
+    latents = _build_latents(stateseq, note_on, n_frames)
+    sampler = _CellSampler(trace, stateseq.ticks)
+    sampler.latents = latents
     return RecoverContext(
         kind=kind,
         stateseq=stateseq,
@@ -1272,9 +1378,10 @@ def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContex
         cursor_cols=cursor_cols,
         note_on=note_on,
         all_on=all_on,
-        n_frames=len(stateseq.ticks),
-        sampler=_CellSampler(trace, stateseq.ticks),
+        n_frames=n_frames,
+        sampler=sampler,
         reads_near=_reads_near_store(trace, stateseq.ticks, kind),
+        latents=latents,
     )
 
 
@@ -1571,10 +1678,29 @@ def _propose_table_walk(series, wr, ctx, sid_addr):
         cand["addr"] = int(sid_addr)
         cand.pop("gate_addr", None)
         cand["overrides"] = []
+        _annotate_cursor_latent(cand, ctx, sid_addr)
         _recover_gate(cand, series, ctx, sid_addr)
         recover_overrides(cand, series, ctx, sid_addr=sid_addr)
         out.append(cand)
     return out
+
+
+def _annotate_cursor_latent(desc, ctx, sid_addr):
+    """Tag a table-walk cursor with its shared per-voice latent id, when grouped.
+
+    When the recovered ``cursor_addr`` is one of the voice's latent cursors, every
+    register walked by that cursor reconstructs from the SAME latent (the JCH/FC
+    recovery rule: recover the cursor once). The latent cursor series equals the
+    cell's end-of-frame series, so the reconstruction is byte-identical -- only the
+    index *identity* is now shared, not independently re-derived per register.
+    """
+    voice, _off = _voice_of(sid_addr)
+    cursor = desc.get("cursor_addr")
+    if voice is None or cursor is None:
+        return
+    latent = ctx.latent_cursor(voice, cursor)
+    if latent is not None:
+        desc["index_latent"] = latent
 
 
 def _propose_binop(sid_addr, series, ctx):
@@ -2053,26 +2179,29 @@ def _pitch_table_for_cell(cursor, lo_o, hi_o, cmax, ram, ramhist, sample):
     return base_lo, int(hi_bases[k]), float(combined[k])
 
 
-def _pitch_index_cells(idx, inb, grid, addrs, tlen, primary, max_extra=2):
-    """Index cells whose end-of-frame sum reproduces a pitch-table index.
+def _greedy_index_sum(idx, inb, grid, addrs, clip_hi, primary, cols, max_extra):
+    """Greedy additive index recovery: cells whose EOF sum reproduces ``idx``.
 
-    ``idx`` is the per-frame table index inverted from the oracle (``-1`` off
-    table, ``inb`` marks the in-table frames). Starting from the ``primary``
-    column (the note cell), greedily add cells whose value explains the residual
-    ``idx - running``, keeping each only while it raises the in-table match. The
-    sum models ``note + transpose + arp/wavetable offset`` of the FC pitch walk.
+    Starting from the ``primary`` column, add cells (restricted to ``cols``) whose
+    value explains the residual ``idx - running`` while they raise the in-table
+    (``inb``) match. Shared core of :func:`_pitch_index_cells` (all columns, given
+    primary) and :func:`propose_index_sum` (candidate columns, discovered
+    primary). ``clip_hi`` bounds the index into the table.
     """
+    cand_cols = np.asarray(sorted(set(int(c) for c in cols)), dtype=np.int64)
     chosen = [int(addrs[primary])]
     running = grid[:, primary].copy()
     used = {primary}
 
     def score(run):
-        return float(np.mean((np.clip(run, 0, tlen - 1) == idx)[inb]))
+        return float(np.mean((np.clip(run, 0, clip_hi) == idx)[inb]))
 
     cur_score = score(running)
     for _ in range(max_extra):
         resid = idx - running
-        match = (grid == resid[:, None])[inb].mean(axis=0)
+        raw = (grid == resid[:, None])[inb].mean(axis=0)
+        match = np.full(len(raw), -1.0)
+        match[cand_cols] = raw[cand_cols]
         match[list(used)] = -1.0
         j = int(match.argmax())
         if j in used:
@@ -2085,6 +2214,51 @@ def _pitch_index_cells(idx, inb, grid, addrs, tlen, primary, max_extra=2):
         running = cand
         cur_score = score(cand)
     return chosen, running
+
+
+def _pitch_index_cells(idx, inb, grid, addrs, tlen, primary, max_extra=2):
+    """Index cells whose end-of-frame sum reproduces a pitch-table index.
+
+    ``idx`` is the per-frame table index inverted from the oracle (``-1`` off
+    table, ``inb`` marks the in-table frames). Starting from the ``primary``
+    column (the note cell), greedily add cells whose value explains the residual
+    ``idx - running``, keeping each only while it raises the in-table match. The
+    sum models ``note + transpose + arp/wavetable offset`` of the FC pitch walk.
+    """
+    return _greedy_index_sum(
+        idx, inb, grid, addrs, tlen - 1, primary, range(grid.shape[1]), max_extra
+    )
+
+
+def propose_index_sum(idx, ctx, sid_addr=None, inb=None, clip_hi=None, max_extra=2):
+    """Recover a table index as a sum of observable state cells (any table node).
+
+    The generalisation of :func:`_pitch_index_cells`: given a per-frame integer
+    index ``idx`` (``-1`` / ``inb=False`` off table) and the table's upper clip
+    bound ``clip_hi``, discover the best single index cell among the read-log
+    narrowed candidate columns, then greedily add cells whose EOF sum reproduces
+    ``idx``. Returns ``(index_cells, running)`` (``([], zeros)`` if no cell fits).
+    Usable by CTRL/PW/filter table lanes, not just the FC pitch walk.
+    """
+    idx = np.asarray(idx, dtype=np.int64)
+    n = len(idx)
+    if inb is None:
+        inb = idx >= 0
+    if not np.any(inb):
+        return [], np.zeros(n, dtype=np.int64)
+    if clip_hi is None:
+        clip_hi = int(idx[inb].max())
+    ss = ctx.stateseq
+    if ss is None or ss.grid.shape[1] == 0:
+        return [], np.zeros(n, dtype=np.int64)
+    grid = ss.grid.astype(np.int64)
+    addrs = ss.addrs
+    cols = ctx.candidate_cols(sid_addr)
+    if not cols:
+        return [], np.zeros(n, dtype=np.int64)
+    match = (np.clip(grid[:, cols], 0, clip_hi) == idx[:, None])[inb].mean(axis=0)
+    primary = int(cols[int(match.argmax())])
+    return _greedy_index_sum(idx, inb, grid, addrs, clip_hi, primary, cols, max_extra)
 
 
 def _pitch_walk(trace, sid_addr, reg_off, ctx):
@@ -2513,6 +2687,10 @@ class _CellSampler:
         self._atwrite: dict = {}
         self._operand: dict = {}
         self._written: dict = {}
+        # Shared per-voice latent state, attached by ``_build_context`` so the
+        # evaluator can resolve ``latent``/``tick`` index nodes; ``None`` when the
+        # sampler is built standalone (reconstruction falls back to eof cells).
+        self.latents = None
 
     def _cell_writes(self, addr):
         sel = self._rw[self._rw["addr"] == addr]
