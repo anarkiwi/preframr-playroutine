@@ -1578,6 +1578,7 @@ _PRIORITY = (
     "ADD",
     "SUB",
     "SELECT",
+    "PROGRAM",
     "SEQ",
     "FEEDER",
     "XSTATE",
@@ -1795,6 +1796,11 @@ def _arbitrate(cands, series, sid_addr, ctx, base):
     """
     s = np.asarray(series, dtype=np.int64)
     scored = [_score_candidate(cand, s, sid_addr, ctx) for cand in cands]
+    scored = [e for e in scored if e is not None]
+    scored += [
+        _score_candidate(prog, s, sid_addr, ctx)
+        for prog in propose_program(scored, s, sid_addr, ctx)
+    ]
     scored = [e for e in scored if e is not None]
     scored += [
         _score_candidate(sel, s, sid_addr, ctx) for sel in propose_select(scored, s, sid_addr, ctx)
@@ -2170,6 +2176,203 @@ def _override_descriptor(forced_byte, ctx, sid_addr=None):
     force_val = int(vals[counts.argmax()])
     terms = _find_override(forced_byte == force_val, ctx, sid_addr=sid_addr)
     return None if terms is None else {"predicate": terms, "force": force_val}
+
+
+# -- program (table-program interpreter) proposer -----------------------------
+#
+# The program node (ir._recon_program) is the interpreter behind GT2 pulse+filter,
+# JCH PW+filter, DMC filter and FC filter: a cursor walks a table of (duration,
+# step-or-SET) records, integrating an accumulator, with $FF-style loop rows.
+# ``propose_program`` fits it two ways, both grounded in the SERIES' constant-slope
+# run structure (never fixture-specific magic values):
+#
+#  1. Grounded: when a candidate RAM table (read-log ``ctx.tables`` first) decodes
+#     -- as interleaved (duration, value) records with a data-driven SET flag and a
+#     loop marker -- into a program that reproduces the series, adopt its records
+#     (recovering SET rows + the loop point that the series alone cannot spell).
+#  2. Series-only: otherwise every constant-slope run becomes one STEP record
+#     ``[len, slope, 0]`` (a jump is a length-1 record); exact by construction.
+#
+# It is offered only as an alternative to a FEEDER / imperfect incumbent (see
+# ``propose_program``) so it never displaces a structured BACC/TABLE_WALK winner,
+# and MDL (ir._cc_program: one record per run vs one replay value per changed
+# frame) then adopts it over the feeder it supplants.
+_PROGRAM_LOOP_MARKER = 0xFF  # a duration byte of $FF flags a loop row (value = target)
+_PROGRAM_MIN_RUNS = 3  # a genuine program has several records, not a flat/CONST series
+# A program is adopted only when its record count is meaningfully below the
+# register's changed-frame count (coarse slope structure) -- so a per-frame-random
+# feeder / mux (records ~= changed frames) is never re-encoded record-per-frame and
+# stolen from the FEEDER/SELECT it belongs to. Filter/pulse sweeps sit well under.
+_PROGRAM_RUN_FRAC = 0.85
+
+
+def _program_runs(series) -> np.ndarray:
+    """Constant-slope runs of a series as ``[length, slope]`` STEP records.
+
+    Each maximal run of a constant first difference ``slope`` over ``length``
+    frames becomes one record; a lone final frame (no outgoing slope) is emitted as
+    a trailing ``[1, 0]`` hold so the record lengths sum to exactly ``len(series)``.
+    Fed straight into :func:`_program_from_runs`.
+    """
+    s = np.asarray(series, dtype=np.int64).ravel()
+    n = len(s)
+    if n == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    if n == 1:
+        return np.array([[1, 0]], dtype=np.int64)
+    d = np.diff(s)
+    cuts = np.nonzero(np.diff(d) != 0)[0] + 1
+    starts = np.concatenate(([0], cuts))
+    ends = np.concatenate((cuts, [len(d)]))
+    recs = [[int(e - b), int(d[b])] for b, e in zip(starts, ends)]
+    recs.append([1, 0])  # the trailing value carried in the accumulator
+    return np.array(recs, dtype=np.int64)
+
+
+def _program_from_runs(series):
+    """Series-only program descriptor: one STEP record per constant-slope run."""
+    s = np.asarray(series, dtype=np.int64).ravel()
+    runs = _program_runs(s)
+    records = [[int(L), int(v), 0] for L, v in runs]
+    return {
+        "type": "PROGRAM",
+        "records": records,
+        "loop": None,
+        "seed": int(s[0]) if len(s) else 0,
+        "variant": "series",
+        "width": 8,
+    }
+
+
+def _int8(v: int) -> int:
+    """A table byte read as a signed step (``$80..$FF`` -> negative)."""
+    v &= 0xFF
+    return v - 256 if v >= 0x80 else v
+
+
+def _decode_program_table(ram, base, top):
+    """Decode a RAM byte region as interleaved ``(duration, value)`` records.
+
+    Data-driven record variants (no per-engine paths): a duration byte of
+    ``$FF`` is a loop row whose value byte is the target record index; a duration
+    byte with bit7 set is a SET row (absolute ``acc := value``, held ``dur & $7F``
+    frames); otherwise a STEP row (``acc += int8(value)`` for ``dur`` frames). A
+    ``0`` duration terminates. Returns ``(records, loop)`` or ``None``.
+    """
+    records, loop = [], None
+    idx = int(base)
+    while idx + 1 <= int(top):
+        dur = int(ram[idx])
+        val = int(ram[idx + 1])
+        idx += 2
+        if dur == 0:
+            break
+        if dur == _PROGRAM_LOOP_MARKER:
+            loop = val if 0 <= val < len(records) else 0
+            break
+        if dur & 0x80:
+            records.append([dur & 0x7F, val, 1])
+        else:
+            records.append([dur, _int8(val), 0])
+        if len(records) > 256:
+            break
+    if not records:
+        return None
+    return records, loop
+
+
+def _ground_program(series, ctx):
+    """A grounded program from a read-log candidate RAM table, or ``None``.
+
+    Searches ``ctx.tables`` (the read-log ``(base, top, valueset)`` candidates)
+    for a region whose decoded records reproduce ``series`` exactly (seeded at the
+    first value, cursor at 0). This is what recovers SET rows and the loop point
+    the series alone cannot distinguish.
+    """
+    if ctx.ram is None or not ctx.tables:
+        return None
+    s = np.asarray(series, dtype=np.int64).ravel()
+    n = len(s)
+    if n == 0:
+        return None
+    ram = np.asarray(ctx.ram, dtype=np.uint8)
+    seed = int(s[0])
+    for base, top, _vals in ctx.tables:
+        decoded = _decode_program_table(ram, base, top)
+        if decoded is None:
+            continue
+        records, loop = decoded
+        desc = {
+            "type": "PROGRAM",
+            "records": records,
+            "loop": loop,
+            "seed": seed,
+            "variant": "table",
+            "width": 8,
+            "time_base": int(base),
+            "spd_base": int(base) + 1,
+        }
+        recon = ir._recon_program(desc, n)  # pylint: disable=protected-access
+        if np.array_equal(recon & 0xFF, s & 0xFF):
+            return desc
+    return None
+
+
+def _best_base(scored):
+    """The highest-scoring already-scored candidate ``(cand, fid)`` or ``None``."""
+    best_cand, best_fid = None, -1.0
+    for cand, _tree, recon, _key in scored:
+        if recon is None:
+            continue
+        fid = _key[0]
+        if best_cand is None:
+            best_cand, best_fid = cand, fid
+            continue
+        if fid > best_fid or (fid == best_fid and cand.get("score", 0) > best_cand.get("score", 0)):
+            best_cand, best_fid = cand, fid
+    return None if best_cand is None else (best_cand, best_fid)
+
+
+_PROGRAM_INCUMBENTS = {"FEEDER", "XSTATE"}
+
+
+def propose_program(scored, series, sid_addr, ctx):
+    """Fit a table-program, but only where a FEEDER / imperfect register would win.
+
+    Gated on the scored base candidates so it never displaces a structured winner
+    (a fid-1.0 BACC/TABLE_WALK/SEQ): a program is offered only when the best base
+    candidate is a FEEDER/XSTATE or is itself imperfect. It reproduces the series
+    exactly (grounded in a read-log table when one decodes, else one STEP record
+    per run), and MDL charges one record per run vs the feeder's one replay value
+    per changed frame -- so the arbiter adopts it over the feeder it supplants.
+    """
+    n = ctx.n_frames
+    if not n:
+        return []
+    s = np.asarray(series, dtype=np.int64).ravel()
+    if len(s) != n:
+        return []
+    best = _best_base(scored)
+    if best is not None:
+        cand, fid = best
+        if fid >= 1.0 - 1e-9 and cand.get("type") not in _PROGRAM_INCUMBENTS:
+            return []
+    desc = _ground_program(s, ctx) or _program_from_runs(s)
+    records = desc.get("records", [])
+    # A program pays only when it captures FAR LESS state than the feeder it
+    # supplants: one record per constant-slope run vs one replay value per changed
+    # frame. Require the record count to be well under the register's changed-frame
+    # count (else a per-frame-random register -- rightly a feeder / mux -- would be
+    # re-encoded record-per-frame at no MDL gain and steal it).
+    changed = int(np.count_nonzero(np.diff(s) != 0)) + 1 if n > 1 else 1
+    if len(records) < _PROGRAM_MIN_RUNS or len(records) >= min(n, _PROGRAM_RUN_FRAC * changed):
+        return []
+    desc["addr"] = int(sid_addr)
+    desc["sid"] = int(sid_addr)
+    recon = ir.evaluate(ir.to_ir(desc), n, ctx.sampler)
+    if recon is None or float(np.mean(np.asarray(recon, dtype=np.int64) == s)) < 1.0 - 1e-9:
+        return []
+    return [desc]
 
 
 # -- select (mux) proposer ----------------------------------------------------

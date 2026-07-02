@@ -575,6 +575,98 @@ def test_select_magic_value_fitter_fails():
     assert round_trip(trace)[0xD402] == 1.0
 
 
+# -- program (table-program interpreter) -----------------------------------
+
+
+def _build_program_trace(reg, table, base, sid_addr=0xD416):
+    """Trace whose ``sid_addr`` register is ``reg`` each frame, with ``table`` in the
+    RAM image and a read log (one PC) walking every table byte -- so the read-log
+    candidate-table path (:func:`recover._read_log_tables`) surfaces it."""
+    ram = np.zeros(65536, dtype=np.uint8)
+    ram[base : base + len(table)] = np.frombuffer(table, dtype=np.uint8)
+    recs, ramrd = [], []
+    for i, v in enumerate(reg):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        # walk two table bytes per frame at a fixed read PC (an `LDA table,X` site).
+        k = (2 * i) % len(table)
+        ramrd.append(_ra(tick + 4, base + k, int(table[k]), pc=0x1500))
+        ramrd.append(
+            _ra(tick + 5, base + (k + 1) % len(table), int(table[(k + 1) % len(table)]), pc=0x1500)
+        )
+        recs.append(
+            _ev(
+                tick + 12,
+                SID_WRITE,
+                reg=sid_addr & 0x1F,
+                value=int(v) & 0xFF,
+                addr=sid_addr,
+                aux=0x1500,
+            )
+        )
+    evs = np.array(recs, dtype=EVENT_DTYPE)
+    evs.sort(order="cycle", kind="stable")
+    return Trace.from_events(
+        evs,
+        PAL_META,
+        ramrd=np.array(ramrd, dtype=RAMACCESS_DTYPE),
+        ram=ram,
+    )
+
+
+@pytest.mark.parametrize("seed", [0, 1, 5, 11])
+def test_program_recovers_set_and_loop(seed):
+    # A table-program lane (GT2/JCH record semantics): (duration, step) records
+    # with an absolute SET row and an $FF loop marker. The program fitter must
+    # recover the decoded records + loop point BYTE-EXACT from the RAM table and
+    # round-trip the register exactly. Parameter randomization (deterministic seed)
+    # exercises the fitter across its space, not at one magic point.
+    from _minisid import program_table, program_series, program_records
+
+    rng = np.random.default_rng(seed)
+    acc0 = int(rng.integers(20, 60))
+    # a random but in-range program: a few STEP rows, a SET row, more STEP rows,
+    # then a loop back into the body (so a short table fills the whole series).
+    rows = [
+        ("step", int(rng.integers(2, 6)), int(rng.integers(1, 6))),
+        ("step", int(rng.integers(2, 6)), 256 - int(rng.integers(1, 6))),
+        ("set", int(rng.integers(2, 5)), int(rng.integers(60, 120))),
+        ("step", int(rng.integers(2, 6)), 256 - int(rng.integers(1, 4))),
+        ("step", int(rng.integers(2, 6)), int(rng.integers(1, 4))),
+        ("loop", int(rng.integers(1, 3))),
+    ]
+    table = program_table(rows)
+    n = 300
+    reg = program_series(rows, acc0, n)
+    assert reg.min() >= 0 and reg.max() <= 255, (reg.min(), reg.max())
+    base = 0x2000
+    trace = _build_program_trace(reg, table, base, sid_addr=0xD416)
+    res = classify_register(trace, 0xD416)
+    assert res["type"] == "PROGRAM", res["type"]
+    exp_records, exp_loop = program_records(rows)
+    assert res["records"] == exp_records, (res["records"], exp_records)
+    assert res["loop"] == exp_loop
+    assert res.get("variant") == "table"
+    assert round_trip(trace)[0xD416] == 1.0
+
+
+def test_program_series_only_beats_feeder_on_runs():
+    # With no read log, the fitter falls back to one STEP record per constant-slope
+    # run -- exact by construction and, because runs <= changed frames, cheaper than
+    # a per-frame feeder. Here a long down-ramp (one run) is far cheaper than a
+    # feeder replaying every changed frame, so the program supplants it.
+    from preframr_playroutine import ir
+    from preframr_playroutine.recover import _program_from_runs
+
+    reg = np.concatenate([np.arange(120, 0, -1), np.arange(0, 120), np.arange(120, 0, -1)])
+    desc = _program_from_runs(reg)
+    desc["addr"] = 0xD416
+    recon = ir.evaluate(ir.to_ir(desc), len(reg), None)
+    assert np.array_equal(recon, reg.astype(np.int64))
+    # one record per run (+ terminal) is far fewer than per-frame changes.
+    assert len(desc["records"]) <= 6
+
+
 def test_reconstruct_pitchwalk_no_sampler_zeros():
     desc = {
         "type": "PITCHWALK",

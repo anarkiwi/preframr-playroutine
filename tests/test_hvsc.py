@@ -68,6 +68,7 @@ def _key(entry):
 _PERFECT = {
     ("DMC", "Doctagop.sid"),
     ("DMC", "In_My_Head.sid"),
+    ("DMC", "Guns_n_Ghosts.sid"),
     ("Soundmonitor", "Only_3.sid"),
     ("Soundmonitor", "Denarius.sid"),
     ("Soundmonitor", "Tom_Tom.sid"),
