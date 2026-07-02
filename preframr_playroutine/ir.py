@@ -296,19 +296,31 @@ def _predicate_terms(predicate):
                 yield ("mask", int(cell), int(cmask), int(cval))
 
 
+def predicate_mask(predicate, sampler, n) -> np.ndarray:
+    """Boolean per-frame mask where a predicate (conjunction of typed terms) holds.
+
+    Shared by :func:`_apply_overrides` and the ``select`` mux evaluator; with no
+    sampler an empty predicate holds everywhere.
+    """
+    sel = np.ones(n, dtype=bool)
+    if sampler is None:
+        return sel
+    for term in _predicate_terms(predicate):
+        col = sampler.eof(term[1])
+        if term[0] == "in":
+            sel &= np.isin(col, np.asarray(term[2], dtype=col.dtype))
+        else:
+            sel &= (col & term[2]) == term[3]
+    return sel
+
+
 def _apply_overrides(out, overrides, sampler) -> np.ndarray:
     """Force values where each override's cell-predicate conjunction holds."""
     if not overrides or sampler is None:
         return out
     n = len(out)
     for ov in overrides:
-        sel = np.ones(n, dtype=bool)
-        for term in _predicate_terms(ov.get("predicate", [])):
-            col = sampler.eof(term[1])
-            if term[0] == "in":
-                sel &= np.isin(col, np.asarray(term[2], dtype=col.dtype))
-            else:
-                sel &= (col & term[2]) == term[3]
+        sel = predicate_mask(ov.get("predicate", []), sampler, n)
         out = np.where(sel, int(ov["force"]), out)
     return out
 
@@ -458,6 +470,24 @@ def _ev_binop(node, n, sampler):
     return a + b
 
 
+def _ev_select(node, n, sampler):
+    """Per-frame mux: the first arm whose predicate holds, else ``default``.
+
+    ``arms`` is an ordered list of ``(predicate, expr)`` pairs (predicate a
+    conjunction of typed terms; expr any node). Evaluating in reverse and
+    overwriting gives first-match precedence where predicates overlap.
+    """
+    default = evaluate(node["default"], n, sampler)
+    out = np.zeros(n, dtype=np.int64) if default is None else np.array(default, dtype=np.int64)
+    for pred, expr in reversed(list(node["arms"])):
+        val = evaluate(expr, n, sampler)
+        if val is None:
+            continue
+        hold = predicate_mask(pred, sampler, n)
+        out = np.where(hold, np.asarray(val, dtype=np.int64), out)
+    return out
+
+
 def _ev_recur(node, n, sampler):
     return _recon_bacc_full(node, n, sampler)
 
@@ -478,6 +508,7 @@ _EVAL = {
     "binop": _ev_binop,
     "recur": _ev_recur,
     "cutoff": _ev_cutoff,
+    "select": _ev_select,
     "frame": _ev_frame,
     "latent": _ev_latent,
 }
@@ -619,6 +650,19 @@ def _cc_cutoff(node, _sampler, _n):
     return 1.0 + PARAM_COST * len(node.get("cells", {})), 0
 
 
+def _cc_select(node, sampler, n):
+    # A powerful node: charge every arm expr, the default, AND each predicate
+    # term (MDL-charged so an over-fit mux never out-scores a single arm that
+    # already fits). Captured-frame totals sum across arms + default.
+    cost, cap = _cost_captured(node["default"], sampler, n)
+    cost += 1.0
+    for pred, expr in node["arms"]:
+        ec, ecap = _cost_captured(expr, sampler, n)
+        cost += ec + sum(1 for _ in _predicate_terms(pred))
+        cap += ecap
+    return cost, cap
+
+
 _COST = {
     "post": _cc_post,
     "const": lambda node, _s, _n: (1.0, 0),
@@ -630,6 +674,7 @@ _COST = {
     "table": _cc_table,
     "recur": _cc_recur,
     "cutoff": _cc_cutoff,
+    "select": _cc_select,
     "frame": lambda node, _s, _n: (1.0, 0),
     "latent": lambda node, _s, _n: (1.0 + INDEX_COST, 0),
 }
@@ -843,6 +888,21 @@ def _pitchwalk_ir(d):
     return _post(expr, d, byte_role=d.get("byte_role", "full"), overrides=d.get("overrides", []))
 
 
+def _select_ir(d):
+    """A ``select`` mux descriptor -> ``post(select(arms, default))``.
+
+    ``arms`` is a list of ``(predicate, tree)`` and ``default_tree`` a tree; both
+    tree operands are already-built sub-hypothesis node trees (each an evaluatable
+    ``post`` node), so the mux composes recovered generators directly.
+    """
+    node = {
+        "op": "select",
+        "arms": [(list(pred), tree) for pred, tree in d["arms"]],
+        "default": d["default_tree"],
+    }
+    return _post(node, d)
+
+
 _BINOP_FN = {"XOR": "xor", "AND": "and", "OR": "or", "ADD": "add", "SUB": "sub"}
 
 
@@ -889,6 +949,7 @@ _TO_IR = {
     "COMPOSITE": _composite_ir,
     "PITCHWALK": _pitchwalk_ir,
     "CUTOFF": _cutoff_ir,
+    "SELECT": _select_ir,
     "XOR": lambda d: _binop_ir("XOR", d),
     "AND": lambda d: _binop_ir("AND", d),
     "OR": lambda d: _binop_ir("OR", d),

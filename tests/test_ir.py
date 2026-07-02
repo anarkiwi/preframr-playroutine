@@ -117,6 +117,51 @@ def test_evaluate_cursor_falls_back_to_eof_without_latents():
     assert list(out) == [9, 8, 7, 8, 9]
 
 
+def test_evaluate_select_first_match_and_default():
+    # sel cell: 0,1,2,1,0 -> arm A on sel bit0 set, arm B on sel==2, else default.
+    sel = np.array([0, 1, 2, 1, 0], dtype=np.int64)
+    sampler = _LatentSampler({}, eof_cells={0x30: sel})
+    a = {"op": "const", "value": 10}
+    b = {"op": "const", "value": 20}
+    default = {"op": "const", "value": 99}
+    node = {
+        "op": "select",
+        "arms": [
+            ([{"kind": "bit", "cell": 0x30, "mask": 0x01, "value": 0x01}], a),
+            ([{"kind": "eq", "cell": 0x30, "value": 2}], b),
+        ],
+        "default": default,
+    }
+    out = ir.evaluate(node, 5, sampler)
+    # frame2 sel==2: bit0 clear so arm A misses, arm B (eq 2) fires -> 20.
+    assert list(out) == [99, 10, 20, 10, 99]
+
+
+def test_select_complexity_charges_predicate_terms():
+    a = {"op": "const", "value": 1}
+    default = {"op": "const", "value": 0}
+    one_term = {
+        "op": "select",
+        "arms": [([{"kind": "eq", "cell": 0x30, "value": 1}], a)],
+        "default": default,
+    }
+    two_term = {
+        "op": "select",
+        "arms": [
+            (
+                [
+                    {"kind": "eq", "cell": 0x30, "value": 1},
+                    {"kind": "bit", "cell": 0x31, "mask": 0x02, "value": 0x02},
+                ],
+                a,
+            )
+        ],
+        "default": default,
+    }
+    # The extra predicate term must raise the MDL cost by exactly 1.
+    assert ir.complexity(two_term) == ir.complexity(one_term) + 1.0
+
+
 def test_recur_global_frame_index_drives_stride():
     # A tick-indexed reflecting sweep whose stride is read from a GLOBAL frame
     # counter (no note reset), verified against an independent simulation.
