@@ -1906,11 +1906,13 @@ def _pow2_mask(span: int) -> int:
     return m - 1
 
 
-def _find_table_in_image(ram, tab, gate):
+def _find_table_in_image(ram, tab, gate, present=None):
     """First image offset where a contiguous window equals ``tab`` (under ``gate``).
 
     Grounds a masked-cursor lookup in a REAL RAM table rather than a table
     fabricated from the data -- the anti-overfit gate for :func:`_masked_table_lookup`.
+    ``present`` (per-index bool) marks the table slots the data actually determined;
+    unobserved slots are wildcards in the match.
     """
     span = len(tab)
     if ram is None or span == 0 or span > len(ram):
@@ -1918,7 +1920,10 @@ def _find_table_in_image(ram, tab, gate):
     r = ram.astype(np.int64) & int(gate)
     t = np.asarray(tab, dtype=np.int64) & int(gate)
     windows = np.lib.stride_tricks.sliding_window_view(r, span)
-    pos = np.nonzero(np.all(windows == t[None, :], axis=1))[0]
+    eq = windows == t[None, :]
+    if present is not None:
+        eq = eq | ~np.asarray(present, dtype=bool)[None, :]
+    pos = np.nonzero(np.all(eq, axis=1))[0]
     return int(pos[0]) if len(pos) else None
 
 
@@ -1957,10 +1962,10 @@ def _masked_table_lookup(series, ctx, sid_addr, masks=(3, 7, 15, 31), max_cols: 
             if len(np.unique(mv)) < 3:
                 continue
             for gate in (0xFF, 0xFE):
-                res, tab = _mask_table_from_data(mv, s & gate, mask + 1, n)
+                res, tab, present = _mask_table_from_data(mv, s & gate, mask + 1, n)
                 if res <= best_res:
                     continue
-                base = _find_table_in_image(ram, tab, gate)
+                base = _find_table_in_image(ram, tab, gate, present)
                 if base is None:
                     continue
                 img = ram[base : base + mask + 1].astype(np.int64)
@@ -1992,22 +1997,19 @@ def _masked_table_lookup(series, ctx, sid_addr, masks=(3, 7, 15, 31), max_cols: 
 
 
 def _mask_table_from_data(mv, sg, span, n):
-    """(coverage, table) recovering ``table[m]`` as the modal register value per ``m``.
+    """(coverage, table, present) recovering ``table[m]`` = modal value per index ``m``.
 
     Coverage is the fraction of frames the deterministic ``(cell & mask) -> value``
     mapping explains; a genuine lookup is near-deterministic (coverage ~ 1), a
     coincidence is not -- so the caller's high floor rejects fabricated tables.
+    Vectorized via one ``(span, 256)`` joint histogram (no per-index python loop):
+    ``present`` marks the indices the data actually observed.
     """
-    tab = np.zeros(span, dtype=np.int64)
-    matched = 0
-    for v in range(span):
-        sel = mv == v
-        if not sel.any():
-            continue
-        vals, counts = np.unique(sg[sel], return_counts=True)
-        tab[v] = int(vals[counts.argmax()])
-        matched += int(counts.max())
-    return matched / max(1, n), tab
+    hist = np.bincount(mv * 256 + sg, minlength=span * 256).reshape(span, 256)
+    tab = hist.argmax(axis=1).astype(np.int64)
+    matched = int(hist.max(axis=1).sum())
+    present = hist.sum(axis=1) > 0
+    return matched / max(1, n), tab, present
 
 
 def _annotate_cursor_latent(desc, ctx, sid_addr):
