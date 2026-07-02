@@ -208,3 +208,5 @@ def test_real_tune_anchors(entry, tmp_path_factory):
     trace2 = _run_sidtrace(sid, prefix_b, entry["seconds"], entry.get("subtune", 1))
     assert np.array_equal(trace.events.view(np.uint8), trace2.events.view(np.uint8))
     assert np.array_equal(trace.ram_writes().view(np.uint8), trace2.ram_writes().view(np.uint8))
+    assert np.array_equal(trace.io_reads().view(np.uint8), trace2.io_reads().view(np.uint8))
+    assert np.array_equal(trace.io_writes().view(np.uint8), trace2.io_writes().view(np.uint8))

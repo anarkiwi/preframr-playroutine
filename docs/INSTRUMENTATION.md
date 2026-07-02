@@ -1,4 +1,4 @@
-# sidtrace instrumentation contract (v2)
+# sidtrace instrumentation contract (v3)
 
 This is the authoritative interface contract between the C++ tracer
 (`app/sidtrace.cpp` + `patches/instrument.patch`) and the Python tooling
@@ -37,6 +37,8 @@ work (IRQ) and any NMI work are separable, and Python can bin on either.
 | `<prefix>.bin` | event stream, `EVENT_DTYPE` (v1, 16 B) — SID writes + interrupts + CPU vectors |
 | `<prefix>.ramwr.bin` | RAM write log, `RAMACCESS_DTYPE` (16 B) |
 | `<prefix>.ramrd.bin` | RAM read log, `RAMACCESS_DTYPE` (only when `--reads`) |
+| `<prefix>.iord.bin` | I/O-area ($D000-$DFFF) read log, `RAMACCESS_DTYPE` (always emitted) |
+| `<prefix>.iowr.bin` | I/O-area ($D000-$DFFF) write log, `RAMACCESS_DTYPE` (always emitted) |
 | `<prefix>.cov.bin` | 8192-byte executed-PC bitmap (bit `pc` set if fetched in a play window) |
 | `<prefix>.ram` | 65536-byte C64 RAM image, dumped after init settle |
 | `<prefix>.json` | metadata sidecar (extended) |
@@ -64,14 +66,19 @@ work (IRQ) and any NMI work are separable, and Python can bin on either.
 - `value`: byte written/read.
 - `kind`: play-window kind — 0 = IRQ, 1 = NMI.
 
-Both `.ramwr.bin` and `.ramrd.bin` use this dtype. The stack page
-(`$0100-$01FF`) is excluded by the tracer. SID/IO writes ($D400-$D7FF) are NOT
-in this log (they are in `<prefix>.bin`); other IO ($D000-$DFFF) is excluded.
-RAM writes to the code region ARE included (self-modifying code).
+All of `.ramwr.bin`, `.ramrd.bin`, `.iord.bin` and `.iowr.bin` use this dtype.
+I/O-area ($D000-$DFFF) reads and writes are logged to the
+`.iord.bin`/`.iowr.bin` sidecars (SID writes additionally appear in
+`<prefix>.bin`). The stack page (`$0100-$01FF`) is excluded from the RAM logs
+unless `--stack` is given, in which case `$01xx` accesses flow into
+`.ramwr.bin`/`.ramrd.bin` with their natural addresses. RAM writes to the code
+region ARE included (self-modifying code).
 
 ## CLI (additions to `app/sidtrace.cpp`)
 
 - `--reads` — also emit the RAM read log (off by default; large).
+- `--stack` — include stack-page (`$01xx`) accesses in the RAM logs (off by
+  default).
 - `--no-ramwrites` / `--no-coverage` / `--no-ram` — disable individual v2 logs.
 - `--window irq|nmi|both` — which interrupt opens a play window (default `both`).
 - `--ram-dump-seconds S` — emulated time at which the `.ram` image is captured
@@ -87,6 +94,10 @@ file), `"ramwr_dtype"`/`"ramacc_fields"` (documented field order), `"window"`
 `"num_ram_reads"`, `"coverage_count"` (number of distinct executed PCs). Keep all
 v1 fields.
 
+v3 (`"schema_version": 3`, all v2 keys kept) adds: `"stack_enabled"` (bool),
+`"num_io_reads"`, `"num_io_writes"`, and always-present `"iord"`/`"iowr"`
+entries in `"artifacts"`.
+
 ## Python API (preframr_playroutine)
 
 `trace.py`:
@@ -95,6 +106,8 @@ v1 fields.
   empty arrays / None), exposed as:
   - `Trace.ram_writes(kind=None)` -> RAMACCESS array (optionally filtered by window kind)
   - `Trace.ram_reads(kind=None)` -> RAMACCESS array
+  - `Trace.io_reads(kind=None)` -> RAMACCESS array (I/O-area read log)
+  - `Trace.io_writes(kind=None)` -> RAMACCESS array (I/O-area write log)
   - `Trace.coverage_pcs()` -> np.ndarray of executed PCs (uint16, sorted)
   - `Trace.ram_image()` -> np.ndarray(65536, uint8) or None
   - `Trace.sid_write_pc()` -> convenience: PC column (aux) of SID writes

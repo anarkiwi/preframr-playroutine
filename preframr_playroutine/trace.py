@@ -100,6 +100,8 @@ class Trace:
         ramrd: np.ndarray | None = None,
         coverage: np.ndarray | None = None,
         ram: np.ndarray | None = None,
+        iord: np.ndarray | None = None,
+        iowr: np.ndarray | None = None,
     ):
         self.events = events
         self.meta = meta
@@ -107,6 +109,8 @@ class Trace:
         self._ramrd = ramrd if ramrd is not None else np.empty(0, dtype=RAMACCESS_DTYPE)
         self._coverage = coverage  # raw 8192-byte bitmap or None
         self._ram = ram  # 65536-byte image or None
+        self._iord = iord if iord is not None else np.empty(0, dtype=RAMACCESS_DTYPE)
+        self._iowr = iowr if iowr is not None else np.empty(0, dtype=RAMACCESS_DTYPE)
 
     # -- loading -----------------------------------------------------------
 
@@ -133,14 +137,16 @@ class Trace:
             ramrd=_load_ramacc(base + ".ramrd.bin"),
             coverage=_load_bytes(base + ".cov.bin"),
             ram=_load_bytes(base + ".ram"),
+            iord=_load_ramacc(base + ".iord.bin"),
+            iowr=_load_ramacc(base + ".iowr.bin"),
         )
 
     @classmethod
     def from_events(cls, events: np.ndarray, meta: dict | None = None, **kwargs) -> "Trace":
         """Build a trace directly from arrays (e.g. for tests).
 
-        Optional keyword args ``ramwr``, ``ramrd``, ``coverage``, ``ram`` seed
-        the v2 sidecar data.
+        Optional keyword args ``ramwr``, ``ramrd``, ``coverage``, ``ram``,
+        ``iord``, ``iowr`` seed the sidecar data.
         """
         return cls(events, meta or {}, **kwargs)
 
@@ -156,6 +162,20 @@ class Trace:
     def ram_reads(self, kind: int | None = None) -> np.ndarray:
         """RAM read log (RAMACCESS), optionally filtered by play-window kind."""
         arr = self._ramrd
+        if kind is not None:
+            arr = arr[arr["kind"] == kind]
+        return arr
+
+    def io_reads(self, kind: int | None = None) -> np.ndarray:
+        """I/O-area ($D000-$DFFF) read log, optionally filtered by window kind."""
+        arr = self._iord
+        if kind is not None:
+            arr = arr[arr["kind"] == kind]
+        return arr
+
+    def io_writes(self, kind: int | None = None) -> np.ndarray:
+        """I/O-area ($D000-$DFFF) write log, optionally filtered by window kind."""
+        arr = self._iowr
         if kind is not None:
             arr = arr[arr["kind"] == kind]
         return arr

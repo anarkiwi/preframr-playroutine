@@ -7,6 +7,7 @@ from preframr_playroutine import (
     CIA_IRQ,
     CPU_VECTOR,
     EVENT_DTYPE,
+    RAMACCESS_DTYPE,
     SID_WRITE,
     VEC_IRQ,
     VIC_IRQ,
@@ -180,6 +181,36 @@ def test_load_missing_json(tmp_path):
     loaded = Trace.load(str(base))
     assert loaded.meta == {}
     assert len(loaded.events) == len(trace.events)
+
+
+def test_load_io_logs(tmp_path):
+    trace = _vbi_trace(n_frames=4)
+    base = tmp_path / "x"
+    trace.events.tofile(str(base) + ".bin")
+    iord = np.array(
+        [(100, 0x100E, 0xD41B, 0x55, 0, 0), (200, 0x1014, 0xDC04, 0xAA, 1, 0)],
+        dtype=RAMACCESS_DTYPE,
+    )
+    iowr = np.array([(300, 0x101F, 0xD020, 0x01, 0, 0)], dtype=RAMACCESS_DTYPE)
+    iord.tofile(str(base) + ".iord.bin")
+    iowr.tofile(str(base) + ".iowr.bin")
+    loaded = Trace.load(str(base))
+    assert np.array_equal(loaded.io_reads(), iord)
+    assert np.array_equal(loaded.io_writes(), iowr)
+    assert len(loaded.io_reads(kind=0)) == 1
+    assert len(loaded.io_reads(kind=1)) == 1
+    assert len(loaded.io_writes(kind=1)) == 0
+
+
+def test_load_io_logs_absent(tmp_path):
+    trace = _vbi_trace(n_frames=4)
+    base = tmp_path / "noio"
+    trace.events.tofile(str(base) + ".bin")
+    loaded = Trace.load(str(base))
+    assert len(loaded.io_reads()) == 0
+    assert len(loaded.io_writes()) == 0
+    assert loaded.io_reads().dtype == RAMACCESS_DTYPE
+    assert loaded.io_writes().dtype == RAMACCESS_DTYPE
 
 
 def test_tick_kinds_irq_and_both():
