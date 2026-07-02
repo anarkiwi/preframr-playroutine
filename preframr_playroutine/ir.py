@@ -18,7 +18,7 @@ Node schemas (plain dicts; numpy arrays allowed as values)::
     {"op":"cell", "addr":int, "sample":"write"|"eof"|"operand", "sid":int}
     {"op":"lohi", "lo":node, "hi":node}
     {"op":"table", "data":uint8[], "index":node, "stride":int, "offset":int}
-    {"op":"binop", "fn":"or"|"and"|"xor"|"add", "a":node, "b":node}
+    {"op":"binop", "fn":"or"|"and"|"xor"|"add"|"sub", "a":node, "b":node}
     {"op":"recur", ...}    # every BACC field; ports _recon_bacc_full (incl tickband)
     {"op":"cutoff", ...}   # every CUTOFF field; ports _recon_cutoff
 """
@@ -104,10 +104,69 @@ def _recon_tickband(desc, n) -> np.ndarray:
     return out
 
 
+def _recon_product(desc, n) -> np.ndarray:
+    """Regenerate a segmented step x boundary product recurrence.
+
+    The general per-frame kernel (``recover._simulate_recur``) covers every cell
+    of ``{const, updown, table} x {wrap, saw, reflect, clampflip}`` from one
+    reseeded descriptor: ``step_kind``/``boundary`` name the axis values,
+    per-segment ``seeds``/``directions``/``steps``/``down_steps`` carry the local
+    state, and ``rate_tables``/``seg_tables`` hold the shared tick-rate programs
+    (``table`` step). The scalar-mode kernels above are the fixture-exercised
+    subset; this path evaluates the axis cells they cannot spell.
+    """
+    from . import recover  # pylint: disable=import-outside-toplevel,cyclic-import
+
+    resets = list(desc.get("resets", [0]))
+    seeds = list(desc.get("seeds", []))
+    dirs = list(desc.get("directions", []))
+    steps = list(desc.get("steps", []))
+    down_steps = list(desc.get("down_steps", []))
+    seg_tables = list(desc.get("seg_tables", []))
+    tables = desc.get("rate_tables", [])
+    lo, hi = int(desc["lo"]), int(desc["hi"])
+    step_kind = desc.get("step_kind", "const")
+    boundary = desc.get("boundary", "reflect")
+    modulus = desc.get("modulus")
+    if not resets or resets[0] != 0:
+        resets = [0] + resets
+        seeds = [seeds[0] if seeds else lo] + seeds
+    bounds = resets + [n]
+    out = np.zeros(n, dtype=np.int64)
+    for i, start in enumerate(resets):
+        length = bounds[i + 1] - start
+        if length <= 0:
+            continue
+        seed = seeds[i] if i < len(seeds) else lo
+        d = dirs[i] if i < len(dirs) else 1
+        up = steps[i] if i < len(steps) else int(desc.get("step", 1))
+        down = down_steps[i] if i < len(down_steps) else int(desc.get("down_step", up))
+        rate = None
+        if step_kind == "table":
+            ti = seg_tables[i] if i < len(seg_tables) else 0
+            rate = tables[ti] if ti < len(tables) else np.zeros(0, dtype=np.int64)
+        out[start : start + length] = recover._simulate_recur(  # pylint: disable=protected-access
+            lo,
+            hi,
+            int(seed),
+            int(d),
+            length,
+            boundary,
+            step_kind,
+            int(up),
+            int(down),
+            rate,
+            modulus,
+        )
+    return out
+
+
 def _recon_bacc_full(desc, n) -> np.ndarray:
     """Regenerate the full (8- or 16-bit) accumulator series from its descriptor."""
     if desc.get("mode") == "tickband":
         return _recon_tickband(desc, n)
+    if desc.get("mode") == "product":
+        return _recon_product(desc, n)
     resets = list(desc.get("resets", [0]))
     seeds = list(desc.get("seeds", [desc.get("phase", desc.get("lo", 0))]))
     if not resets or resets[0] != 0:
@@ -295,6 +354,8 @@ def _ev_binop(node, n, sampler):
         return a & b
     if fn == "xor":
         return a ^ b
+    if fn == "sub":
+        return a - b
     return a + b
 
 
@@ -429,8 +490,16 @@ def _cc_table(node, _sampler, _n):
     return 1.0 + _index_cost(node["index"]), 0
 
 
-def _cc_recur(node, _sampler, _n):
-    return 1.0 + PARAM_COST * (len(node.get("seeds", [])) + len(node.get("resets", []))), 0
+def _cc_recur(node, _sampler, n):
+    # Closed-form parameters (seeds/resets) are cheap; a tick-rate table is
+    # captured per-frame stride data, so it is charged like a replay cell
+    # (CAPTURED_W * captured-strides / n). This prices the old tickband anti-theft
+    # heuristic ("few shared tables") into MDL: many distinct rate tables => high
+    # cost, so a per-frame stride replay never out-scores a genuine generator.
+    params = len(node.get("seeds", [])) + len(node.get("resets", []))
+    rate = int(sum(len(t) for t in node.get("rate_tables", [])))
+    cost = 1.0 + PARAM_COST * params + CAPTURED_W * rate / max(1, n or 1)
+    return cost, rate
 
 
 def _cc_cutoff(node, _sampler, _n):
@@ -655,17 +724,40 @@ def _pitchwalk_ir(d):
     return _post(expr, d, byte_role=d.get("byte_role", "full"), overrides=d.get("overrides", []))
 
 
-def _pair_ir(kind, d):
+_BINOP_FN = {"XOR": "xor", "AND": "and", "OR": "or", "ADD": "add", "SUB": "sub"}
+
+
+def _binop_ir(kind, d):
+    """A ``{or,and,xor,add,sub}`` fold of two cells / a cell and a constant.
+
+    The 8-bit form (``cell_a`` op ``cell_b``/``const``) covers the CTRL/MODE-VOL
+    idioms; the 16-bit form (``base``/``mod`` lo-hi parts) is the ``add`` over a
+    freq/PW lo-hi pair. Overrides and the held-seed prelude are applied uniformly
+    when the descriptor carries them (absent for the plain folds)."""
+    fn = _BINOP_FN[kind]
+    if d.get("base") is not None:  # 16-bit lo/hi pair fold
+        mod = _comp_part_ir(d.get("mod"))
+        expr = {
+            "op": "binop",
+            "fn": fn,
+            "a": _comp_part_ir(d["base"]),
+            "b": mod if mod is not None else {"op": "const", "value": 0},
+        }
+        return _post(
+            expr,
+            d,
+            width_mask=d.get("width_mask", 0xFFFF),
+            byte_role=d.get("byte_role", "full"),
+            overrides=d.get("overrides", []),
+            prelude=_prelude_of(d),
+        )
     a = {"op": "cell", "addr": d["cell_a"], "sample": "write", "sid": d["sid"]}
     if d.get("cell_b") is not None:
         second = {"op": "cell", "addr": d["cell_b"], "sample": "write", "sid": d["sid"]}
     else:
         second = {"op": "const", "value": int(d.get("const", 0))}
-    fn = {"XOR": "xor", "AND": "and", "OR": "or"}[kind]
     expr = {"op": "binop", "fn": fn, "a": a, "b": second}
-    overrides = d.get("overrides", []) if kind == "AND" else []
-    prelude = _prelude_of(d) if kind == "OR" else None
-    return _post(expr, d, width_mask=0xFF, overrides=overrides, prelude=prelude)
+    return _post(expr, d, width_mask=0xFF, overrides=d.get("overrides", []), prelude=_prelude_of(d))
 
 
 _TO_IR = {
@@ -678,9 +770,11 @@ _TO_IR = {
     "COMPOSITE": _composite_ir,
     "PITCHWALK": _pitchwalk_ir,
     "CUTOFF": _cutoff_ir,
-    "XOR": lambda d: _pair_ir("XOR", d),
-    "AND": lambda d: _pair_ir("AND", d),
-    "OR": lambda d: _pair_ir("OR", d),
+    "XOR": lambda d: _binop_ir("XOR", d),
+    "AND": lambda d: _binop_ir("AND", d),
+    "OR": lambda d: _binop_ir("OR", d),
+    "ADD": lambda d: _binop_ir("ADD", d),
+    "SUB": lambda d: _binop_ir("SUB", d),
 }
 
 

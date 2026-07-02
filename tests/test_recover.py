@@ -19,12 +19,18 @@ from preframr_playroutine import (
     reconstruct_register,
     recover_tuning,
     round_trip,
-    segmented_bacc,
     state_sequence,
     voice_detune,
     voice_events,
 )
+from preframr_playroutine.recover import (
+    _recur_const,
+    _recur_product,
+    _segment_bounds,
+    _segmented_recur,
+)
 from preframr_playroutine.trace import CPU_VECTOR
+from _minisid import recur_series
 
 PAL_FRAME = 985248.444 / 50.0
 PAL_META = {"cpu_hz": 985248.444, "effective_model": "PAL"}
@@ -284,15 +290,19 @@ def _note_reseeded_triangle(notes, note_len):
     return (one * notes)[: notes * note_len]
 
 
-def test_segmented_bacc_recovers_reseeded_step():
+def test_segmented_recur_recovers_reseeded_step():
+    # The unified fitter's const-step vote recovers a note-reseeded accumulator.
     vals = np.array(_note_reseeded_triangle(6, 13), dtype=np.int64)
     resets = list(range(0, len(vals), 13))
-    fit = segmented_bacc(vals, resets)
+    fit = _recur_const(vals, _segment_bounds(vals, resets))
     assert fit is not None
     assert fit["type"] == "BACC"
     assert fit["step"] == 6
     assert fit["segmented"] is True
     assert fit["n_fit"] >= 3
+    # It is offered as a candidate by the unified proposer entry point too.
+    cands = _segmented_recur(vals, resets)
+    assert any(c["type"] == "BACC" and c["step"] == 6 for c in cands)
     # The same series with no resets has discontinuities at each note edge that
     # defeat a single global accumulator fit.
     assert fit_bacc(vals) is None
@@ -1672,9 +1682,9 @@ def test_table_walk_scan_parity(seed):
 
 from preframr_playroutine.recover import (  # noqa: E402
     _recon_bacc_full,
+    _recur_updown,
     _simulate_pingpong,
     _simulate_reflect,
-    segmented_pingpong,
 )
 
 
@@ -1705,13 +1715,13 @@ def test_reconstruct_bacc_pingpong_roundtrip():
     assert np.array_equal(recon, series)
 
 
-def test_segmented_pingpong_per_note_roundtrip():
-    # Two notes with different seeds and rates, reseeded; the descriptor keeps a
-    # per-segment step/direction and regenerates the whole series exactly.
+def test_recur_updown_per_note_roundtrip():
+    # Two notes with different seeds and rates, reseeded; the unified up/down
+    # clamp-flip fit keeps a per-segment step/direction and regenerates exactly.
     s1, _ = _simulate_pingpong(0, 200, 0, 200, 4, 6, 0, 1, 150)
     s2, _ = _simulate_pingpong(0, 200, 0, 200, 8, 5, 50, 1, 150)
     series = np.concatenate([s1, s2])
-    fit = segmented_pingpong(series, [0, 150])
+    fit = _recur_updown(series, _segment_bounds(series, [0, 150]))
     assert fit is not None
     assert fit["mode"] == "pingpong"
     assert fit["clamp_lo"] == 0 and fit["clamp_hi"] == 200
@@ -1735,8 +1745,8 @@ def test_pingpong_does_not_steal_mirror_reflect():
 
 from preframr_playroutine.recover import (  # noqa: E402
     _recon_tickband,
+    _recur_table,
     _simulate_tickreflect,
-    segmented_tickband,
 )
 
 
@@ -1756,13 +1766,13 @@ def _tickband_series(rate, lo, hi, seed, n_notes, note_len, direction=1):
     return np.array(series, dtype=np.int64), resets
 
 
-def test_segmented_tickband_recovers_rate_table():
+def test_recur_table_recovers_rate_table():
     # Stride varies with the tick (96,96,64,64,96,128...) and reflects at the PW
     # bounds; the fitter recovers a single shared rate table and reconstructs the
     # whole reseeded series exactly.
     rate = [96, 96, 64, 64, 96, 128, 128, 128, 128, 128]
     series, resets = _tickband_series(rate, 1536, 2592, 1536, 12, 14)
-    fit = segmented_tickband(series, resets)
+    fit = _recur_table(series, _segment_bounds(series, resets))
     assert fit is not None
     assert fit["type"] == "BACC"
     assert fit["mode"] == "tickband"
@@ -1805,11 +1815,11 @@ def test_classify_tickband_pw_roundtrip():
 
 
 def test_tickband_does_not_steal_constant_step():
-    # A constant per-note stride is a plain reflect, NOT tick-banded: the new mode
-    # must reject it (no within-note stride variation) and leave it to the scalar
-    # reflect/saw modes.
+    # A constant per-note stride is a plain reflect, NOT tick-banded: the table
+    # mode must reject it (no within-note stride variation) and leave it to the
+    # scalar reflect/saw modes.
     series, resets = _tickband_series([6] * 14, 0, 240, 0, 12, 16)
-    assert segmented_tickband(series, resets) is None
+    assert _recur_table(series, _segment_bounds(series, resets)) is None
     plain, _ = _simulate_reflect(0, 240, 6, 0, 1, 400)
     fit = fit_bacc(np.asarray(plain))
     assert fit is not None and fit["mode"] == "reflect"
@@ -1821,7 +1831,7 @@ def test_tickband_rejects_noise():
     rng = np.random.default_rng(5)
     series = rng.integers(0, 4096, size=600).astype(np.int64)
     resets = list(range(0, 600, 6))
-    assert segmented_tickband(series, resets) is None
+    assert _recur_table(series, _segment_bounds(series, resets)) is None
 
 
 def test_or_modevol_cell_or_const():
@@ -2080,3 +2090,193 @@ def test_sampler_operand_pre_store():
     samp = _CellSampler(trace, trace.tick_cycles("auto"))
     assert list(samp.at_write(cell, sid)) == [100, 101, 102, 103, 104]
     assert list(samp.operand(cell, sid)) == [10, 11, 12, 13, 14]
+
+
+# -- step x boundary product fitter (all 12 cells, randomized params) ------
+
+from preframr_playroutine import ir as _ir  # noqa: E402
+
+# Diverse, deterministic parameterizations proven to round-trip per product cell
+# (a fitter that only recovers the HVSC magic constants fails these). Scalar cells
+# carry (lo, hi, up, |down|); table cells carry (lo, hi, rate) with a per-note
+# tick ramp settling to a constant tail (the FC/tickband regime). Each cell has a
+# small fixed set of variants -- the anti-overfitting mechanism (section 5b).
+_SCALAR_VARIANTS = [(0, 48, 6, 8), (0, 60, 5, 10), (0, 120, 8, 12)]
+_TABLE_VARIANTS = {
+    "wrap": [
+        (0, 48, [4, 8, 12, 24, 24, 24, 24, 24, 24, 24]),
+        (8, 104, [16, 32, 48, 48, 48, 48, 48]),
+        (0, 96, [8, 16, 24, 48, 48, 48, 48, 48]),
+    ],
+    "saw": [
+        (0, 48, [4, 8, 12, 24, 24, 24, 24, 24, 24, 24]),
+        (0, 60, [10, 20, 20, 20, 20, 20, 20, 20]),
+        (0, 96, [16, 16, 32, 48, 48, 48, 48, 48]),
+    ],
+    "reflect": [
+        (0, 48, [4, 8, 12, 24, 24, 24, 24, 24, 24, 24]),
+        (8, 104, [16, 32, 48, 48, 48, 48, 48]),
+        (0, 84, [12, 12, 24, 24, 24, 24, 24]),
+    ],
+    "clampflip": [
+        (0, 48, [4, 8, 12, 24, 24, 24, 24, 24, 24, 24]),
+        (0, 60, [10, 20, 20, 20, 20, 20, 20, 20]),
+        (0, 96, [16, 16, 32, 48, 48, 48, 48, 48]),
+    ],
+}
+_STEP_KINDS = ("const", "updown", "table")
+_BOUNDARIES = ("wrap", "saw", "reflect", "clampflip")
+
+
+def _product_cases():
+    for step_kind in _STEP_KINDS:
+        for boundary in _BOUNDARIES:
+            variants = _TABLE_VARIANTS[boundary] if step_kind == "table" else _SCALAR_VARIANTS
+            for vi, spec in enumerate(variants):
+                yield pytest.param(step_kind, boundary, spec, id=f"{step_kind}-{boundary}-{vi}")
+
+
+@pytest.mark.parametrize("step_kind,boundary,spec", list(_product_cases()))
+def test_product_fitter_recovers_cell(step_kind, boundary, spec):
+    # The unified recurrence fitter recovers EVERY cell of the
+    # {const,updown,table} x {wrap,saw,reflect,clampflip} product on a reseeded
+    # synthetic series and reconstructs it frame-exact. Reconstruction (not a
+    # magic-value match) is the anti-overfitting gate across the diverse variants.
+    if step_kind == "table":
+        lo, hi, rate = spec
+        up = down = 0
+        seeds = [lo] * 10
+    else:
+        lo, hi, up, down = spec
+        rate = None
+        seeds = [lo + (k * up) % (hi - lo) for k in range(10)]
+    series, resets = recur_series(lo, hi, seeds, 30, boundary, step_kind, up, down, rate)
+    # Feed the known note bounds so each segment is intact (the product fitter's
+    # per-segment job); segmentation is exercised separately by the real-trace
+    # tests. A wrap/saw reset mid-note otherwise reads as a discontinuity cut.
+    bounds = list(resets) + [len(series)]
+    desc = _recur_product(series, bounds)
+    assert desc is not None
+    assert desc["type"] == "BACC" and desc["mode"] == "product"
+    recon = _ir._recon_product(desc, len(series))  # noqa: SLF001
+    assert np.array_equal(recon, series), (step_kind, boundary, spec)
+    # The boundary was genuinely exercised (the sweep turns / resets, not a short
+    # monotone ramp) -- so the cell is really tested, not trivially reproduced.
+    assert np.any(np.diff(series) < 0)
+    # Round-trips through the public reconstruction path (to_ir -> evaluate).
+    rt = reconstruct_register(desc, _ticks(len(series)))
+    assert np.array_equal(rt, series)
+
+
+def test_product_table_step_genuinely_varies():
+    # A table-step cell must recover a per-tick VARYING stride, not a constant
+    # (which the scalar modes already cover) -- proves the table axis is real.
+    lo, hi, rate = _TABLE_VARIANTS["reflect"][1]
+    series, resets = recur_series(lo, hi, [lo] * 8, 30, "reflect", "table", 0, 0, rate)
+    desc = _recur_product(series, list(resets) + [len(series)])
+    assert desc["step_kind"] == "table"
+    table = np.asarray(desc["rate_tables"][0])
+    assert len(np.unique(table[table != 0])) > 1
+
+
+def test_product_fitter_loses_to_constant_step_on_cost():
+    # On a clean constant-step reflect the product cell must not out-score the
+    # scalar recurrence: the rate-table capture is MDL-charged, so a per-frame
+    # stride replay is more expensive than the closed-form generator.
+    series, resets = recur_series(0, 60, [0, 20, 40, 10, 30], 40, "reflect", "const", 5, 5, None)
+    bounds = _segment_bounds(series, resets)
+    scalar = _recur_const(series, bounds)
+    product = _recur_product(series, bounds)
+    assert scalar is not None and product is not None
+    # Both reconstruct the series, but the product (captured rate tables) costs more.
+    n = len(series)
+    assert _ir.complexity(_ir.to_ir(product), None, n) > _ir.complexity(_ir.to_ir(scalar), None, n)
+
+
+# -- unified binop proposer (add / sub / or / and / xor) -------------------
+
+
+def _binop_reg_trace(target, cells, n=60, sid_addr=0xD418):
+    """Trace where ``target[i]`` is written to ``sid_addr`` each frame and every
+    ``(addr, series)`` in ``cells`` is a RAM feeder written just before the store."""
+    recs, ramwr = [], []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        for off, (addr, ser) in enumerate(cells):
+            ramwr.append(_ra(tick + 4 + off, addr, int(ser[i])))
+        recs.append(
+            _ev(
+                tick + 20,
+                SID_WRITE,
+                reg=sid_addr & 0x1F,
+                value=int(target[i]) & 0xFF,
+                addr=sid_addr,
+                aux=0x1500,
+            )
+        )
+    return _build_trace(recs, ram_writes=ramwr)
+
+
+# A control-like operand carries only a handful of distinct values (the binop
+# prefilter -- like the former pair searches -- scans low-entropy cells).
+_LOWENT = [0x02, 0x10, 0x12, 0x20, 0x22, 0x30, 0x32, 0x40, 0x42, 0x50, 0x52, 0x60]
+
+
+def test_binop_add_cell_const():
+    # $D418 written as ``cell + const`` (an additive bias on a low-entropy byte):
+    # neither the cell nor a single feeder reproduces it, but the exact 8-bit add
+    # with a carry (so it is not merely an OR) does.
+    rng = np.random.default_rng(1)
+    n = 60
+    base = np.array([_LOWENT[int(rng.integers(0, len(_LOWENT)))] for _ in range(n)])
+    target = (base + 0x1F) & 0xFF  # low-bit carry -> a genuine add, not an OR
+    trace = _binop_reg_trace(target, [(0x40, base)], n=n)
+    res = analyze(trace)
+    assert res[0xD418]["type"] == "ADD", res[0xD418]["type"]
+    assert res[0xD418]["cell_a"] == 0x40 and res[0xD418]["const"] == 0x1F
+    assert round_trip(trace)[0xD418] == 1.0
+
+
+def test_binop_add_cell_cell():
+    # $D418 written as ``cellA + cellB`` (two low-entropy operands summed with
+    # carry -- distinct from an OR of the same pair).
+    rng = np.random.default_rng(2)
+    n = 60
+    a = np.array([_LOWENT[int(rng.integers(0, len(_LOWENT)))] for _ in range(n)])
+    b = np.array([(0x0C, 0x14, 0x1C)[int(rng.integers(0, 3))] for _ in range(n)])
+    target = (a + b) & 0xFF
+    trace = _binop_reg_trace(target, [(0x40, a), (0x41, b)], n=n)
+    res = analyze(trace)
+    assert res[0xD418]["type"] == "ADD", res[0xD418]["type"]
+    assert {res[0xD418]["cell_a"], res[0xD418]["cell_b"]} == {0x40, 0x41}
+    assert round_trip(trace)[0xD418] == 1.0
+
+
+def test_binop_sub_cell_cell():
+    # $D418 written as ``cellA - cellB``: subtraction of two cells is the one fold
+    # an add cannot express (a const sub folds into an add mod 256), so SUB wins.
+    rng = np.random.default_rng(4)
+    n = 60
+    a = np.array([_LOWENT[int(rng.integers(6, len(_LOWENT)))] for _ in range(n)])  # larger
+    b = np.array([(0x02, 0x10, 0x12, 0x20)[int(rng.integers(0, 4))] for _ in range(n)])
+    target = (a - b) & 0xFF
+    trace = _binop_reg_trace(target, [(0x40, a), (0x41, b)], n=n)
+    res = analyze(trace)
+    assert res[0xD418]["type"] == "SUB", res[0xD418]["type"]
+    assert res[0xD418]["cell_a"] == 0x40 and res[0xD418]["cell_b"] == 0x41
+    assert round_trip(trace)[0xD418] == 1.0
+
+
+def test_binop_add_sub_randomized_constants():
+    # Parameter randomization: the add/sub const search recovers the offset from
+    # the residual histogram across many constants (not a hardcoded magic value).
+    for seed, const in ((10, 0x07), (11, 0x1D), (12, 0x25), (13, 0x2B)):
+        rng = np.random.default_rng(seed)
+        n = 64
+        base = np.array([_LOWENT[int(rng.integers(0, len(_LOWENT)))] for _ in range(n)])
+        target = (base + const) & 0xFF
+        trace = _binop_reg_trace(target, [(0x40, base)], n=n)
+        res = analyze(trace)
+        assert res[0xD418]["type"] in ("ADD", "SUB"), (const, res[0xD418]["type"])
+        assert round_trip(trace)[0xD418] == 1.0

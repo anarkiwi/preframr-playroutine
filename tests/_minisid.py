@@ -8,6 +8,8 @@ calls it from a VIC raster IRQ (VBI); set, from a CIA timer IRQ.
 
 import struct
 
+import numpy as np
+
 LOAD = 0x1000
 INIT = 0x1000
 PLAY = 0x1003
@@ -148,3 +150,66 @@ def build_psid(speed: int = 0) -> bytes:
 def build_ioprobe_psid() -> bytes:
     """Return the I/O-probe PSID (VBI-driven; exercises I/O reads + writes)."""
     return _build_psid(0, IOPROBE_INIT, IOPROBE_PLAY, IOPROBE_CODE)
+
+
+def recur_segment(lo, hi, seed, direction, length, boundary, step_kind, up=1, down=1, rate=None):
+    """Reference simulator for one step x boundary product segment.
+
+    A deliberately INDEPENDENT reimplementation of the recovery kernel
+    (``recover._simulate_recur``): the product-fitter tests build ground truth
+    here and recover it there, so a bug in one is not masked by the other.
+    ``step_kind`` in {const, updown, table}; ``boundary`` in
+    {wrap, saw, reflect, clampflip}."""
+    rate = None if rate is None else [int(x) for x in rate]
+    m = 0 if rate is None else len(rate)
+    span = hi - lo
+    out = []
+    v, d = int(seed), int(direction)
+    for i in range(length):
+        out.append(v)
+        if step_kind == "table":
+            if m == 0:
+                continue
+            st = rate[i] if i < m else rate[m - 1]
+        elif step_kind == "updown":
+            st = up if d > 0 else down
+        else:
+            st = up
+        nv = v + d * st
+        if boundary == "wrap":
+            mod = (span + st) if span > 0 else 1
+            nv = lo + ((nv - lo) % mod)
+        elif boundary == "saw":
+            if nv > hi or nv < lo:
+                nv = lo
+        elif boundary == "reflect":
+            if nv > hi:
+                d = -d
+                nv = hi - (nv - hi)
+            elif nv < lo:
+                d = -d
+                nv = lo + (lo - nv)
+        else:  # clampflip
+            if nv > hi:
+                d = -d
+                nv = hi
+            elif nv < lo:
+                d = -d
+                nv = lo
+        v = nv
+    return np.array(out, dtype=np.int64)
+
+
+def recur_series(lo, hi, seeds, length, boundary, step_kind, up=1, down=1, rate=None):
+    """A reseeded multi-note product series and its note-on reset frames.
+
+    Each entry of ``seeds`` seeds one note segment of ``length`` frames; the
+    return is ``(series, resets)`` where ``resets`` are the segment start frames
+    (the synthesized note-ons the product fitter segments on)."""
+    segs, resets, acc = [], [], 0
+    for seed in seeds:
+        resets.append(acc)
+        seg = recur_segment(lo, hi, seed, 1, length, boundary, step_kind, up, down, rate)
+        segs.append(seg)
+        acc += len(seg)
+    return np.concatenate(segs), resets
