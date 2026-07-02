@@ -14,25 +14,23 @@ assertion below):
     (``overall == 1.0``, zero ``XSTATE``); a tune NOT in ``_PERFECT`` that has
     become perfect fails the test until it is promoted into ``_PERFECT`` (the
     old strict-xfail forcing, expressed without xfail so the ratchet survives).
-``test_real_tune_anchors`` independently pins the DMC and GoatTracker2
-register classifications against their reverse-engineering docs, guarding those
-specifics regardless of the perfect gate.
+``test_real_tune_anchors`` independently pins the DMC, GoatTracker2 and JCH
+register classifications (and cell-address facts) against their
+reverse-engineering docs, guarding those specifics regardless of the perfect
+gate. The deeper, license-walled cross-check that reads the private re-trackers
+repo lives in ``tests/test_retrackers.py`` (skipped in CI).
 """
 
 import json
 import os
-import shutil
-import subprocess
 
 import numpy as np
 import pytest
 
-from preframr_playroutine import Trace, analyze, round_trip
+from preframr_playroutine import analyze, round_trip
 
-from _hvsc import ensure_tune, fetchable, load_catalog
-
-SIDTRACE = shutil.which("sidtrace") or "/usr/local/bin/sidtrace"
-HAVE_SIDTRACE = os.path.exists(SIDTRACE)
+from _hvsc import fetchable, load_catalog
+from _render import HAVE_SIDTRACE, render_tune, run_sidtrace
 
 CATALOG = load_catalog()
 
@@ -100,10 +98,52 @@ _SR = (0xD406, 0xD40D, 0xD414)
 _PW = (0xD402, 0xD403, 0xD409, 0xD40A, 0xD410, 0xD411)
 _CTRL = (0xD404, 0xD40B, 0xD412)
 
-# The two tunes pinned against their reverse-engineering docs.
-_ANCHORS = [
-    e for e in CATALOG if _key(e) in {("DMC", "Doctagop.sid"), ("GoatTracker2", "Raindrops.sid")}
-]
+# Reverse-engineering FACTS (cell ADDRESSES only; no disassembly/prose copied)
+# hardcoded here so the CI anchor test cross-checks the recovered descriptors
+# against re-trackers ground truth WITHOUT reading the private repo at runtime
+# (docs/GENERIC_RECOVERY.md section 2, License wall). The deeper, license-walled
+# cross-check that reads re-trackers lives in tests/test_retrackers.py and skips
+# in CI. A whole-song fixture renders without --reads, so a gate cell (the RE
+# ``AND gatemask`` term) is recovered as a constant SID mask (0xFE lets the gate
+# through / 0xFF passes it) -- the verified-equivalent of the gate-cell fold.
+_GATE_MASKS = (0xFE, 0xFF)
+# DMC (dmc-generators.md): CTRL is a waveform TABLE-WALK ``$18AD[wavecur]`` gated
+# by ``gatemask $100F``; ``wavecur`` is a per-voice cursor cell in the $177x
+# voice-state block. PW is a 16-bit up/down reflect BACC whose hi-byte bounds are
+# seeded from pw_min/pw_max cells ($1756/$1759 for voice 1).
+_DMC_WAVE_CURSOR_BLOCK = (0x1770, 0x178F)
+_DMC_GATE_CELL = 0x100F
+_DMC_PW_BOUND_CELLS = (0x1756, 0x1759)
+# GoatTracker2 (goattracker2-generators.md): CTRL = chnwave ($93B9) AND chngate
+# ($93D0); chnwave is a TABLE-WALK of ``wavetbl[chnwaveptr $93B8]``.
+_GT2_WAVE_CURSOR_BLOCK = (0x93B0, 0x93BF)
+_GT2_GATE_CELL = 0x93D0
+# JCH_NewPlayer (jch-generators.md): MODE/VOL $D418 = $1793 | $1009 (filter-mode
+# hi-nibble OR base volume).
+_JCH_D418_CELLS = (0x1793, 0x1009)
+
+# The tunes pinned against their reverse-engineering docs (DMC, GoatTracker2,
+# JCH -- the cheap 12s worktune -- one fixture per anchored engine).
+_ANCHOR_KEYS = {
+    ("DMC", "Doctagop.sid"),
+    ("GoatTracker2", "Raindrops.sid"),
+    ("JCH_NewPlayer", "24th_Amaranth_Grand_Prix_3.sid"),
+}
+_ANCHORS = [e for e in CATALOG if _key(e) in _ANCHOR_KEYS]
+
+
+def _walk_cursors(result, addrs):
+    """{addr: descriptor} for the TABLE_WALK-typed registers among ``addrs``."""
+    return {a: result[a] for a in addrs if result.get(a, {}).get("type") == "TABLE_WALK"}
+
+
+def _cells_of(desc):
+    """Cell addresses a binop/table descriptor references (cell_a/cell_b/cursor)."""
+    cells = set()
+    for key in ("cell_a", "cell_b", "cursor_addr"):
+        if key in desc:
+            cells.add(int(desc[key]))
+    return cells
 
 
 def _types(result, addrs):
@@ -111,13 +151,15 @@ def _types(result, addrs):
 
 
 def _assert_register_classes(entry, trace, result):
-    """Anchor recovery quality + round-trip fidelity on the DMC and GT2 tunes.
+    """Anchor recovery quality + round-trip fidelity on the DMC, GT2 and JCH tunes.
 
-    Both named tunes are checked against their reverse-engineering docs
-    (``re-trackers/DMC`` and ``re-trackers/GoatTracker2``). Round-trip fidelity
+    Each named tune is checked against its reverse-engineering doc
+    (``re-trackers/{DMC,GoatTracker2,JCH_NewPlayer}``). Round-trip fidelity
     (regenerated descriptor vs oracle) is the real correctness metric: the
     recovered registers must reconstruct essentially exactly (per-register
-    >= 0.99) and the whole tune near-perfectly (overall >= 0.95).
+    >= 0.99) and the whole tune near-perfectly (overall >= 0.95). Cell-address
+    facts (documented in the ``_*_CELL``/``_*_CELLS``/``_*_BLOCK`` constants) are
+    asserted against the recovered descriptor dicts.
     """
     family = entry.get("family")
     fid = round_trip(trace)
@@ -142,6 +184,13 @@ def _assert_register_classes(entry, trace, result):
         assert "TABLE_WALK" in ctrl_types.values(), ctrl_types
         for addr in _AD + _SR + _PW + _CTRL:
             assert fid[addr] >= 0.99, (hex(addr), result[addr]["type"], fid[addr])
+        # RE fact: each waveform TABLE_WALK CTRL walks a $177x wave cursor and
+        # applies the $100F gate as a constant SID mask (the no-reads equivalent).
+        lo, hi = _DMC_WAVE_CURSOR_BLOCK
+        for addr, desc in _walk_cursors(result, _CTRL).items():
+            cur = int(desc["cursor_addr"])
+            assert lo <= cur <= hi, (hex(addr), hex(cur), desc.get("mask"))
+            assert int(desc["mask"]) in _GATE_MASKS, (hex(addr), hex(cur), desc.get("mask"))
 
     if family == "GoatTracker2":
         # goattracker2-generators.md: AD/SR per-note SEQ (+ hard restart); the
@@ -152,39 +201,30 @@ def _assert_register_classes(entry, trace, result):
             assert t == "BACC", (hex(addr), t)
         for addr in _AD + _SR + (0xD409, 0xD40A):
             assert fid[addr] >= 0.99, (hex(addr), result[addr]["type"], fid[addr])
+        # RE fact: CTRL = chnwave AND chngate, chnwave = wavetbl[chnwaveptr $93B8].
+        # Whatever CTRL registers recover as a waveform TABLE_WALK must walk a
+        # $93Bx wave cursor under a constant gate mask (the $93D0-gate equivalent).
+        lo, hi = _GT2_WAVE_CURSOR_BLOCK
+        for addr, desc in _walk_cursors(result, _CTRL).items():
+            cur = int(desc["cursor_addr"])
+            assert lo <= cur <= hi, (hex(addr), hex(cur), desc.get("mask"))
+            assert int(desc["mask"]) in _GATE_MASKS, (hex(addr), hex(cur), desc.get("mask"))
+
+    if family == "JCH_NewPlayer":
+        # jch-generators.md: MODE/VOL $D418 = $1793 | $1009. The blit OR-folds the
+        # instrument filter-mode nibble ($1793) with the base volume/mode ($1009).
+        # The arbiter recovers this exactly (fid == 1.0 on this perfect tune); when
+        # it spells it as an OR fold both source cells are referenced.
+        d418 = result.get(0xD418, {})
+        assert fid.get(0xD418, 0.0) >= 0.99, (d418.get("type"), fid.get(0xD418))
+        # jch-generators.md classifies $D418 as SEQ (mode<<4 | vol); the arbiter
+        # may instead spell the same value stream as the OR fold (both verified
+        # equivalent). When it is the OR fold, both source cells are referenced.
+        assert d418.get("type") in ("OR", "SEQ", "CONST"), (d418.get("type"), d418)
+        if d418.get("type") == "OR":
+            assert set(_JCH_D418_CELLS) <= _cells_of(d418), (d418.get("type"), d418)
 
     assert fid["overall"] >= 0.95, fid["overall"]
-
-
-def _run_sidtrace(sid_path, prefix, seconds, subtune):
-    subprocess.run(
-        [
-            SIDTRACE,
-            "--seconds",
-            str(seconds),
-            "--song",
-            str(subtune),
-            "--out",
-            prefix,
-            sid_path,
-        ],
-        check=True,
-        capture_output=True,
-    )
-    return Trace.load(prefix)
-
-
-def _render(entry, work):
-    """Render a fixture whole-song, no reads (CI conditions); return the trace."""
-    sid = ensure_tune(entry)
-    prefix = str(work / "a")
-    trace = _run_sidtrace(sid, prefix, entry["seconds"], entry.get("subtune", 1))
-    assert len(trace.events) > 0
-    assert len(trace.ram_writes()) > 0
-    assert len(trace.coverage_pcs()) > 0
-    img = trace.ram_image()
-    assert img is not None and len(img) == 65536
-    return sid, prefix, trace
 
 
 @pytest.mark.parametrize("entry", CATALOG, ids=[_ids(e) for e in CATALOG])
@@ -197,7 +237,7 @@ def test_real_tune_perfect(entry, tmp_path_factory):
     if not fetchable(entry):
         pytest.skip(f"tune not fetchable: {entry['path']}")
     work = tmp_path_factory.mktemp("hvsc")
-    _sid, _prefix, trace = _render(entry, work)
+    _sid, _prefix, trace = render_tune(entry, work)
 
     result = analyze(trace)
     classified = sum(v for k, v in result["summary"].items())
@@ -249,7 +289,7 @@ def test_arbiter_calibration(entry, tmp_path_factory):
     if not fetchable(entry):
         pytest.skip(f"tune not fetchable: {entry['path']}")
     work = tmp_path_factory.mktemp("hvsc")
-    _sid, _prefix, trace = _render(entry, work)
+    _sid, _prefix, trace = render_tune(entry, work)
     result = analyze(trace)
     for reg, expected in snap.get("regs", {}).items():
         addr = int(reg, 16)
@@ -259,18 +299,18 @@ def test_arbiter_calibration(entry, tmp_path_factory):
 
 @pytest.mark.parametrize("entry", _ANCHORS, ids=[_ids(e) for e in _ANCHORS])
 def test_real_tune_anchors(entry, tmp_path_factory):
-    """Pin DMC/GT2 register classifications + per-register fidelity (non-xfail)."""
+    """Pin DMC/GT2/JCH register classes + cell facts + per-register fidelity."""
     if not fetchable(entry):
         pytest.skip(f"tune not fetchable: {entry['path']}")
     work = tmp_path_factory.mktemp("hvsc")
-    sid, prefix_a, trace = _render(entry, work)
+    sid, _prefix_a, trace = render_tune(entry, work)
 
     result = analyze(trace)
     _assert_register_classes(entry, trace, result)
 
     # Determinism: a second render is byte-identical across event + RAM streams.
     prefix_b = str(work / "b")
-    trace2 = _run_sidtrace(sid, prefix_b, entry["seconds"], entry.get("subtune", 1))
+    trace2 = run_sidtrace(sid, prefix_b, entry["seconds"], entry.get("subtune", 1))
     assert np.array_equal(trace.events.view(np.uint8), trace2.events.view(np.uint8))
     assert np.array_equal(trace.ram_writes().view(np.uint8), trace2.ram_writes().view(np.uint8))
     assert np.array_equal(trace.io_reads().view(np.uint8), trace2.io_reads().view(np.uint8))
