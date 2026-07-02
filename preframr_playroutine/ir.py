@@ -158,6 +158,10 @@ def _recon_product(desc, n, sampler=None) -> np.ndarray:
     step_kind = desc.get("step_kind", "const")
     boundary = desc.get("boundary", "reflect")
     modulus = desc.get("modulus")
+    divide = int(desc.get("divide", 1) or 1)
+    up_n = int(desc.get("up_n", 0) or 0)
+    down_n = int(desc.get("down_n", 0) or 0)
+    targets = list(desc.get("targets", []))
     tick = _global_tick(desc, n, sampler)
     if not resets or resets[0] != 0:
         resets = [0] + resets
@@ -177,6 +181,7 @@ def _recon_product(desc, n, sampler=None) -> np.ndarray:
             ti = seg_tables[i] if i < len(seg_tables) else 0
             rate = tables[ti] if ti < len(tables) else np.zeros(0, dtype=np.int64)
             rate = _seg_rate(rate, start, length, tick)
+        tgt = targets[i] if i < len(targets) else None
         out[start : start + length] = recover._simulate_recur(  # pylint: disable=protected-access
             lo,
             hi,
@@ -189,6 +194,10 @@ def _recon_product(desc, n, sampler=None) -> np.ndarray:
             int(down),
             rate,
             modulus,
+            divide,
+            up_n,
+            down_n,
+            tgt,
         )
     return out
 
@@ -695,7 +704,9 @@ def _cc_recur(node, _sampler, n):
     # (CAPTURED_W * captured-strides / n). This prices the old tickband anti-theft
     # heuristic ("few shared tables") into MDL: many distinct rate tables => high
     # cost, so a per-frame stride replay never out-scores a genuine generator.
-    params = len(node.get("seeds", [])) + len(node.get("resets", []))
+    # ``targets`` are per-segment glide latch values (target boundary); price them
+    # like seeds so a clamp-to-target recur is never cheaper than a plain seeded one.
+    params = len(node.get("seeds", [])) + len(node.get("resets", [])) + len(node.get("targets", []))
     rate = int(sum(len(t) for t in node.get("rate_tables", [])))
     cost = 1.0 + PARAM_COST * params + CAPTURED_W * rate / max(1, n or 1)
     return cost, rate

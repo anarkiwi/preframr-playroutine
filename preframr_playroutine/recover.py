@@ -255,8 +255,22 @@ def _simulate_tickreflect(lo, hi, rate, start, direction, n):
     return out
 
 
-def _simulate_recur(  # pylint: disable=too-many-branches
-    lo, hi, seed, direction, length, boundary, step_kind, up=1, down=1, rate=None, modulus=None
+def _simulate_recur(  # pylint: disable=too-many-branches,too-many-locals,too-many-arguments,too-many-statements
+    lo,
+    hi,
+    seed,
+    direction,
+    length,
+    boundary,
+    step_kind,
+    up=1,
+    down=1,
+    rate=None,
+    modulus=None,
+    divide=1,
+    up_n=0,
+    down_n=0,
+    target=None,
 ):
     """One segment of the general ``step x boundary`` bounded-accumulator product.
 
@@ -264,25 +278,50 @@ def _simulate_recur(  # pylint: disable=too-many-branches
     (``up`` rising / ``down`` falling), or ``table`` (``rate[tick]``, holding the
     last entry past its end). ``boundary`` selects the bound behaviour: ``wrap``
     (modular), ``saw`` (reset to ``lo``), ``reflect`` (mirror the overshoot and
-    flip), or ``clampflip`` (saturate at the bound and flip). This single kernel
-    spans the full 12-cell product; the scalar-mode simulators above are its
-    fixture-exercised subset and stay byte-for-byte to preserve reconstruction.
+    flip), ``clampflip`` (saturate at the bound and flip), ``countflip`` (flip
+    direction after ``up_n``/``down_n`` dwell frames, independent of the value
+    bounds), or ``target`` (glide toward ``target`` and latch on arrival). The
+    ``divide`` modifier applies the step only every ``divide``-th frame (half-rate
+    / parity). This single kernel spans the whole product; the scalar-mode
+    simulators above are its fixture-exercised subset and stay byte-for-byte.
     """
     out = np.empty(length, dtype=np.int64)
     v = int(seed)
     d = int(direction)
     m = len(rate) if rate is not None else 0
     span = hi - lo
+    divide = int(divide) if divide else 1
+    tgt = None if target is None else int(target)
+    dc = 0  # divider counter: the step fires only when it reaches ``divide``
+    fc = 0  # countflip dwell counter (applied steps in the current direction)
+    tk = 0  # table cursor: one rate entry consumed per APPLIED step (not per frame)
     for i in range(length):
         out[i] = v
         if step_kind == "table":
             if m == 0:
                 continue
-            st = int(rate[i]) if i < m else int(rate[m - 1])
+            st = int(rate[tk]) if tk < m else int(rate[m - 1])
         elif step_kind == "updown":
             st = up if d > 0 else down
         else:
             st = up
+        dc += 1
+        if dc < divide:
+            continue
+        dc = 0
+        if step_kind == "table":
+            tk += 1
+        if boundary == "target":
+            step = st if st else 1
+            if tgt is not None:
+                if v < tgt:
+                    nv = min(v + step, tgt)
+                elif v > tgt:
+                    nv = max(v - step, tgt)
+                else:
+                    nv = v
+                v = nv
+            continue
         nv = v + d * st
         if boundary == "wrap":
             mod = int(modulus) if modulus else (span + st if span > 0 else 1)
@@ -298,6 +337,12 @@ def _simulate_recur(  # pylint: disable=too-many-branches
             elif nv < lo:
                 d = -d
                 nv = lo + (lo - nv)
+        elif boundary == "countflip":
+            fc += 1
+            limit = up_n if d > 0 else down_n
+            if limit and fc >= limit:
+                d = -d
+                fc = 0
         else:  # clampflip
             if nv > hi:
                 d = -d
@@ -795,15 +840,20 @@ def _recur_updown(series, bounds, min_residual: float = 0.6, min_reversing: int 
     }
 
 
-def _rate_tables(series, bounds):
-    """Per-segment abs-stride vectors deduplicated into a shared program set."""
+def _rate_tables(series, bounds, div: int = 1):
+    """Per-segment abs-stride vectors deduplicated into a shared program set.
+
+    With ``div > 1`` the stride table is the applied-step subsequence (every
+    ``div``-th diff): a ``table`` step under the ``divide`` modifier consumes one
+    rate entry per applied step, so its compact program is the sub-sampled diffs.
+    """
     seeds, dirs, rate_vecs = [], [], []
     varying = 0
     for k in range(len(bounds) - 1):
         seg = series[bounds[k] : bounds[k + 1]]
         d = np.diff(seg)
         nz = d[d != 0]
-        rate = np.abs(d).astype(np.int64)
+        rate = np.abs(d).astype(np.int64)[div - 1 :: div] if div > 1 else np.abs(d).astype(np.int64)
         seeds.append(int(seg[0]))
         dirs.append(1 if (len(nz) == 0 or nz[0] > 0) else -1)
         rate_vecs.append(rate)
@@ -863,7 +913,61 @@ _STEP_KINDS = ("const", "updown", "table")
 _BOUNDARIES = ("wrap", "saw", "reflect", "clampflip")
 
 
-def _recur_product(series, bounds, min_segments: int = 3, min_residual: float = 0.95):
+def _estimate_divide(series, bounds, cap: int = 8) -> int:
+    """Modal hold-period between value changes within segments (parity/half-rate).
+
+    A ``divide`` step applies only every n-th frame, so the register dwells on each
+    value for n frames. Recover n as the modal gap between successive changes; 1
+    (every-frame stepping) is the default cell and needs no separate hypothesis.
+    """
+    gaps = []
+    for k in range(len(bounds) - 1):
+        seg = np.asarray(series[bounds[k] : bounds[k + 1]], dtype=np.int64)
+        chg = np.nonzero(np.diff(seg) != 0)[0]
+        if len(chg) >= 2:
+            gaps.extend(int(g) for g in np.diff(chg))
+    if not gaps:
+        return 1
+    period = _modal_int(gaps)
+    return period if 1 < period <= cap else 1
+
+
+def _estimate_countflip(series, bounds):
+    """Modal (up_n, down_n) dwell counts: applied steps before each direction flip.
+
+    ``countflip`` flips direction after a fixed dwell count, independent of the
+    value bounds. Run-length the signed steps per segment and take the modal
+    rising / falling run lengths.
+    """
+    ups, downs = [], []
+    for k in range(len(bounds) - 1):
+        seg = np.asarray(series[bounds[k] : bounds[k + 1]], dtype=np.int64)
+        d = np.diff(seg)
+        d = d[d != 0]
+        if len(d) == 0:
+            continue
+        sign = np.sign(d)
+        run, cur = 1, sign[0]
+        for s in sign[1:]:
+            if s == cur:
+                run += 1
+            else:
+                (ups if cur > 0 else downs).append(run)
+                run, cur = 1, s
+        (ups if cur > 0 else downs).append(run)
+    up_n = _modal_int(ups) if ups else 0
+    down_n = _modal_int(downs) if downs else 0
+    return int(up_n), int(down_n)
+
+
+def _segment_targets(series, bounds):
+    """Per-segment latch value: the value a glide settles to (segment's last)."""
+    return [int(np.asarray(series[bounds[k] : bounds[k + 1]])[-1]) for k in range(len(bounds) - 1)]
+
+
+def _recur_product(  # pylint: disable=too-many-branches
+    series, bounds, min_segments: int = 3, min_residual: float = 0.95
+):
     """Best cell of the full ``step x boundary`` product as one ``product`` BACC.
 
     Covers the axis cells the scalar/tickband modes above cannot spell (e.g.
@@ -916,12 +1020,43 @@ def _recur_product(series, bounds, min_segments: int = 3, min_residual: float = 
         "step": up,
         "down_step": down,
     }
+    # ``divide`` (parity/half-rate) and the count/target boundaries are extra axes;
+    # their parameters are derived from the series (never fixture magic values) and
+    # tried only when the data indicates them, so the product stays cost-bounded.
+    divides = [1]
+    dtables, dseg_tables = None, None
+    est_div = _estimate_divide(series, bounds)
+    if est_div > 1:
+        divides.append(est_div)
+        # A ``table`` step under ``divide`` consumes one rate entry per APPLIED
+        # step, so its program is the sub-sampled diffs (not the zero-interleaved
+        # per-frame vector) -- recover the compact table for the divided cell.
+        _s, _d, dtables, dseg_tables, _v = _rate_tables(series, bounds, est_div)
+    up_n, down_n = _estimate_countflip(series, bounds)
+    targets = _segment_targets(series, bounds)
     best_res, best_desc = -1.0, None
+    axes = []
     for step_kind in _STEP_KINDS:
         if step_kind == "table" and not table_ok:
             continue
         for boundary in _BOUNDARIES:
-            desc = dict(common, step_kind=step_kind, boundary=boundary)
+            axes.append((step_kind, boundary, {}))
+    # Count-dwell flip and clamp-to-target glide: const/updown steps only (a
+    # tick-table stride under these boundaries has no fixture and only adds cost).
+    for step_kind in ("const", "updown"):
+        if up_n > 0 or down_n > 0:
+            axes.append((step_kind, "countflip", {"up_n": up_n, "down_n": down_n}))
+        axes.append((step_kind, "target", {"targets": targets}))
+    for step_kind, boundary, extra in axes:
+        # A ``table`` step under ``divide`` and its zero-interleaved ``divide=1``
+        # spelling reconstruct identically; prefer the compact (larger-``divide``)
+        # form so the MDL-cheaper program wins the tie (fewer captured strides).
+        div_order = sorted(divides, reverse=True) if step_kind == "table" else divides
+        for divide in div_order:
+            desc = dict(common, step_kind=step_kind, boundary=boundary, divide=divide, **extra)
+            if step_kind == "table" and divide > 1:
+                desc["rate_tables"] = dtables
+                desc["seg_tables"] = dseg_tables
             recon = ir._recon_product(desc, n)  # pylint: disable=protected-access
             res = float(np.mean(recon == series))
             if res > best_res:
