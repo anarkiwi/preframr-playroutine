@@ -4,12 +4,17 @@ The whole module is skipped when the catalog is missing, the ``sidtrace`` binary
 is absent, or no tune can be fetched. Each tune is rendered for its full song
 length WITHOUT a RAM read log (exactly as CI renders), then analysed.
 
-``test_real_tune_perfect`` is the ratchet: it asserts *perfect* recovery for
-every fixture -- ``round_trip(trace)['overall'] == 1.0`` and zero ``XSTATE``
-registers -- and marks the tunes that do not yet meet that bar with
-``xfail(strict=True)``. When a recovery improvement makes an xfail tune perfect
-it flips to XPASS and CI fails until the marker is removed (the intended
-ratchet). ``test_real_tune_anchors`` independently pins the DMC and GoatTracker2
+``test_real_tune_perfect`` enforces two ratchets on every fixture, both run
+unconditionally (neither is swallowed by an xfail marker, so regressions on
+*imperfect* tunes are caught too -- an xfail would swallow the fidelity
+assertion below):
+  * the fidelity ratchet -- no per-register or overall fidelity recorded in
+    ``fidelity_snapshot.json`` may regress; and
+  * the perfect gate -- tunes in ``_PERFECT`` must recover perfectly
+    (``overall == 1.0``, zero ``XSTATE``); a tune NOT in ``_PERFECT`` that has
+    become perfect fails the test until it is promoted into ``_PERFECT`` (the
+    old strict-xfail forcing, expressed without xfail so the ratchet survives).
+``test_real_tune_anchors`` independently pins the DMC and GoatTracker2
 register classifications against their reverse-engineering docs, guarding those
 specifics regardless of the perfect gate.
 """
@@ -63,8 +68,8 @@ def _key(entry):
 
 # Fixtures that already round-trip PERFECTLY (overall == 1.0, no XSTATE register)
 # on a whole-song, no-reads render -- determined empirically, not guessed. Every
-# other fixture is xfail(strict=True): improve its recovery to perfect and remove
-# it here (CI XPASS-fails until you do).
+# other fixture must improve its recovery to perfect and then be promoted here:
+# test_real_tune_perfect fails for any non-listed tune that becomes perfect.
 _PERFECT = {
     ("DMC", "Doctagop.sid"),
     ("DMC", "In_My_Head.sid"),
@@ -182,21 +187,13 @@ def _render(entry, work):
     return sid, prefix, trace
 
 
-def _perfect_param(entry):
-    marks = []
-    if _key(entry) not in _PERFECT:
-        marks = [
-            pytest.mark.xfail(
-                strict=True,
-                reason="round_trip not yet perfect (overall<1.0 or XSTATE present)",
-            )
-        ]
-    return pytest.param(entry, marks=marks, id=_ids(entry))
-
-
-@pytest.mark.parametrize("entry", [_perfect_param(e) for e in CATALOG])
+@pytest.mark.parametrize("entry", CATALOG, ids=[_ids(e) for e in CATALOG])
 def test_real_tune_perfect(entry, tmp_path_factory):
-    """Every fixture must recover PERFECTLY: overall == 1.0 and no XSTATE."""
+    """Fidelity ratchet + perfect gate, both enforced unconditionally.
+
+    See the module docstring: the fidelity ratchet must run for imperfect tunes
+    too, so this test carries NO xfail marker (which would swallow it).
+    """
     if not fetchable(entry):
         pytest.skip(f"tune not fetchable: {entry['path']}")
     work = tmp_path_factory.mktemp("hvsc")
@@ -210,18 +207,28 @@ def test_real_tune_perfect(entry, tmp_path_factory):
     )
     rt = round_trip(trace)
 
-    # Ratchet: no recorded per-register or overall fidelity may regress. Absent
-    # key (e.g. the committed empty snapshot) -> no assertion, so CI stays green
-    # until the snapshot is populated in the Docker/HVSC environment.
+    # Fidelity ratchet: no recorded per-register or overall fidelity may regress.
+    # Enforced for EVERY tune, perfect and imperfect -- never swallowed by xfail.
+    # Tolerance 1e-6 absorbs the snapshot's 6-place rounding (max error 5e-7)
+    # while still catching any real (>= single-frame) fidelity drop. Absent key
+    # (e.g. the committed empty snapshot) -> no assertion.
     snap = _SNAPSHOT.get(_ids(entry))
     if snap is not None:
         for reg, recorded in snap.get("regs", {}).items():
             addr = int(reg, 16)
-            assert rt.get(addr, 0.0) >= recorded - 1e-9, (reg, rt.get(addr), recorded)
-        assert rt["overall"] >= snap["overall"] - 1e-9, (rt["overall"], snap["overall"])
+            assert rt.get(addr, 0.0) >= recorded - 1e-6, (reg, rt.get(addr), recorded)
+        assert rt["overall"] >= snap["overall"] - 1e-6, (rt["overall"], snap["overall"])
 
-    assert not xstate, [hex(a) for a in xstate]
-    assert rt["overall"] == 1.0, (rt["overall"], rt["unmodeled"][:4])
+    if _key(entry) in _PERFECT:
+        assert not xstate, [hex(a) for a in xstate]
+        assert rt["overall"] == 1.0, (rt["overall"], rt["unmodeled"][:4])
+    else:
+        # Not yet perfect. The fidelity ratchet above guards against regression;
+        # this forces promotion -- when the tune reaches perfect recovery, add it
+        # to _PERFECT (CI fails here until you do; the old strict-xfail intent).
+        assert xstate or rt["overall"] < 1.0, (
+            f"{_ids(entry)} now recovers perfectly (overall==1.0, no XSTATE); " "add it to _PERFECT"
+        )
 
 
 _PERFECT_ENTRIES = [e for e in CATALOG if _key(e) in _PERFECT]
