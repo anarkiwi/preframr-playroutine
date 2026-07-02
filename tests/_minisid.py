@@ -105,6 +105,56 @@ IOPROBE_CODE = bytes(
 )
 
 
+# Clamp-branch player: play computes min(frame counter, $40) into voice-1 freq
+# low via a CMP/BCC clamp (the emit-slice lifter's branch -> cmpsel shape), a
+# capability no value-stream proposer spells directly.
+#   1000 60           init: RTS
+#   1001 EA EA        pad
+#   1003 E6 FB        play: INC $FB          ; frame counter
+#   1005 A5 FB              LDA $FB
+#   1007 C9 40              CMP #$40
+#   1009 90 02              BCC $100D
+#   100B A9 40              LDA #$40
+#   100D 8D 00 D4           STA $D400         ; voice1 freq lo = min(counter, $40)
+#   1010 A9 0F              LDA #$0F
+#   1012 8D 18 D4           STA $D418         ; master volume
+#   1015 60                 RTS
+LIFT_CLAMP_INIT = 0x1000
+LIFT_CLAMP_PLAY = 0x1003
+LIFT_CLAMP_STORE_PC = 0x100D
+LIFT_CLAMP_CODE = bytes(
+    [
+        0x60,
+        0xEA,
+        0xEA,
+        0xE6,
+        0xFB,
+        0xA5,
+        0xFB,
+        0xC9,
+        0x40,
+        0x90,
+        0x02,
+        0xA9,
+        0x40,
+        0x8D,
+        0x00,
+        0xD4,
+        0xA9,
+        0x0F,
+        0x8D,
+        0x18,
+        0xD4,
+        0x60,
+    ]
+)
+
+
+def build_lift_clamp_psid() -> bytes:
+    """PSID whose voice-1 freq-lo is ``min(frame_counter, $40)`` (a CMP/BCC clamp)."""
+    return _build_psid(0, LIFT_CLAMP_INIT, LIFT_CLAMP_PLAY, LIFT_CLAMP_CODE)
+
+
 def _build_psid(speed: int, init: int, play: int, code: bytes) -> bytes:
     """Assemble PSID v2 bytes for a player loaded at LOAD ($1000)."""
     magic = b"PSID"

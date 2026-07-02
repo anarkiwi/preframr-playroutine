@@ -602,6 +602,97 @@ def _ev_select(node, n, sampler):
     return out
 
 
+def _s8(x) -> np.ndarray:
+    """Interpret the low byte of ``x`` as a signed 8-bit integer."""
+    return ((np.asarray(x, dtype=np.int64) & 0xFF) ^ 0x80) - 0x80
+
+
+def _ev_cmpsel(node, n, sampler):
+    """A value-comparison mux: the 6502 conditional-branch clamp/select shape.
+
+    ``cmp`` names the flag test a branch lifts to (``eq``/``ne``/``ult``/``uge``
+    unsigned, ``slt``/``sge`` signed, ``neg``/``pos`` on bit 7, ``zero``/
+    ``nonzero`` on the low byte). ``then`` is the value on the taken branch (the
+    predicate TRUE), ``else`` on the fall-through -- the two reconverging arms a
+    clamp/min/max produces. The comparison is on the low byte, matching the
+    processor status the branch read.
+    """
+    a = np.asarray(evaluate(node["a"], n, sampler), dtype=np.int64)
+    cmp = node["cmp"]
+    if cmp in ("neg", "pos"):
+        mask = (a & 0x80) != 0
+        if cmp == "pos":
+            mask = ~mask
+    elif cmp in ("zero", "nonzero"):
+        mask = (a & 0xFF) == 0
+        if cmp == "nonzero":
+            mask = ~mask
+    else:
+        b = np.asarray(evaluate(node["b"], n, sampler), dtype=np.int64)
+        if cmp == "eq":
+            mask = (a & 0xFF) == (b & 0xFF)
+        elif cmp == "ne":
+            mask = (a & 0xFF) != (b & 0xFF)
+        elif cmp == "ult":
+            mask = (a & 0xFF) < (b & 0xFF)
+        elif cmp == "uge":
+            mask = (a & 0xFF) >= (b & 0xFF)
+        elif cmp == "slt":
+            mask = _s8(a) < _s8(b)
+        else:  # "sge"
+            mask = _s8(a) >= _s8(b)
+    then = np.asarray(evaluate(node["then"], n, sampler), dtype=np.int64)
+    els = np.asarray(evaluate(node["else"], n, sampler), dtype=np.int64)
+    return np.where(mask, then, els)
+
+
+def _witness_cols(node, n, sampler):
+    """Per-frame sampled columns for a witness node's input cells."""
+    sid = node.get("sid")
+    cols = []
+    for addr, samp in node["specs"]:
+        if samp == "eof":
+            col = sampler.eof(int(addr))
+        elif samp == "operand":
+            col = sampler.operand(int(addr), sid)
+        else:
+            col = sampler.at_write(int(addr), sid)
+        cols.append(np.asarray(col, dtype=np.int64)[:n] & 0xFF)
+    return cols
+
+
+def _encode_rows(cols) -> np.ndarray:
+    """Pack up to 7 byte columns into one int64 key per frame (base 256)."""
+    if not cols:
+        return np.zeros(0, dtype=np.int64)
+    enc = np.zeros(len(cols[0]), dtype=np.int64)
+    for j, col in enumerate(cols):
+        enc |= (np.asarray(col, dtype=np.int64) & 0xFF) << np.int64(8 * j)
+    return enc
+
+
+def _ev_witness(node, n, sampler):
+    """Tier-3 dynamic input witness: replay the observed input->output mapping.
+
+    The always-succeeds totality backstop (GENERIC_RECOVERY.md 3.5): the register
+    value is a memoised function of the sampler-replayed input cells of the
+    emitting code's dataflow cone. Exact by construction on the traced frames when
+    the cone determines the output (premises 1-3); a residual collision leaves a
+    frame unmatched (scored below 1.0, so a structured tree still wins).
+    """
+    if sampler is None or not node.get("specs"):
+        return np.zeros(n, dtype=np.int64)
+    frame_enc = _encode_rows(_witness_cols(node, n, sampler))
+    kenc = np.asarray(node["kenc"], dtype=np.int64)
+    vals = np.asarray(node["values"], dtype=np.int64)
+    if len(kenc) == 0:
+        return np.zeros(n, dtype=np.int64)
+    order = np.argsort(kenc, kind="stable")
+    ks, vs = kenc[order], vals[order]
+    pos = np.clip(np.searchsorted(ks, frame_enc), 0, len(ks) - 1)
+    return np.where(ks[pos] == frame_enc, vs[pos], 0)
+
+
 def _ev_recur(node, n, sampler):
     return _recon_bacc_full(node, n, sampler)
 
@@ -630,6 +721,8 @@ _EVAL = {
     "program": _ev_program,
     "frame": _ev_frame,
     "latent": _ev_latent,
+    "cmpsel": _ev_cmpsel,
+    "witness": _ev_witness,
 }
 
 
@@ -667,6 +760,10 @@ PARAM_COST = 0.1  # a closed-form generator parameter (recur seed, cutoff cell)
 # latch list replaying its output. Modest, so genuine sparse latches stay cheaper
 # than a per-frame feeder.
 LATCH_COST = 2.0
+# The Tier-3 dynamic-witness weight -- far above CAPTURED_W so a memoised
+# input->output mapping is always the last resort: any grammar/lifted tree that
+# reproduces the series (Tiers 1-2) wins the arbiter over it.
+WITNESS_W = 64.0
 
 
 def _changed_frames(series) -> int:
@@ -798,8 +895,32 @@ def _cc_program(node, _sampler, n):
     return cost, r
 
 
+def _cc_cmpsel(node, sampler, n):
+    ca, capa = _cost_captured(node["a"], sampler, n)
+    ct, capt = _cost_captured(node["then"], sampler, n)
+    ce, cape = _cost_captured(node["else"], sampler, n)
+    cost = 1.0 + ca + ct + ce
+    cap = capa + capt + cape
+    if node["cmp"] not in ("neg", "pos", "zero", "nonzero"):
+        cb, capb = _cost_captured(node.get("b"), sampler, n)
+        cost += cb
+        cap += capb
+    return cost, cap
+
+
+def _cc_witness(node, _sampler, n):
+    # The Tier-3 backstop is charged heavily: one distinct input->output entry per
+    # observed key (the captured mapping) at CAPTURED_W, plus every input cell, so
+    # any Tier-1/2 tree that reproduces the series always out-scores it (3.5).
+    cap = len(node.get("kenc", []))
+    cost = 1.0 + WITNESS_W * cap / max(1, n or 1) + CAPTURED_W * len(node.get("specs", []))
+    return cost, cap
+
+
 _COST = {
     "post": _cc_post,
+    "cmpsel": _cc_cmpsel,
+    "witness": _cc_witness,
     "const": lambda node, _s, _n: (1.0, 0),
     "seq": _cc_seq,
     "literal": _cc_literal,
@@ -1102,7 +1223,31 @@ def _binop_ir(kind, d):
     return _post(expr, d, width_mask=0xFF, overrides=d.get("overrides", []), prelude=_prelude_of(d))
 
 
+def _lift_ir(d):
+    """A Tier-2 lifted register: the pre-built node tree carried on the descriptor.
+
+    The emit-slice lifter (:mod:`preframr_playroutine.lift`) grounds the emitting
+    6502 code to a grammar tree directly, so ``to_ir`` just returns it (already a
+    full ``post`` node with addr/sid); the arbiter scores it like any proposer.
+    """
+    return d.get("tree")
+
+
+def _witness_ir(d):
+    """A Tier-3 witness descriptor -> ``post(witness(specs, mapping))``."""
+    node = {
+        "op": "witness",
+        "specs": [(int(a), s) for a, s in d["specs"]],
+        "sid": d.get("sid"),
+        "kenc": d["kenc"],
+        "values": d["values"],
+    }
+    return _post(node, d)
+
+
 _TO_IR = {
+    "LIFT": _lift_ir,
+    "WITNESS": _witness_ir,
     "CONST": _const_ir,
     "SEQ": _seq_ir,
     "FEEDER": _feeder_ir,
