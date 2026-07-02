@@ -10,6 +10,8 @@
  *   <prefix>.bin       SID writes (now PC-tagged) + interrupts + CPU vectors
  *   <prefix>.ramwr.bin RAM write log (accumulators, table cursors, SMC)
  *   <prefix>.ramrd.bin RAM read log (only with --reads)
+ *   <prefix>.iord.bin  I/O-area ($D000-$DFFF) read log
+ *   <prefix>.iowr.bin  I/O-area ($D000-$DFFF) write log
  *   <prefix>.cov.bin   executed-PC bitmap over play windows
  *   <prefix>.ram       64K RAM image (relocated player code + static tables)
  *   <prefix>.json      metadata sidecar
@@ -65,12 +67,15 @@ static_assert(sizeof(RamRec) == 16, "RamRec must be 16 bytes");
 
 class TraceSink : public libsidplayfp::InstrumentSink {
 public:
-    TraceSink(FILE *ev, FILE *ramwr, FILE *ramrd, bool wantReads, uint8_t windowMask)
-        : m_ev(ev), m_ramwr(ramwr), m_ramrd(ramrd),
-          m_wantReads(wantReads), m_windowMask(windowMask) {
+    TraceSink(FILE *ev, FILE *ramwr, FILE *ramrd, FILE *iord, FILE *iowr,
+              bool wantReads, bool wantStack, uint8_t windowMask)
+        : m_ev(ev), m_ramwr(ramwr), m_ramrd(ramrd), m_iord(iord), m_iowr(iowr),
+          m_wantReads(wantReads), m_wantStack(wantStack), m_windowMask(windowMask) {
         m_evbuf.reserve(BUF);
         m_wrbuf.reserve(BUF);
         m_rdbuf.reserve(BUF);
+        m_iordbuf.reserve(BUF);
+        m_iowrbuf.reserve(BUF);
         std::memset(m_cov, 0, sizeof(m_cov));
     }
 
@@ -109,17 +114,34 @@ public:
         if (m_rdbuf.size() >= BUF) flushBuf(m_rdbuf, m_ramrd);
     }
 
+    void ioRead(int64_t cycle, uint16_t pc, uint16_t addr, uint8_t value, uint8_t kind) override {
+        if (!windowWanted(kind) || m_iord == nullptr) return;
+        m_iordbuf.push_back({static_cast<uint64_t>(cycle), pc, addr, value, kind, 0});
+        ++m_nior;
+        if (m_iordbuf.size() >= BUF) flushBuf(m_iordbuf, m_iord);
+    }
+
+    void ioWrite(int64_t cycle, uint16_t pc, uint16_t addr, uint8_t value, uint8_t kind) override {
+        if (!windowWanted(kind) || m_iowr == nullptr) return;
+        m_iowrbuf.push_back({static_cast<uint64_t>(cycle), pc, addr, value, kind, 0});
+        ++m_niow;
+        if (m_iowrbuf.size() >= BUF) flushBuf(m_iowrbuf, m_iowr);
+    }
+
     void cpuExec(uint16_t pc, uint8_t kind) override {
         if (!windowWanted(kind)) return;
         m_cov[pc >> 3] |= static_cast<uint8_t>(1u << (pc & 7));
     }
 
     bool wantReads() const override { return m_wantReads; }
+    bool wantStack() const override { return m_wantStack; }
 
     void flush() {
         if (!m_evbuf.empty()) { std::fwrite(m_evbuf.data(), sizeof(Record), m_evbuf.size(), m_ev); m_evbuf.clear(); }
         flushBuf(m_wrbuf, m_ramwr);
         flushBuf(m_rdbuf, m_ramrd);
+        flushBuf(m_iordbuf, m_iord);
+        flushBuf(m_iowrbuf, m_iowr);
     }
 
     void writeCoverage(FILE *f) const { std::fwrite(m_cov, 1, sizeof(m_cov), f); }
@@ -127,6 +149,8 @@ public:
     uint64_t evCount() const { return m_nev; }
     uint64_t wrCount() const { return m_nwr; }
     uint64_t rdCount() const { return m_nrd; }
+    uint64_t iorCount() const { return m_nior; }
+    uint64_t iowCount() const { return m_niow; }
     unsigned coverageCount() const {
         unsigned n = 0;
         for (unsigned char b : m_cov) n += __builtin_popcount(b);
@@ -149,13 +173,14 @@ private:
         buf.clear();
     }
 
-    FILE *m_ev, *m_ramwr, *m_ramrd;
+    FILE *m_ev, *m_ramwr, *m_ramrd, *m_iord, *m_iowr;
     bool m_wantReads;
+    bool m_wantStack;
     uint8_t m_windowMask;
     std::vector<Record> m_evbuf;
-    std::vector<RamRec> m_wrbuf, m_rdbuf;
+    std::vector<RamRec> m_wrbuf, m_rdbuf, m_iordbuf, m_iowrbuf;
     uint8_t m_cov[8192];
-    uint64_t m_nev = 0, m_nwr = 0, m_nrd = 0;
+    uint64_t m_nev = 0, m_nwr = 0, m_nrd = 0, m_nior = 0, m_niow = 0;
 };
 
 struct Options {
@@ -171,6 +196,7 @@ struct Options {
     std::string kernal, basic, chargen;
     unsigned powerOnDelay = 0;   // fixed for byte-exact determinism (see README)
     bool reads = false;
+    bool stack = false;
     bool ramwrites = true;
     bool coverage = true;
     bool ramimage = true;
@@ -190,6 +216,7 @@ void usage(const char *argv0) {
         "  --power-on-delay N  fixed power-on delay cycles for determinism (default 0)\n"
         "  --window W          play-window source: irq|nmi|both (default both)\n"
         "  --reads             also emit the RAM read log (large)\n"
+        "  --stack             include stack-page ($01xx) accesses in the RAM logs\n"
         "  --no-ramwrites      do not emit the RAM write log\n"
         "  --no-coverage       do not emit the PC coverage bitmap\n"
         "  --no-ram            do not dump the RAM image\n"
@@ -291,6 +318,7 @@ int main(int argc, char **argv) {
             else { std::fprintf(stderr, "unknown window %s\n", w.c_str()); return 2; }
         }
         else if (a == "--reads") opt.reads = true;
+        else if (a == "--stack") opt.stack = true;
         else if (a == "--no-ramwrites") opt.ramwrites = false;
         else if (a == "--no-coverage") opt.coverage = false;
         else if (a == "--no-ram") opt.ramimage = false;
@@ -366,6 +394,8 @@ int main(int argc, char **argv) {
     const std::string binPath = opt.prefix + ".bin";
     const std::string ramwrPath = opt.prefix + ".ramwr.bin";
     const std::string ramrdPath = opt.prefix + ".ramrd.bin";
+    const std::string iordPath = opt.prefix + ".iord.bin";
+    const std::string iowrPath = opt.prefix + ".iowr.bin";
     const std::string covPath = opt.prefix + ".cov.bin";
     const std::string ramPath = opt.prefix + ".ram";
     const std::string jsonPath = opt.prefix + ".json";
@@ -374,8 +404,12 @@ int main(int argc, char **argv) {
     if (!bin) { std::fprintf(stderr, "cannot open %s\n", binPath.c_str()); return 1; }
     FILE *ramwr = opt.ramwrites ? std::fopen(ramwrPath.c_str(), "wb") : nullptr;
     FILE *ramrd = opt.reads ? std::fopen(ramrdPath.c_str(), "wb") : nullptr;
+    FILE *iord = std::fopen(iordPath.c_str(), "wb");
+    if (!iord) { std::fprintf(stderr, "cannot open %s\n", iordPath.c_str()); return 1; }
+    FILE *iowr = std::fopen(iowrPath.c_str(), "wb");
+    if (!iowr) { std::fprintf(stderr, "cannot open %s\n", iowrPath.c_str()); return 1; }
 
-    TraceSink sink(bin, ramwr, ramrd, opt.reads, opt.windowMask);
+    TraceSink sink(bin, ramwr, ramrd, iord, iowr, opt.reads, opt.stack, opt.windowMask);
     libsidplayfp::setInstrumentSink(&sink);
 
     const uint_least32_t targetMs = static_cast<uint_least32_t>(opt.seconds * 1000.0 + 0.5);
@@ -405,6 +439,8 @@ int main(int argc, char **argv) {
     std::fclose(bin);
     if (ramwr) std::fclose(ramwr);
     if (ramrd) std::fclose(ramrd);
+    std::fclose(iord);
+    std::fclose(iowr);
 
     if (opt.coverage) {
         FILE *cov = std::fopen(covPath.c_str(), "wb");
@@ -421,7 +457,7 @@ int main(int argc, char **argv) {
     const char *windowStr = opt.windowMask == 0x1 ? "irq" : opt.windowMask == 0x2 ? "nmi" : "both";
 
     std::string j = "{\n";
-    j += "  \"schema_version\": 2,\n";
+    j += "  \"schema_version\": 3,\n";
     j += "  \"record_size\": 16,\n";
     j += "  \"num_records\": " + std::to_string(sink.evCount()) + ",\n";
     j += "  \"bin\": "; jsonStr(j, binPath.c_str()); j += ",\n";
@@ -451,14 +487,19 @@ int main(int argc, char **argv) {
     j += "  \"deterministic\": true,\n";
     j += "  \"window\": "; jsonStr(j, windowStr); j += ",\n";
     j += "  \"reads_enabled\": "; j += (opt.reads ? "true" : "false"); j += ",\n";
+    j += "  \"stack_enabled\": "; j += (opt.stack ? "true" : "false"); j += ",\n";
     j += "  \"ram_dump_cycle\": " + std::to_string(ramDumpCycle) + ",\n";
     j += "  \"num_ram_writes\": " + std::to_string(sink.wrCount()) + ",\n";
     j += "  \"num_ram_reads\": " + std::to_string(sink.rdCount()) + ",\n";
+    j += "  \"num_io_reads\": " + std::to_string(sink.iorCount()) + ",\n";
+    j += "  \"num_io_writes\": " + std::to_string(sink.iowCount()) + ",\n";
     j += "  \"coverage_count\": " + std::to_string(sink.coverageCount()) + ",\n";
     j += "  \"artifacts\": {";
     j += "\"sidwr\": "; jsonStr(j, binPath.c_str());
     if (opt.ramwrites) { j += ", \"ramwr\": "; jsonStr(j, ramwrPath.c_str()); }
     if (opt.reads)     { j += ", \"ramrd\": "; jsonStr(j, ramrdPath.c_str()); }
+    j += ", \"iord\": "; jsonStr(j, iordPath.c_str());
+    j += ", \"iowr\": "; jsonStr(j, iowrPath.c_str());
     if (opt.coverage)  { j += ", \"cov\": "; jsonStr(j, covPath.c_str()); }
     if (opt.ramimage)  { j += ", \"ram\": "; jsonStr(j, ramPath.c_str()); }
     j += "},\n";
