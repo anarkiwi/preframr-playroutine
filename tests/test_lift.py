@@ -52,21 +52,38 @@ def _rw(cycle, addr, value):
     return rec
 
 
+def _iordrec(cycle, addr, value, pc=0):
+    rec = np.zeros(1, dtype=RAMACCESS_DTYPE)[0]
+    rec["cycle"] = np.uint64(cycle)
+    rec["pc"] = pc
+    rec["addr"] = addr
+    rec["value"] = value & 0xFF
+    rec["kind"] = 0
+    return rec
+
+
 def build_trace(image, covered, frames, sid_addr, store_pc, extra_sid=None):
     """Assemble a synthetic Trace from per-frame (value, cells) tuples.
 
     ``frames`` is a list of ``(sid_value, {cell_addr: value})``; each frame writes
     its cells then the SID register (so the sampler's at-write instant sees them).
-    ``extra_sid`` optionally maps other SID addrs to a constant, so a full voice is
-    present. Returns ``(trace, context, series)``.
+    A ``cell_addr`` in the I/O range ($D000-$DFFF) is logged as an I/O read (the
+    ``chip`` source), and a cell key of the form ``("pc", read_pc)`` seeds a
+    per-frame read-PC value. ``extra_sid`` optionally maps other SID addrs to a
+    constant, so a full voice is present. Returns ``(trace, context, series)``.
     """
-    events, rams = [], []
+    events, rams, iords = [], [], []
     series = []
     for f, (val, cells) in enumerate(frames):
         base = f * 1000
         events.append(_vector(base + 1))
         for addr, cval in cells.items():
-            rams.append(_rw(base + 5, addr, cval))
+            if isinstance(addr, tuple) and addr[0] == "pc":
+                iords.append(_iordrec(base + 5, 0, cval, pc=addr[1]))
+            elif isinstance(addr, int) and (addr & 0xF000) == 0xD000:
+                iords.append(_iordrec(base + 5, addr, cval))
+            else:
+                rams.append(_rw(base + 5, addr, cval))
         events.append(_sid(base + 10, sid_addr, val, store_pc))
         for addr, cval in (extra_sid or {}).items():
             events.append(_sid(base + 9, addr, cval, 0x2000))
@@ -77,6 +94,7 @@ def build_trace(image, covered, frames, sid_addr, store_pc, extra_sid=None):
         ramwr=np.array(rams, dtype=RAMACCESS_DTYPE),
         coverage=_cov(covered),
         ram=image,
+        iord=np.array(iords, dtype=RAMACCESS_DTYPE) if iords else None,
     )
     ctx = _build_context(trace)
     return trace, ctx, np.array(series, dtype=np.int64)
@@ -343,6 +361,185 @@ def test_witness_exact_and_replayable():
     wit = lift._witness_from_specs(series, cone, 0xD400, ctx)
     recon = ir.evaluate(ir.to_ir(wit), ctx.n_frames, ctx.sampler)
     assert np.array_equal(recon, series)
+
+
+def test_lift_chip_osc3():
+    # LDA $D41B ; STA $D404 -- the classic osc3-driven idiom. The I/O read grounds
+    # to a chip source node (Tier 2), driven by the logged io-read values.
+    img = np.zeros(65536, dtype=np.uint8)
+    prog = [0xAD, 0x1B, 0xD4, 0x8D, 0x04, 0xD4]
+    img[0x1000 : 0x1000 + len(prog)] = prog
+    covered = [0x1000, 0x1003]
+    rng = np.random.default_rng(11)
+    frames = [(int(v), {0xD41B: int(v)}) for v in rng.integers(0, 256, size=60)]
+    _tr, ctx, series = build_trace(img, covered, frames, 0xD404, 0x1003)
+    expr, recon = _lift_recon(img, covered, 0x1003, 0xD404, ctx)
+    assert expr["op"] == "chip" and expr["addr"] == 0xD41B
+    assert np.array_equal(recon, series)
+
+
+def test_lift_chip_masked_fold():
+    # LDA $D41B ; AND #$1F ; STA $D404 -> and(chip, const): osc3 noise masked.
+    img = np.zeros(65536, dtype=np.uint8)
+    prog = [0xAD, 0x1B, 0xD4, 0x29, 0x1F, 0x8D, 0x04, 0xD4]
+    img[0x1000 : 0x1000 + len(prog)] = prog
+    covered = [0x1000, 0x1003, 0x1005]
+    rng = np.random.default_rng(12)
+    frames = [(int(v) & 0x1F, {0xD41B: int(v)}) for v in rng.integers(0, 256, size=60)]
+    _tr, ctx, series = build_trace(img, covered, frames, 0xD404, 0x1005)
+    expr, recon = _lift_recon(img, covered, 0x1005, 0xD404, ctx)
+    assert expr["op"] == "binop" and expr["fn"] == "and"
+    assert expr["a"]["op"] == "chip" and expr["a"]["addr"] == 0xD41B
+    assert np.array_equal(recon, series)
+
+
+def test_classify_chip_retires_xstate():
+    # A register driven entirely by osc3 noise, no RAM feeder can model it (the old
+    # XSTATE case). The chip lift/witness recovers it exactly -> never XSTATE.
+    img = np.zeros(65536, dtype=np.uint8)
+    prog = [0xAD, 0x1B, 0xD4, 0x8D, 0x00, 0xD4]  # LDA $D41B ; STA $D400
+    img[0x1000 : 0x1000 + len(prog)] = prog
+    covered = [0x1000, 0x1003]
+    rng = np.random.default_rng(13)
+    frames = [(int(v), {0xD41B: int(v)}) for v in rng.integers(0, 256, size=80)]
+    trace, _ctx, series = build_trace(img, covered, frames, 0xD400, 0x1003)
+    res = classify_register(trace, 0xD400)
+    assert res["type"] != "XSTATE", res
+    recon = ir.evaluate(ir.to_ir(res), len(series), _build_context(trace).sampler)
+    assert np.array_equal(recon, series)
+
+
+def test_witness_chip_when_slice_fails():
+    # LDA $D41B ; LSR A ; STA $D404 -- LSR bails the static value slice, but the
+    # chip read is in the cone, so the Tier-3 witness recovers it exactly.
+    img = np.zeros(65536, dtype=np.uint8)
+    prog = [0xAD, 0x1B, 0xD4, 0x4A, 0x8D, 0x04, 0xD4]
+    img[0x1000 : 0x1000 + len(prog)] = prog
+    covered = [0x1000, 0x1003, 0x1004]
+    rng = np.random.default_rng(14)
+    frames = [(int(v) >> 1, {0xD41B: int(v)}) for v in rng.integers(0, 256, size=80)]
+    trace, _ctx, series = build_trace(img, covered, frames, 0xD404, 0x1004)
+    assert lift.lift_store(img, frozenset(covered), 0x1004, 0xD404, lambda _a: False) is None
+    cone = lift.slice_cone(img, frozenset(covered), 0x1004, lambda _a: False)
+    assert (0xD41B, "chip") in cone
+    res = classify_register(trace, 0xD404)
+    assert res["type"] in ("WITNESS", "LIFT") and res["type"] != "XSTATE"
+    recon = ir.evaluate(ir.to_ir(res), len(series), _build_context(trace).sampler)
+    assert np.array_equal(recon, series)
+
+
+def test_witness_readpc_indexed_via_log():
+    # A per-frame read whose effective address varies (an indexed/subroutine read):
+    # captured by read-PC value in the log, the witness recovers it exactly even
+    # though the static value function is opaque. The store code is a bare STA whose
+    # value came from an (unmodelled) subroutine that read read-PC 0x2500.
+    img = np.zeros(65536, dtype=np.uint8)
+    rng = np.random.default_rng(15)
+    n = 70
+    vals = rng.integers(0, 256, size=n)
+    frames = [(int(vals[i]), {("pc", 0x2500): int(vals[i])}) for i in range(n)]
+    trace, ctx, series = build_trace(img, [], frames, 0xD400, 0x2000)
+    assert ctx.read_pcs_near is not None
+    wit = lift._witness_from_specs(series, [(0x2500, "readpc")], 0xD400, ctx)
+    recon = ir.evaluate(ir.to_ir(wit), ctx.n_frames, ctx.sampler)
+    assert np.array_equal(recon, series)
+
+
+def test_witness_greedy_drops_noise_column():
+    # A determining cell plus a noise cell: greedy selection keeps only the cell
+    # that reduces collisions, so the witness stays exact and minimal.
+    img = np.zeros(65536, dtype=np.uint8)
+    rng = np.random.default_rng(16)
+    n = 60
+    good = rng.integers(0, 200, size=n)
+    noise = rng.integers(0, 256, size=n)
+    frames = [(int(good[i]), {0x10: int(good[i]), 0x11: int(noise[i])}) for i in range(n)]
+    _tr, ctx, series = build_trace(img, [], frames, 0xD400, 0x2000)
+    wit = lift._witness_from_specs(series, [(0x11, "write"), (0x10, "write")], 0xD400, ctx)
+    assert (0x10, "write") in wit["specs"]
+    recon = ir.evaluate(ir.to_ir(wit), ctx.n_frames, ctx.sampler)
+    assert np.array_equal(recon, series)
+
+
+def test_block_start_stops_at_call_boundary():
+    # A compute routine (JSR) writes the SMC immediate, RTS, then LDA #imm ; STA.
+    # block_start must stop AFTER the RTS so the slice/cone is the store's own
+    # LDA #imm feeder, not the whole routine before the call.
+    img = np.zeros(65536, dtype=np.uint8)
+    # 1000 JSR $1500 ; 1003 LDA #$00(smc @1004) ; 1005 STA $D400
+    prog = [0x20, 0x00, 0x15, 0xA9, 0x00, 0x8D, 0x00, 0xD4]
+    img[0x1000 : 0x1000 + len(prog)] = prog
+    img[0x14FF] = 0x60  # RTS at the JSR target return path (executed)
+    covered = frozenset([0x1000, 0x14FF, 0x1003, 0x1005])
+    # Without the boundary stop the walk-back would reach the JSR and fail; with it
+    # the entry is the LDA #imm.
+    assert lift.block_start(img, covered, 0x1005) == 0x1003
+    cone = lift.slice_cone(img, covered, 0x1005, lambda a: a == 0x1004)
+    assert cone == [(0x1004, "write")]
+
+
+def test_witness_multisite_smc_writer():
+    # A register written by TWO unrolled SMC sites (LDA #imm ; STA $D400) whose
+    # immediate is self-modified each frame; which site fires alternates. No single
+    # cell determines the register, but the joint pair does -> exact witness.
+    img = np.zeros(65536, dtype=np.uint8)
+    # site A at 0x1000: LDA #imm(@0x1001) ; STA $D400
+    img[0x1000:0x1005] = [0xA9, 0x00, 0x8D, 0x00, 0xD4]
+    # site B at 0x1010: LDA #imm(@0x1011) ; STA $D400
+    img[0x1010:0x1015] = [0xA9, 0x00, 0x8D, 0x00, 0xD4]
+    rng = np.random.default_rng(21)
+    frames = []
+    pcs = []
+    for i in range(80):
+        va, vb = int(rng.integers(0, 256)), int(rng.integers(0, 256))
+        if i % 2 == 0:
+            frames.append((va, {0x1001: va, 0x1011: vb}))
+            pcs.append(0x1002)
+        else:
+            frames.append((vb, {0x1001: va, 0x1011: vb}))
+            pcs.append(0x1012)
+    events, rams, series = [], [], []
+    for f, (val, cells) in enumerate(frames):
+        base = f * 1000
+        events.append(_vector(base + 1))
+        for addr, cval in cells.items():
+            rams.append(_rw(base + 5, addr, cval))
+        events.append(_sid(base + 10, 0xD400, val, pcs[f]))
+        series.append(val)
+    trace = Trace.from_events(
+        np.array(events, dtype=EVENT_DTYPE),
+        {"effective_model": "PAL"},
+        ramwr=np.array(rams, dtype=RAMACCESS_DTYPE),
+        coverage=_cov([0x1000, 0x1002, 0x1010, 0x1012]),
+        ram=img,
+    )
+    res = classify_register(trace, 0xD400)
+    assert res["type"] != "XSTATE"
+    recon = ir.evaluate(ir.to_ir(res), len(series), _build_context(trace).sampler)
+    assert np.array_equal(recon, np.array(series, dtype=np.int64))
+
+
+def test_witness_wide_cone_over_seven_columns():
+    # EIGHT SMC sites, each determining a disjoint 1/8 of frames (the register value
+    # is that site's cell); an unrolled multi-site writer needs all eight cells in
+    # the key -> proves the witness is not capped at 7 columns (structured-row key).
+    img = np.zeros(65536, dtype=np.uint8)
+    rng = np.random.default_rng(22)
+    n = 160
+    # Site j is live on frames i%8==j: its cell then carries the value, the other
+    # seven read 0 (a one-hot unrolled writer). No proper subset of cells covers
+    # every slice, so the determining key is all eight columns (>7).
+    vals = rng.integers(1, 256, size=n)
+    frames = []
+    for i in range(n):
+        cells = {0x10 + j: (int(vals[i]) if j == i % 8 else 0) for j in range(8)}
+        frames.append((int(vals[i]), cells))
+    specs = [(0x10 + j, "write") for j in range(8)]
+    _tr, ctx, ser = build_trace(img, [], frames, 0xD400, 0x2000)
+    wit = lift._witness_from_specs(ser, specs, 0xD400, ctx)
+    assert len(wit["specs"]) == 8  # all eight per-site inputs kept (>7)
+    recon = ir.evaluate(ir.to_ir(wit), ctx.n_frames, ctx.sampler)
+    assert np.array_equal(recon, ser)
 
 
 def test_cmpsel_node_signed_and_flag():

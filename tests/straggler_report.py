@@ -1,9 +1,9 @@
 """Diagnostic: per-fixture round-trip straggler report.
 
-Renders every catalog fixture whole-song (no reads, CI conditions) and prints,
-for each: overall round-trip, any XSTATE registers, and the sorted ``unmodeled``
-register list (addr/type/fidelity/example_frames) from ``round_trip``. Turns the
-xfail set into a ranked table of exactly which register blocks each fixture.
+Renders every catalog fixture whole-song WITH ``--reads`` (CI conditions) and
+prints, for each: overall round-trip and the sorted ``unmodeled`` register list
+(addr/type/fidelity/example_frames) from ``round_trip``. Turns the imperfect set
+into a ranked table of exactly which register blocks each fixture.
 
 Run inside the Docker image with the repo + HVSC mirror mounted, e.g.:
 
@@ -36,6 +36,7 @@ def render(entry, work):
             str(entry["seconds"]),
             "--song",
             str(entry.get("subtune", 1)),
+            "--reads",
             "--out",
             prefix,
             sid,
@@ -53,22 +54,18 @@ def main():
         fam = entry.get("family")
         name = os.path.basename(entry["path"])
         if not fetchable(entry):
-            rows.append((1.0, fam, name, "SKIP (not fetchable)", []))
+            rows.append((1.0, fam, f"{name} SKIP (not fetchable)", []))
             continue
         with tempfile.TemporaryDirectory() as work:
             trace = render(entry, work)
-            result = analyze(trace)
-            xstate = sorted(
-                a for a, d in result.items() if isinstance(a, int) and d.get("type") == "XSTATE"
-            )
+            analyze(trace)
             rt = round_trip(trace)
-        rows.append((rt["overall"], fam, name, xstate, rt["unmodeled"]))
+        rows.append((rt["overall"], fam, name, rt["unmodeled"]))
 
     rows.sort(key=lambda r: r[0])
     print("\n==== straggler report (sorted worst overall first) ====\n")
-    for overall, fam, name, xstate, unmodeled in rows:
-        xs = [hex(a) for a in xstate] if isinstance(xstate, list) else xstate
-        print(f"{overall:.4f}  {fam}:{name}  XSTATE={xs}")
+    for overall, fam, name, unmodeled in rows:
+        print(f"{overall:.4f}  {fam}:{name}")
         for u in unmodeled:
             print(
                 f"        {hex(u['addr'])}  {u['type']:<11} "

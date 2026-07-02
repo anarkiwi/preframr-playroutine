@@ -1,7 +1,8 @@
 """Regenerate the per-register fidelity snapshot ratchet.
 
-Renders every catalog fixture whole-song (no reads, CI conditions), runs
-``round_trip``, and writes ``tests/fixtures/fidelity_snapshot.json`` keyed by
+Renders every catalog fixture whole-song WITH ``--reads`` (matching the CI render
+in ``tests/_render.py``), runs ``round_trip``, and writes
+``tests/fixtures/fidelity_snapshot.json`` keyed by
 ``<family>:<basename>:<subtune>`` with the overall and per-register fidelities
 (floats rounded to 6 places, keys sorted). ``tests/test_hvsc.py`` then asserts
 no recorded fidelity regresses. NOT named ``test_*`` so pytest does not collect
@@ -44,6 +45,7 @@ def _render(entry, work):
             str(entry["seconds"]),
             "--song",
             str(entry.get("subtune", 1)),
+            "--reads",
             "--out",
             prefix,
             sid,

@@ -3,7 +3,7 @@
 Given the SID register oracle plus the v2 internal-state signals (per-frame RAM
 write log, store-site PC of each SID write, and the static RAM image), recover
 the generator that produces each SID register's per-frame value, classified in
-the BACC / TABLE-WALK / SEQ / COMPOSITE / XSTATE taxonomy of
+the BACC / TABLE-WALK / SEQ / COMPOSITE taxonomy of
 ``/scratch/anarkiwi/cbm/re-trackers``:
 
 - ``BACC``       bounded accumulator (per-frame add/sub with bound + saw / wrap /
@@ -12,11 +12,12 @@ the BACC / TABLE-WALK / SEQ / COMPOSITE / XSTATE taxonomy of
 - ``SEQ``        event-latched (sparse) writes from the note/pattern sequencer.
 - ``COMPOSITE``  base + modulation + override: a sequencer-indexed base table,
                  an additive modulation accumulator, and value-forcing overrides.
-- ``XSTATE``     a cross-function dependency not yet modelled by a single
-                 generator. The emulator logs every bit, so the output is always
-                 a function of observable state; ``XSTATE`` marks a register whose
-                 dependency we have not yet decomposed, and :func:`round_trip`
-                 fidelity quantifies exactly how large that gap is (and where).
+- ``LIFT``/``WITNESS`` the Phase-7 emit-slice lifter (:mod:`preframr_playroutine.lift`)
+                 and its Tier-3 dynamic-input backstop. Every inter-frame value is a
+                 function of observable state (RAM + logged I/O reads), so the
+                 witness memoises the exact code-derived input->output mapping --
+                 retiring ``XSTATE`` as a terminal category (GENERIC_RECOVERY.md 3.5).
+                 ``FEEDER`` is the raw closest-cell fallback the witness upgrades.
 
 Everything is per-frame: writes are binned into frames by the chosen interrupt
 cadence (``Trace.tick_cycles``) and carried forward, the same technique as
@@ -37,7 +38,7 @@ import numpy as np
 
 from . import ir
 from . import lift
-from .trace import WIN_IRQ, WIN_NMI
+from .trace import RAMACCESS_DTYPE, WIN_IRQ, WIN_NMI
 
 # Per-voice CTRL (gate) register addresses.
 CTRL_ADDRS = {0: 0xD404, 1: 0xD40B, 2: 0xD412}
@@ -602,6 +603,10 @@ class RecoverContext(NamedTuple):
     # code and to recognise self-modifying (SMC) immediate operands.
     covered_pcs: object = None
     written_cells: object = None
+    # dict[sid_addr] -> frozenset of read-PCs whose RAM/I/O read fed a store to the
+    # address (the Tier-3 witness's log-based dynamic input cone); None when no read
+    # log is present.
+    read_pcs_near: object = None
 
     def latent_cursor(self, voice, addr):
         """The (voice, "cursor", addr) latent id if ``addr`` is a grouped cursor."""
@@ -620,11 +625,16 @@ class RecoverContext(NamedTuple):
 
         Returns a frozenset of RAM addresses when the read log narrowed the
         search, or ``None`` (no narrowing -> consider every changing cell) in the
-        fallback path.
+        fallback path. An *empty* narrowed set (the emitting code read no tracked
+        cell near the store -- e.g. an ``LDA #imm ; STA`` immediate/SMC writer)
+        means "could not localize", NOT "no cell matters", so it also falls back to
+        the global set -- otherwise a register whose feeder the window missed would
+        lose its only candidate (regressing a perfect register to a bare fallback).
         """
         if self.reads_near is None or sid_addr is None:
             return None
-        return self.reads_near.get(int(sid_addr), frozenset())
+        cand = self.reads_near.get(int(sid_addr), frozenset())
+        return cand if cand else None
 
     def candidate_cols(self, sid_addr):
         """Column indices into ``stateseq.grid`` for the candidate cells.
@@ -1392,11 +1402,12 @@ def _reads_near_store(trace, ticks, kind):
     rd = trace.ram_reads(_window_kind(kind))
     if len(rd) == 0:
         return None
-    if len(ticks) >= 2:
-        call = int(np.median(np.diff(ticks.astype(np.int64))))
-    else:
-        call = int(trace.frame_cycles)
-    window = min(call, _SLICE_CYCLES)
+    # I/O reads (osc3/env3, CIA timers) join the narrowed cell set so a chip/CIA
+    # input is a candidate like any read cell (GENERIC_RECOVERY.md 3.5). The None
+    # gate stays keyed on the RAM read log, so a no-``--reads`` trace still falls
+    # back to the global changing-cells set (unchanged Phase-4 behaviour).
+    rd = np.concatenate([rd, trace.io_reads(_window_kind(kind))])
+    window = _call_window(trace, ticks)
     wr = trace.ram_writes(_window_kind(kind))
     ro = np.argsort(rd["cycle"], kind="stable")
     rc, ra = rd["cycle"][ro].astype(np.int64), rd["addr"][ro]
@@ -1408,6 +1419,40 @@ def _reads_near_store(trace, ticks, kind):
         sc = np.sort(sw[sw["addr"] == addr]["cycle"].astype(np.int64))
         cells = _window_cells(sc, rc, ra, window) | _window_cells(sc, wc, wa, window)
         out[int(addr)] = frozenset(cells)
+    return out
+
+
+def _call_window(trace, ticks) -> int:
+    """One play-call span in cycles (median tick period), capped at ``_SLICE_CYCLES``."""
+    if len(ticks) >= 2:
+        call = int(np.median(np.diff(ticks.astype(np.int64))))
+    else:
+        call = int(trace.frame_cycles)
+    return min(call, _SLICE_CYCLES)
+
+
+def _read_pcs_near_store(trace, ticks, kind):
+    """Map each stored SID address to the read-PCs that fed it (the log-based cone).
+
+    The Tier-3 witness's dynamic input cone: every PC whose RAM/I/O read fell within
+    one play call before a store to the address -- reads inside called subroutines a
+    bounded static slice cannot reach (GENERIC_RECOVERY.md 3.5). Always available
+    (I/O reads are logged unconditionally), so a chip read in a shared subroutine is
+    still witnessable without ``--reads``.
+    """
+    reads = np.concatenate(
+        [trace.ram_reads(_window_kind(kind)), trace.io_reads(_window_kind(kind))]
+    )
+    if len(reads) == 0:
+        return None
+    window = _call_window(trace, ticks)
+    ro = np.argsort(reads["cycle"], kind="stable")
+    rc, rp = reads["cycle"][ro].astype(np.int64), reads["pc"][ro]
+    out = {}
+    sw = trace.sid_writes()
+    for addr in np.unique(sw["addr"]):
+        sc = np.sort(sw[sw["addr"] == addr]["cycle"].astype(np.int64))
+        out[int(addr)] = frozenset(_window_cells(sc, rc, rp, window))
     return out
 
 
@@ -1529,6 +1574,7 @@ def _build_context(trace, kind="auto", stateseq=None, ram=None) -> RecoverContex
         latents=latents,
         covered_pcs=covered,
         written_cells=written,
+        read_pcs_near=_read_pcs_near_store(trace, stateseq.ticks, kind),
     )
 
 
@@ -1727,8 +1773,8 @@ _PRIORITY = (
     "SELECT",
     "PROGRAM",
     "SEQ",
+    "WITNESS",
     "FEEDER",
-    "XSTATE",
 )
 
 
@@ -2087,15 +2133,20 @@ def _propose_binop(sid_addr, series, ctx):
 
 
 def _propose_feeder(series, sid_addr, ctx):
-    """Feeder fallback: the closest captured cell (FEEDER if exact, else XSTATE)."""
-    desc = {"type": "XSTATE", "addr": int(sid_addr)}
+    """Raw-cell fallback: the closest captured cell replayed at the write instant.
+
+    Always a FEEDER (the closest captured cell); the Tier-3 dynamic witness -- not a
+    terminal XSTATE category -- is the backstop that upgrades this raw replay to the
+    exact code-derived input mapping (GENERIC_RECOVERY.md 3.5). A bare fallback with
+    no captured cell reconstructs to None (fidelity 0), so any fitting proposal or
+    the witness wins the arbiter.
+    """
+    desc = {"type": "FEEDER", "addr": int(sid_addr)}
     cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
     if cell is not None and frac > 0.0:
         desc["cell"] = int(cell)
         desc["sid"] = int(sid_addr)
         desc["cell_frac"] = round(float(frac), 4)
-        if frac >= 0.999:
-            desc["type"] = "FEEDER"
     return [desc]
 
 
@@ -2176,12 +2227,16 @@ def _maybe_lift(best, best_key, series, sid_addr, ctx, base):
         if scored is None:
             continue
         cand, _tree, _recon, key = scored
-        # A Tier-2 lift adopts on any strict fidelity gain (a recovered generator);
-        # the Tier-3 witness adopts only when EXACT -- it is the totality backstop,
-        # not a partial-fit tool, so it never causes equal-or-partial churn.
+        # A Tier-2 lift adopts on any strict fidelity gain (a recovered generator).
+        # The Tier-3 witness adopts when EXACT, or when the incumbent is only the
+        # raw-cell FEEDER fallback -- there the witness (the code-derived input
+        # mapping) is the totality descriptor that RETIRES the ex-XSTATE register,
+        # so it takes any strict improvement. Against a structured winner it still
+        # needs to be exact, so it never displaces a genuine generator on MDL.
+        raw_incumbent = best is None or best.get("type") == "FEEDER"
         exact = key[0] >= 1.0 - 1e-9
         gain = key[0] > best_fid + 1e-9
-        adopt = gain and (cand.get("type") != "WITNESS" or exact)
+        adopt = gain and (cand.get("type") != "WITNESS" or exact or raw_incumbent)
         if adopt and (best_key is None or key > best_key):
             best, best_key, best_fid = cand, key, key[0]
     return best
@@ -2218,7 +2273,8 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
     that maximises ``fidelity - LAMBDA * complexity``, ties broken by lower
     complexity then documented proposer priority. Returns a descriptor dict with
     ``type`` in {'CONST','CUTOFF','SEQ','BACC','PITCHWALK','COMPOSITE',
-    'TABLE_WALK','XOR','AND','OR','FEEDER','XSTATE'}, its recovered parameters,
+    'TABLE_WALK','XOR','AND','OR','SELECT','PROGRAM','LIFT','WITNESS','FEEDER'},
+    its recovered parameters,
     ``store_pcs``, and the arbiter's ``score``/``complexity``/``captured_frames``.
 
     ``ctx`` is a precomputed :class:`RecoverContext` (built once by
@@ -2703,7 +2759,7 @@ def _best_base(scored):
     return None if best_cand is None else (best_cand, best_fid)
 
 
-_PROGRAM_INCUMBENTS = {"FEEDER", "XSTATE"}
+_PROGRAM_INCUMBENTS = {"FEEDER"}
 
 
 def propose_program(scored, series, sid_addr, ctx):
@@ -2711,7 +2767,7 @@ def propose_program(scored, series, sid_addr, ctx):
 
     Gated on the scored base candidates so it never displaces a structured winner
     (a fid-1.0 BACC/TABLE_WALK/SEQ): a program is offered only when the best base
-    candidate is a FEEDER/XSTATE or is itself imperfect. It reproduces the series
+    candidate is a raw FEEDER fallback or is itself imperfect. It reproduces the series
     exactly (grounded in a read-log table when one decodes, else one STEP record
     per run), and MDL charges one record per run vs the feeder's one replay value
     per changed frame -- so the arbiter adopts it over the feeder it supplants.
@@ -3420,6 +3476,12 @@ def voice_events(trace, kind="auto") -> dict:
 # -- per-frame cell sampling (for reconstruction) -------------------------
 
 
+def _opt_log(trace, name) -> np.ndarray:
+    """A trace's RAM-access log by method ``name``, or an empty log if unsupported."""
+    fn = getattr(trace, name, None)
+    return fn() if callable(fn) else np.empty(0, dtype=RAMACCESS_DTYPE)
+
+
 def _carry_at(cycles, values, sample_cycles, back: int = 1) -> np.ndarray:
     """Value of a cell ``back`` writes before each sample cycle (1 = the last).
 
@@ -3458,6 +3520,22 @@ class _CellSampler:
         self._atwrite: dict = {}
         self._operand: dict = {}
         self._written: dict = {}
+        self._chip: dict = {}
+        self._readpc: dict = {}
+        # Logged I/O reads ($D000-$DFFF: SID osc3/env3, CIA timers) -- always
+        # present on a real trace; the ``chip`` source node samples these. The
+        # combined read log (RAM reads when rendered with ``--reads``, plus I/O
+        # reads) is keyed by read-PC for the Tier-3 witness's per-frame code-derived
+        # input cone. Absent on minimal duck-typed fakes -> empty logs.
+        self._iord = _opt_log(trace, "io_reads")
+        reads = np.concatenate([_opt_log(trace, "ram_reads"), self._iord])
+        # Index the combined read log by PC once (sorted), so ``read_pc`` slices a
+        # contiguous run instead of scanning the whole log per call -- the witness
+        # samples many read-PCs on the longest fixtures (millions of reads).
+        order = np.argsort(reads["pc"], kind="stable")
+        self._rbp_pc = reads["pc"][order]
+        self._rbp_cyc = reads["cycle"][order]
+        self._rbp_val = reads["value"][order]
         # Shared per-voice latent state, attached by ``_build_context`` so the
         # evaluator can resolve ``latent``/``tick`` index nodes; ``None`` when the
         # sampler is built standalone (reconstruction falls back to eof cells).
@@ -3515,6 +3593,37 @@ class _CellSampler:
             cyc, val = self._cell_writes(int(cell_addr))
             self._operand[key] = _carry_at(cyc, val, sample, back=2)
         return self._operand[key]
+
+    def chip(self, addr, sid_addr) -> np.ndarray:
+        """Per-frame logged I/O read value of ``addr`` at ``sid_addr``'s write instant.
+
+        The player's own ``LDA $D41B`` (osc3/env3) or CIA-timer read: the value the
+        code observed feeding the store, taken from the I/O-read log at (just after)
+        the store cycle. During recovery these are data the trace observed, so they
+        drive reconstruction with no circularity (GENERIC_RECOVERY.md 3.5).
+        """
+        key = (int(addr), int(sid_addr) if sid_addr is not None else -1)
+        if key not in self._chip:
+            sample = self.write_cycles(sid_addr) + np.uint64(2)
+            sel = self._iord[self._iord["addr"] == int(addr)]
+            self._chip[key] = _carry_at(sel["cycle"], sel["value"], sample)
+        return self._chip[key]
+
+    def read_pc(self, pc, sid_addr) -> np.ndarray:
+        """Per-frame value read by store-PC ``pc`` at ``sid_addr``'s write instant.
+
+        A read-PC's per-frame value is exactly the input the emitting code used --
+        regardless of its (possibly per-frame varying) effective address -- so it is
+        the Tier-3 witness's canonical dynamic input (indexed/subroutine reads
+        included). Sampled from the combined RAM+I/O read log at the store cycle.
+        """
+        key = (int(pc), int(sid_addr) if sid_addr is not None else -1)
+        if key not in self._readpc:
+            sample = self.write_cycles(sid_addr) + np.uint64(2)
+            lo = int(np.searchsorted(self._rbp_pc, int(pc), side="left"))
+            hi = int(np.searchsorted(self._rbp_pc, int(pc), side="right"))
+            self._readpc[key] = _carry_at(self._rbp_cyc[lo:hi], self._rbp_val[lo:hi], sample)
+        return self._readpc[key]
 
     def cell_first_frame(self, cell_addr) -> int:
         """Frame index of a RAM cell's first write (``0`` if never written)."""
@@ -3610,8 +3719,9 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
     sampled at the write instant; ``XOR`` -> a CTRL register's ``cellA XOR cellB``
     (base/eor gate idiom); ``OR`` -> a MODE/VOL-style ``cellA | cellB`` /
     ``cell | const`` blit. Cell-referencing descriptors read those cells
-    from ``trace`` (or a shared ``sampler``); ``XSTATE`` has no single-generator
-    model yet and returns ``None``.
+    from ``trace`` (or a shared ``sampler``); ``LIFT``/``WITNESS`` regenerate the
+    lifted grammar tree / the memoised code-derived input mapping. A bare ``FEEDER``
+    with no captured cell has no model and returns ``None``.
     """
     smp = _sampler_for(ticks, trace, sampler)
     return ir.evaluate(ir.to_ir(descriptor), len(ticks), smp)
