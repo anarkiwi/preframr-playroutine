@@ -1315,8 +1315,11 @@ def _propose_table_walk(series, wr, ctx, sid_addr):
     s = np.asarray(series, dtype=np.int64) & 0xFF
     const_one = int(np.bitwise_and.reduce(s)) if len(s) else 0
     base_mask = int(tw.get("mask", 0xFF))
+    masks = [base_mask]
+    if base_mask | const_one != base_mask:
+        masks.append(base_mask | const_one)
     out = []
-    for mask in {base_mask, base_mask | const_one}:
+    for mask in masks:
         cand = dict(tw)
         cand["mask"] = int(mask)
         cand["addr"] = int(sid_addr)

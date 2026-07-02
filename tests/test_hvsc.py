@@ -118,7 +118,10 @@ def _assert_register_classes(entry, trace, result):
 
     if family == "DMC":
         # dmc-generators.md: AD/SR per-note SEQ; PW 16-bit up/down BACC; CTRL a
-        # waveform table walk (AND-ed with the gate mask). A sustained voice can
+        # waveform table walk (AND-ed with the gate mask). The MDL arbiter may
+        # express that gated waveform directly as the documented ``chnwave AND
+        # chngate`` fold (an ``AND`` descriptor) when it reconstructs at least as
+        # well -- both are the same gated-waveform generator. A sustained voice can
         # be a 1-entry waveform loop, presenting as a CONST CTRL -- allow it, but
         # require at least one active voice to recover as a real TABLE_WALK. The
         # whole-song fixture renders without --reads, so this exercises the
@@ -129,7 +132,7 @@ def _assert_register_classes(entry, trace, result):
             assert t == "BACC", (hex(addr), t)
         ctrl_types = _types(result, _CTRL)
         for addr, t in ctrl_types.items():
-            assert t in ("TABLE_WALK", "CONST"), (hex(addr), t)
+            assert t in ("TABLE_WALK", "AND", "CONST"), (hex(addr), t)
         assert "TABLE_WALK" in ctrl_types.values(), ctrl_types
         for addr in _AD + _SR + _PW + _CTRL:
             assert fid[addr] >= 0.99, (hex(addr), result[addr]["type"], fid[addr])
