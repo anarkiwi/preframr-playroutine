@@ -34,6 +34,7 @@ from collections import namedtuple
 
 import numpy as np
 
+from . import ir
 from .trace import WIN_IRQ, WIN_NMI
 
 # Per-voice CTRL (gate) register addresses.
@@ -1181,8 +1182,7 @@ def _defmon_cutoff(trace, sid_addr, series, store_pcs, ctx, min_fid: float = 0.9
             "imm": int(img[cells["imm"]]),
             "scale": 2 if img[cells["scale"]] == 0x0A else 1,
         }
-        recon = _recon_cutoff(desc, ctx.n_frames, ctx.sampler)
-        recon = _default_until_first_write(recon, desc, ctx.sampler)
+        recon = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
         fid = float(np.mean(recon == np.asarray(series, dtype=np.int64)))
         desc["residual"] = round(fid, 4)
         if fid >= min_fid:
@@ -1494,7 +1494,7 @@ def _recover_walk_overrides(tw, series, ctx, max_overrides: int = 3):
     if ctx.sampler is None:
         return
     series = np.asarray(series, dtype=np.int64)
-    work = _recon_table(tw, ctx.n_frames, ctx.sampler)
+    work = ir.evaluate(ir.to_ir(tw), ctx.n_frames, ctx.sampler)
     best_fid = float(np.mean(work == series))
     overrides = []
     for _ in range(max_overrides):
@@ -1555,8 +1555,9 @@ def _find_override(forced, ctx, max_terms: int = 3):
     ``cell in {v0,..}`` (recovered set of <= ``max_set`` distinct cell values, e.g.
     the per-voice waveform shadow whose value selects the instruments that
     hard-restart) captures a force gated by a handful of states no single
-    equality/bit can express. Returns ``[(cell, mask, value) | (cell, "in",
-    (v0,..)), ...]`` or ``None``.
+    equality/bit can express. Returns a list of typed predicate dicts
+    (``{"kind":"eq"|"bit"|"in", ...}``) or ``None``; :func:`ir._apply_overrides`
+    still accepts the legacy tuple forms too.
     """
     if int(forced.sum()) == 0:
         return None
@@ -1570,17 +1571,29 @@ def _find_override(forced, ctx, max_terms: int = 3):
         fc = col[forced]
         uniq = np.unique(fc)
         if len(uniq) == 1:
-            cands.append((col == int(uniq[0]), (int(addrs[j]), 0xFF, int(uniq[0]))))
+            cands.append(
+                (col == int(uniq[0]), {"kind": "eq", "cell": int(addrs[j]), "value": int(uniq[0])})
+            )
         elif 2 <= len(uniq) <= max_set and len(uniq) < len(np.unique(col)):
             # A force gated by the cell holding one of a few states (recall 1.0 by
             # construction); the greedy precision/strict-improvement gating below
             # rejects it unless it genuinely tightens the selection.
-            cands.append((np.isin(col, uniq), (int(addrs[j]), "in", tuple(int(x) for x in uniq))))
+            cands.append(
+                (
+                    np.isin(col, uniq),
+                    {"kind": "in", "cell": int(addrs[j]), "values": tuple(int(x) for x in uniq)},
+                )
+            )
         for b in range(8):
             bit = (fc >> b) & 1
             if bit.min() == bit.max():
                 val = int(bit[0]) << b
-                cands.append(((col & (1 << b)) == val, (int(addrs[j]), 1 << b, val)))
+                cands.append(
+                    (
+                        (col & (1 << b)) == val,
+                        {"kind": "bit", "cell": int(addrs[j]), "mask": 1 << b, "value": val},
+                    )
+                )
     sel = np.ones(len(forced), dtype=bool)
     terms = []
     precision = n_forced / max(1, int(sel.sum()))
@@ -1812,13 +1825,13 @@ def _build_pitchwalk(role, base_lo, base_hi, primary, lo_o, hi_o, grid, addrs, r
         "index_cells": index_cells,
         "overrides": [],
     }
-    out = _recon_pitchwalk(desc, ctx.n_frames, ctx.sampler)
+    out = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
     oracle = lo_o if role == "lo" else hi_o
     forced = np.where(out == oracle, -1, oracle).astype(np.int64)
     ov = _override_descriptor(forced, ctx)
     if ov is not None:
         desc["overrides"].append(ov)
-        out = _recon_pitchwalk(desc, ctx.n_frames, ctx.sampler)
+        out = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
     desc["residual"] = float(np.mean(out == oracle))
     return desc
 
@@ -1855,7 +1868,7 @@ def _composite16(trace, sid_addr, reg_off, ctx):
     if base_lo is None or base_hi is None:
         return None
     base = {"lo": (base_lo, int(lo_addr)), "hi": (base_hi, int(hi_addr))}
-    base_val = _comp_part(base, n, ctx.sampler)
+    base_val = ir.part_value(base, n, ctx.sampler)
     out_byte = np.asarray(lo_oracle if role == "lo" else hi_oracle, dtype=np.int64)
     target_byte = out_byte & 0xFF
 
@@ -1886,9 +1899,9 @@ def _composite16(trace, sid_addr, reg_off, ctx):
             "mod": mod,
             "overrides": [],
         }
-        modelled = (base_val + _comp_part(mod, n, ctx.sampler)) & 0xFFFF
+        modelled = (base_val + ir.part_value(mod, n, ctx.sampler)) & 0xFFFF
         _best_composite_override(desc, modelled, target, out_byte, target_byte, n, ctx)
-        fid = float(np.mean(_recon_composite(desc, n, ctx.sampler) == target_byte))
+        fid = float(np.mean(ir.evaluate(ir.to_ir(desc), n, ctx.sampler) == target_byte))
         desc["residual"] = fid
         if fid > best_fid:
             best_fid, best_desc = fid, desc
@@ -1906,7 +1919,7 @@ def _best_composite_override(desc, modelled, target, out_byte, target_byte, n, c
     raise reconstruction (a spurious membership predicate, say) is dropped, so a
     register an override already nails is never displaced.
     """
-    base_fid = float(np.mean(_recon_composite(desc, n, ctx.sampler) == target_byte))
+    base_fid = float(np.mean(ir.evaluate(ir.to_ir(desc), n, ctx.sampler) == target_byte))
     candidates = []
     ov_b = _override_descriptor(np.where(modelled == target, -1, out_byte).astype(np.int64), ctx)
     if ov_b is not None:
@@ -1914,7 +1927,7 @@ def _best_composite_override(desc, modelled, target, out_byte, target_byte, n, c
     best_fid, best_ov = base_fid, None
     for ov in candidates:
         desc["overrides"] = [ov]
-        fid = float(np.mean(_recon_composite(desc, n, ctx.sampler) == target_byte))
+        fid = float(np.mean(ir.evaluate(ir.to_ir(desc), n, ctx.sampler) == target_byte))
         if fid > best_fid:
             best_fid, best_ov = fid, ov
     desc["overrides"] = [best_ov] if best_ov is not None else []
@@ -1937,7 +1950,7 @@ def _composite8(sid_addr, series, ctx):
     ov = _override_descriptor(forced, ctx)
     if ov is not None:
         desc["overrides"].append(ov)
-    recon = _recon_composite(desc, ctx.n_frames, ctx.sampler)
+    recon = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
     desc["residual"] = float(np.mean(recon == series))
     return desc
 
@@ -2075,7 +2088,7 @@ def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
 
 def _and_recon_masked(desc, ctx) -> np.ndarray:
     """``_recon_and`` with the pre-first-write power-on default applied (for scoring)."""
-    base = _recon_and(desc, ctx.n_frames, ctx.sampler)
+    base = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
     written = ctx.sampler.written_mask(desc["sid"])
     return np.where(written, base, 0)
 
@@ -2093,7 +2106,7 @@ def _recover_pair_overrides(desc, series, ctx, max_overrides: int = 4):
         return
     series = np.asarray(series, dtype=np.int64)
     written = sampler.written_mask(desc["sid"])
-    cur = _recon_and(desc, ctx.n_frames, sampler)
+    cur = ir.evaluate(ir.to_ir(desc), ctx.n_frames, sampler)
     work = np.where(written, cur, 0)
     best_fid = float(np.mean(work == series))
     overrides = []
@@ -2221,7 +2234,7 @@ def _or_pair(sid_addr, series, ctx, min_fid: float = 0.999):
         desc["cell_b"] = int(addrs[cols[bi]])
         cells.append(desc["cell_b"])
     _attach_or_prelude(desc, s, ctx, cells)
-    recon = _recon_or(desc, n, ctx.sampler)
+    recon = ir.evaluate(ir.to_ir(desc), n, ctx.sampler)
     fid = float(np.mean(recon == s))
     if fid < min_fid:
         return None
@@ -2489,334 +2502,23 @@ def _seq_latches(series) -> tuple:
     return frames, values
 
 
-def _recon_seq(desc, n) -> np.ndarray:
-    frames = np.asarray(desc.get("latch_frames", [0]), dtype=np.int64)
-    values = np.asarray(desc.get("latch_values", [0]), dtype=np.int64)
-    idx = np.clip(np.searchsorted(frames, np.arange(n), side="right") - 1, 0, len(values) - 1)
-    return values[idx]
+def _apply_overrides(out, overrides, sampler) -> np.ndarray:
+    """Force values where each override's cell-predicate conjunction holds.
 
-
-def _run_recurrence(
-    mode,
-    step,
-    lo,
-    hi,
-    seed,
-    length,
-    modulus,
-    down_step=None,
-    clamp_lo=None,
-    clamp_hi=None,
-    direction=None,
-) -> np.ndarray:
-    """Regenerate one bounded-accumulator segment from a seed."""
-    if length <= 0:
-        return np.empty(0, dtype=np.int64)
-    if mode == "pingpong" and hi > lo:
-        d = (1 if seed <= (lo + hi) // 2 else -1) if direction is None else direction
-        clo = lo if clamp_lo is None else clamp_lo
-        chi = hi if clamp_hi is None else clamp_hi
-        ds = step if down_step is None else down_step
-        series, _ = _simulate_pingpong(lo, hi, clo, chi, step, ds, int(seed), d, length)
-        return series
-    if mode == "reflect" and hi > lo:
-        d = (1 if seed <= (lo + hi) // 2 else -1) if direction is None else direction
-        series, _ = _simulate_reflect(lo, hi, step, int(seed), d, length)
-        return series
-    mod = modulus if modulus else (hi - lo + step)
-    if mod <= 0:
-        return np.full(length, int(seed), dtype=np.int64)
-    return lo + ((int(seed) - lo) + step * np.arange(length, dtype=np.int64)) % mod
-
-
-def _recon_tickband(desc, n) -> np.ndarray:
-    """Regenerate a tick-banded reflecting sweep from its per-segment rate tables.
-
-    Each note segment reseeds the accumulator and replays its shared tick-rate
-    table (``rate_tables[seg_tables[i]]``) via :func:`_simulate_tickreflect`,
-    mirror-reflecting at the recovered bounds.
+    Delegates to the single implementation in :mod:`preframr_playroutine.ir`,
+    which accepts both legacy predicate tuples and the typed-dict form.
     """
-    resets = list(desc.get("resets", [0]))
-    seeds = list(desc.get("seeds", []))
-    dirs = list(desc.get("directions", []))
-    seg_tables = list(desc.get("seg_tables", []))
-    tables = desc.get("rate_tables", [])
-    lo, hi = desc["lo"], desc["hi"]
-    if not resets or resets[0] != 0:
-        resets = [0] + resets
-        seeds = [seeds[0] if seeds else lo] + seeds
-        dirs = [dirs[0] if dirs else 1] + dirs
-        seg_tables = [seg_tables[0] if seg_tables else 0] + seg_tables
-    bounds = resets + [n]
-    out = np.zeros(n, dtype=np.int64)
-    for i, start in enumerate(resets):
-        length = bounds[i + 1] - start
-        if length <= 0:
-            continue
-        seed = seeds[i] if i < len(seeds) else lo
-        d = dirs[i] if i < len(dirs) else 1
-        ti = seg_tables[i] if i < len(seg_tables) else 0
-        rate = tables[ti] if ti < len(tables) else np.zeros(0, dtype=np.int64)
-        out[start : start + length] = _simulate_tickreflect(lo, hi, rate, int(seed), int(d), length)
-    return out
+    return ir._apply_overrides(out, overrides, sampler)  # pylint: disable=protected-access
 
 
 def _recon_bacc_full(desc, n) -> np.ndarray:
-    """Regenerate the full (8- or 16-bit) accumulator series from its descriptor."""
-    if desc.get("mode") == "tickband":
-        return _recon_tickband(desc, n)
-    resets = list(desc.get("resets", [0]))
-    seeds = list(desc.get("seeds", [desc.get("phase", desc.get("lo", 0))]))
-    if not resets or resets[0] != 0:
-        resets = [0] + resets
-        seeds = [seeds[0] if seeds else desc.get("lo", 0)] + seeds
-    bounds = resets + [n]
-    out = np.zeros(n, dtype=np.int64)
-    mode = desc["mode"]
-    step = desc["step"]
-    lo = desc["lo"]
-    hi = desc["hi"]
-    modulus = desc.get("modulus")
-    down_step = desc.get("down_step")
-    clamp_lo = desc.get("clamp_lo")
-    clamp_hi = desc.get("clamp_hi")
-    steps = desc.get("steps")
-    down_steps = desc.get("down_steps")
-    directions = desc.get("directions")
-    for i, start in enumerate(resets):
-        length = bounds[i + 1] - start
-        seed = seeds[i] if i < len(seeds) else lo
-        st = steps[i] if steps and i < len(steps) else step
-        ds = down_steps[i] if down_steps and i < len(down_steps) else down_step
-        di = directions[i] if directions and i < len(directions) else None
-        out[start : start + length] = _run_recurrence(
-            mode, st, lo, hi, seed, length, modulus, ds, clamp_lo, clamp_hi, di
-        )
-    return out
+    """Full (8/16-bit) accumulator series; the port now lives in ir (segment fits)."""
+    return ir._recon_bacc_full(desc, n)  # pylint: disable=protected-access
 
 
-def _recon_bacc(desc, n, sampler=None) -> np.ndarray:
-    # The recurrence regenerates the accumulator, but a note-reseeded accumulator
-    # also carries sequencer-driven per-note seeds, dwell/hold frames and a start
-    # phase (the dwell counter, e.g. DMC pw_stepctr $1762) that the bare
-    # recurrence does not reproduce. Where the recovered accumulator cell was
-    # captured, regenerate from it (same "else use the captured cell" fallback as
-    # the table-walk cursor); otherwise run the pure recurrence.
-    if sampler is not None and desc.get("cell") is not None and desc.get("sid") is not None:
-        out = sampler.at_write(desc["cell"], desc["sid"]) & 0xFF
-        end = desc.get("prelude_end")
-        if end:
-            prelude = _recon_seq(
-                {
-                    "latch_frames": desc.get("prelude_frames", [0]),
-                    "latch_values": desc.get("prelude_values", [0]),
-                },
-                n,
-            )
-            out = np.where(np.arange(n) < int(end), prelude & 0xFF, out)
-        return out
-    full = _recon_bacc_full(desc, n)
-    role = desc.get("byte_role", "full")
-    if role == "lo":
-        return full & 0xFF
-    if role == "hi":
-        return (full >> 8) & 0xFF
-    return full
-
-
-def _recon_table(desc, n, sampler) -> np.ndarray:
-    table = np.asarray(desc["table"], dtype=np.int64)
-    mask = int(desc.get("mask", 0xFF))
-    stride = int(desc.get("stride", 1))
-    off = int(desc.get("cursor_offset", 0))
-    cursor = desc.get("cursor")
-    if cursor is None and sampler is not None and desc.get("cursor_addr") is not None:
-        cursor = sampler.eof(desc["cursor_addr"])
-    if cursor is None:
-        return np.zeros(n, dtype=np.int64)
-    idx = np.clip(np.asarray(cursor, dtype=np.int64) * stride + off, 0, len(table) - 1)
-    out = table[idx]
-    gate_addr = desc.get("gate_addr")
-    if gate_addr is not None and sampler is not None:
-        out = out & sampler.eof(gate_addr)
-    else:
-        out = out & mask
-    return _apply_overrides(out, desc.get("overrides", []), sampler)
-
-
-def _apply_overrides(out, overrides, sampler) -> np.ndarray:
-    """Force values where each override's cell-predicate conjunction holds."""
-    if not overrides or sampler is None:
-        return out
-    n = len(out)
-    for ov in overrides:
-        sel = np.ones(n, dtype=bool)
-        for cell, cmask, cval in ov.get("predicate", []):
-            col = sampler.eof(cell)
-            # ``cmask == "in"`` marks a value-membership term (cval is the value
-            # tuple); an integer ``cmask`` is the historical bit/equality test.
-            if cmask == "in":
-                sel &= np.isin(col, np.asarray(cval, dtype=col.dtype))
-            else:
-                sel &= (col & cmask) == cval
-        out = np.where(sel, int(ov["force"]), out)
-    return out
-
-
-def _comp_part(part, n, sampler) -> np.ndarray:
-    """Per-frame value of a composite part (8-bit cell or 16-bit lo/hi cell pair)."""
-    if part is None:
-        return np.zeros(n, dtype=np.int64)
-    if "series" in part:
-        return np.asarray(part["series"], dtype=np.int64)
-    if sampler is None:
-        return np.zeros(n, dtype=np.int64)
-    if "lo" in part:
-        lo = sampler.at_write(part["lo"][0], part["lo"][1])
-        hi = sampler.at_write(part["hi"][0], part["hi"][1])
-        return combine_lohi(lo, hi)
-    return sampler.at_write(part["cell"], part["sid"])
-
-
-def _recon_composite(desc, n, sampler) -> np.ndarray:
-    total = _comp_part(desc.get("base"), n, sampler) + _comp_part(desc.get("mod"), n, sampler)
-    total = total & int(desc.get("width_mask", 0xFF))
-    role = desc.get("byte_role", "full")
-    if role == "lo":
-        out = total & 0xFF
-    elif role == "hi":
-        out = (total >> 8) & 0xFF
-    else:
-        out = total
-    return _apply_overrides(out, desc.get("overrides", []), sampler)
-
-
-def _recon_pitchwalk(desc, n, sampler) -> np.ndarray:
-    """Regenerate an FC pitch-table walk: ``pitchtable[sum(index_cells)]``."""
-    lotab = np.asarray(desc["lo_table"], dtype=np.int64)
-    hitab = np.asarray(desc["hi_table"], dtype=np.int64)
-    length = len(lotab)
-    if sampler is None or length == 0:
-        return np.zeros(n, dtype=np.int64)
-    isum = np.zeros(n, dtype=np.int64)
-    for cell in desc.get("index_cells", []):
-        isum = isum + sampler.eof(cell)
-    idx = np.clip(isum, 0, length - 1)
-    val16 = lotab[idx] | (hitab[idx] << 8)
-    out = val16 & 0xFF if desc.get("byte_role") == "lo" else (val16 >> 8) & 0xFF
-    return _apply_overrides(out, desc.get("overrides", []), sampler)
-
-
-def _recon_feeder(desc, n, sampler) -> np.ndarray:
-    """Regenerate a cell-latched filter register: the captured feeder cell.
-
-    The player computes the value into a RAM cell then stores it to SID; replay
-    is that captured cell sampled at the register's write instant.
-    """
-    if sampler is None:
-        return np.zeros(n, dtype=np.int64)
-    return sampler.at_write(desc["cell"], desc["sid"]) & 0xFF
-
-
-def _recon_cutoff(desc, n, sampler) -> np.ndarray:
-    """Regenerate a defMON filter-cutoff register from its SMC micro-routine cells.
-
-    The player runs a 16-bit self-modifying accumulator (``lo``/``hi`` operand
-    cells stepped by ``slo``/``shi`` with the direction set by an ADC/SBC opcode
-    cell) then emits ``clamp(hi + imm + carry, base) * scale`` to the SID. The hi
-    store is observable (``hi`` sampled at the write instant), so only the carry
-    out of the hi add/sub -- which the trailing ``adc #imm`` folds in -- is
-    recomputed from the step cells. Clamp threshold and fill share the ``base``
-    cell (the ``cmp`` operand overlaps the bound-load byte); ``scale`` is the
-    SID-model post-shift (``asl`` x2 on 6581, ``nop`` x1 on 8580).
-    """
-    if sampler is None:
-        return np.zeros(n, dtype=np.int64)
-    c = desc["cells"]
-    sid = int(desc["sid"])
-
-    def s(addr):
-        return sampler.at_write(int(addr), sid).astype(np.int64) & 0xFF
-
-    def pre(addr):
-        return sampler.operand(int(addr), sid).astype(np.int64) & 0xFF
-
-    hi, lo = s(c["hi"]), s(c["lo"])  # post-store accumulator (what adc #imm emits)
-    slo, shi = s(c["slo"]), s(c["shi"])
-    op_lo, op_hi = s(c["op_lo"]), s(c["op_hi"])
-    imm = s(c["imm"])  # SMC'd per instrument (a signed cutoff offset)
-    ihi, ilo = pre(c["hi"]), pre(c["lo"])  # operand the routine read (pre-store)
-    # Carry out of the hi add/sub -- folded into d416 by the trailing adc #imm.
-    # Recompute it from the read operand and step cells when the opcode cells are
-    # captured; where the SMC opcode sampled stale (frozen sweep / pre-first-write),
-    # fall back to the 16-bit accumulator direction (a decrease is a no-borrow
-    # subtract -> 1). Using the pre-store operand (not roll of the post-store value)
-    # makes the carry -- and the A<base clamp -- exact across note reseeds.
-    add_lo = op_lo == 0x69
-    carry_lo = np.where(add_lo, (ilo + slo) > 0xFF, (ilo - slo - 1) >= 0).astype(np.int64)
-    add_hi = op_hi == 0x69
-    hi_sum = np.where(add_hi, ihi + shi + carry_lo, ihi - shi - (1 - carry_lo))
-    carry_rec = np.where(add_hi, hi_sum > 0xFF, hi_sum >= 0).astype(np.int64)
-    carry_dir = ((hi * 256 + lo) < (ihi * 256 + ilo)).astype(np.int64)
-    valid = np.isin(op_lo, (0x69, 0xE9)) & np.isin(op_hi, (0x69, 0xE9))
-    carry_hi = np.where(valid, carry_rec, carry_dir)
-    base = int(desc["base"])
-    scale = int(desc.get("scale", 1))
-    a = (hi + imm + carry_hi) & 0xFF
-    emit = np.where((a < base) | (a >= 0x80), base, a)
-    return ((emit * scale) & 0xFF).astype(np.int64)
-
-
-def _recon_xor(desc, n, sampler) -> np.ndarray:
-    """Regenerate a ``cellA XOR cellB`` CTRL register from its two captured cells."""
-    if sampler is None:
-        return np.zeros(n, dtype=np.int64)
-    a = sampler.at_write(desc["cell_a"], desc["sid"]).astype(np.int64)
-    b = sampler.at_write(desc["cell_b"], desc["sid"]).astype(np.int64)
-    return (a ^ b) & 0xFF
-
-
-def _recon_and(desc, n, sampler) -> np.ndarray:
-    """Regenerate a ``cellA AND cellB`` CTRL register from its two captured cells.
-
-    The waveform-shadow cell AND the gate-mask cell reproduce the steady CTRL; the
-    note-onset / hard-restart frames force a control byte (e.g. ``$08``/``$09``/
-    ``$81``) the shadow never carries, recovered as value-forcing overrides.
-    """
-    if sampler is None:
-        return np.zeros(n, dtype=np.int64)
-    a = sampler.at_write(desc["cell_a"], desc["sid"]).astype(np.int64)
-    b = sampler.at_write(desc["cell_b"], desc["sid"]).astype(np.int64)
-    out = (a & b) & 0xFF
-    return _apply_overrides(out, desc.get("overrides", []), sampler)
-
-
-def _recon_or(desc, n, sampler) -> np.ndarray:
-    """Regenerate an ``OR`` register (``cellA | cellB`` or ``cell | const``).
-
-    Samples the source cell(s) at the write instant and OR-folds the constant mode
-    nibble; the held-seed prelude (if recovered) overrides the leading frames before
-    the cells' first write, mirroring :func:`_recon_bacc`.
-    """
-    if sampler is None:
-        return np.zeros(n, dtype=np.int64)
-    out = sampler.at_write(desc["cell_a"], desc["sid"]).astype(np.int64)
-    if desc.get("cell_b") is not None:
-        out = out | sampler.at_write(desc["cell_b"], desc["sid"]).astype(np.int64)
-    if desc.get("const") is not None:
-        out = out | int(desc["const"])
-    out &= 0xFF
-    end = desc.get("prelude_end")
-    if end:
-        prelude = _recon_seq(
-            {
-                "latch_frames": desc.get("prelude_frames", [0]),
-                "latch_values": desc.get("prelude_values", [0]),
-            },
-            n,
-        )
-        out = np.where(np.arange(n) < int(end), prelude & 0xFF, out)
-    return out
+def _recon_tickband(desc, n) -> np.ndarray:
+    """Tick-banded reflecting sweep; the port now lives in ir (segment fits)."""
+    return ir._recon_tickband(desc, n)  # pylint: disable=protected-access
 
 
 def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndarray:
@@ -2834,56 +2536,8 @@ def reconstruct_register(descriptor, ticks, trace=None, sampler=None) -> np.ndar
     from ``trace`` (or a shared ``sampler``); ``XSTATE`` has no single-generator
     model yet and returns ``None``.
     """
-    n = len(ticks)
-    kind = descriptor.get("type")
     smp = _sampler_for(ticks, trace, sampler)
-    if kind == "CONST":
-        value = descriptor.get("value")
-        recon = np.full(n, 0 if value is None else int(value), dtype=np.int64)
-    elif kind == "SEQ":
-        recon = _recon_seq(descriptor, n)
-    else:
-        builders = {
-            "BACC": _recon_bacc,
-            "TABLE_WALK": _recon_table,
-            "COMPOSITE": _recon_composite,
-            "PITCHWALK": _recon_pitchwalk,
-            "FEEDER": _recon_feeder,
-            "CUTOFF": _recon_cutoff,
-            "XOR": _recon_xor,
-            "AND": _recon_and,
-            "OR": _recon_or,
-        }
-        if kind in builders:
-            recon = builders[kind](descriptor, n, smp)
-        # XSTATE: not yet modelled -- best effort is the closest observable feeder
-        # cell sampled at the write instant (or nothing if none was recorded).
-        elif kind == "XSTATE" and smp is not None and descriptor.get("cell") is not None:
-            recon = smp.at_write(descriptor["cell"], descriptor["sid"]) & 0xFF
-        else:
-            return None  # no model yet for this descriptor
-    return _default_until_first_write(recon, descriptor, smp)
-
-
-def _default_until_first_write(recon, descriptor, sampler):
-    """Hold the power-on default (``0``) on frames before a register's first write.
-
-    The oracle carries ``0`` until the player's first store to a register, but a
-    reconstruction back-fills its recovered value to frame 0, mismatching those
-    leading frames. Zero them to mirror the oracle. Strictly non-worsening: those
-    frames are ``0`` in the oracle by construction.
-    """
-    if recon is None or sampler is None:
-        return recon
-    addr = descriptor.get("addr")
-    if addr is None:
-        return recon
-    written = sampler.written_mask(addr)
-    if written.all():
-        return recon
-    recon = np.array(recon, dtype=np.int64, copy=True)
-    recon[~written] = 0
-    return recon
+    return ir.evaluate(ir.to_ir(descriptor), len(ticks), smp)
 
 
 def round_trip(trace, kind="auto") -> dict:
