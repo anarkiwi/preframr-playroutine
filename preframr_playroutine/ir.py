@@ -266,6 +266,56 @@ def _recon_cutoff(desc, n, sampler) -> np.ndarray:
     return ((emit * scale) & 0xFF).astype(np.int64)
 
 
+# -- table-program interpreter (Phase 6b) -------------------------------------
+#
+# One archetype for GT2/JCH pulse+filter, DMC filter, FC filter: a cursor walks a
+# table of ``(duration, value)`` records, integrating an accumulator. Each record
+# is either a STEP row (``acc += value`` each frame for ``duration`` frames) or a
+# SET row (``acc := value``, held for ``duration`` frames -- an absolute / slope-oo
+# jump); a ``loop`` index makes the cursor wrap ($FF-style loop rows) so a short
+# table fills an arbitrarily long series. The record semantics are DATA-DRIVEN
+# (a per-record ``is_set`` flag and the shared ``loop`` index, decoded once by the
+# fitter), never per-engine code paths.
+
+
+def _recon_program(desc, n) -> np.ndarray:
+    """Regenerate a register from its table-program (cursor over dur/step records)."""
+    recs = np.asarray(desc.get("records") or [], dtype=np.int64).reshape(-1, 3)
+    if n <= 0:
+        return np.zeros(max(0, n), dtype=np.int64)
+    out = np.zeros(n, dtype=np.int64)
+    r = len(recs)
+    if r == 0:
+        return out
+    loop = desc.get("loop")
+    loop = None if loop is None else int(loop)
+    acc = int(desc.get("seed", int(recs[0, 1]) if int(recs[0, 2]) else 0))
+    f = cur = guard = 0
+    max_guard = n + r + 8
+    while f < n:
+        if cur >= r:
+            guard += 1
+            if loop is None or not 0 <= loop < r or guard > max_guard:
+                break
+            cur = loop
+            continue
+        length, value, is_set = int(recs[cur, 0]), int(recs[cur, 1]), int(recs[cur, 2])
+        cur += 1
+        if length <= 0:
+            continue
+        take = min(length, n - f)
+        if is_set:
+            acc = value
+            out[f : f + take] = acc
+        else:
+            out[f : f + take] = acc + value * np.arange(take, dtype=np.int64)
+            acc += value * length
+        f += take
+    if f < n:
+        out[f:] = acc
+    return out
+
+
 # -- overrides (moved from recover; accepts legacy tuples and typed dicts) -----
 
 
@@ -498,6 +548,10 @@ def _ev_cutoff(node, n, sampler):
     return _recon_cutoff(node, n, sampler)
 
 
+def _ev_program(node, n, _sampler):
+    return _recon_program(node, n)
+
+
 _EVAL = {
     "const": _ev_const,
     "literal": _ev_literal,
@@ -509,6 +563,7 @@ _EVAL = {
     "recur": _ev_recur,
     "cutoff": _ev_cutoff,
     "select": _ev_select,
+    "program": _ev_program,
     "frame": _ev_frame,
     "latent": _ev_latent,
 }
@@ -663,6 +718,20 @@ def _cc_select(node, sampler, n):
     return cost, cap
 
 
+def _cc_program(node, _sampler, n):
+    # The record table IS the captured state (one record per constant-slope run of
+    # the register, honoured $FF loop rows folding it further). Charged like a
+    # replay cell at CAPTURED_W * records / n -- but a program has one record per
+    # RUN where a feeder replays one value per CHANGED FRAME, and runs <= changed
+    # frames always, so a table-program that reproduces the same series is never
+    # dearer than the feeder and is strictly cheaper whenever any run spans more
+    # than one frame (the Phase 6b "far less captured state" win over FEEDER).
+    recs = node.get("records") or []
+    r = len(recs)
+    cost = 1.0 + PARAM_COST + CAPTURED_W * r / max(1, n or r or 1)
+    return cost, r
+
+
 _COST = {
     "post": _cc_post,
     "const": lambda node, _s, _n: (1.0, 0),
@@ -675,6 +744,7 @@ _COST = {
     "recur": _cc_recur,
     "cutoff": _cc_cutoff,
     "select": _cc_select,
+    "program": _cc_program,
     "frame": lambda node, _s, _n: (1.0, 0),
     "latent": lambda node, _s, _n: (1.0 + INDEX_COST, 0),
 }
@@ -903,6 +973,32 @@ def _select_ir(d):
     return _post(node, d)
 
 
+def _program_ir(d):
+    """A ``PROGRAM`` descriptor -> ``post(program(records, loop, seed))``.
+
+    Carries the decoded ``records`` (each ``[length, value, is_set]``), the cyclic
+    ``loop`` index (or ``None``), the accumulator ``seed`` and the width mask; the
+    ``time_base``/``spd_base`` provenance addresses ride along for the text IR.
+    """
+    node = {
+        "op": "program",
+        "records": [list(map(int, r)) for r in d["records"]],
+        "loop": None if d.get("loop") is None else int(d["loop"]),
+        "seed": int(d.get("seed", 0)),
+        "time_base": int(d.get("time_base", 0)),
+        "spd_base": int(d.get("spd_base", 0)),
+        "variant": d.get("variant", "series"),
+    }
+    width = int(d.get("width", 8))
+    return _post(
+        node,
+        d,
+        width_mask=0xFFFF if width == 16 else 0xFF,
+        byte_role=d.get("byte_role", "full"),
+        overrides=d.get("overrides", []),
+    )
+
+
 _BINOP_FN = {"XOR": "xor", "AND": "and", "OR": "or", "ADD": "add", "SUB": "sub"}
 
 
@@ -950,6 +1046,7 @@ _TO_IR = {
     "PITCHWALK": _pitchwalk_ir,
     "CUTOFF": _cutoff_ir,
     "SELECT": _select_ir,
+    "PROGRAM": _program_ir,
     "XOR": lambda d: _binop_ir("XOR", d),
     "AND": lambda d: _binop_ir("AND", d),
     "OR": lambda d: _binop_ir("OR", d),

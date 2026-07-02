@@ -226,6 +226,76 @@ def select_feeder_mux(rng, n, arm_cells, sel_cell, mode_values):
     return reg, cells
 
 
+def program_table(rows):
+    """Encode ``rows`` as an interleaved (duration, value) table byte sequence.
+
+    Each row is ``("step", dur, step)`` / ``("set", hold, value)`` / ``("loop",
+    target)``; a deliberately INDEPENDENT reimplementation of
+    ``recover._decode_program_table`` (byte layout: STEP dur ``$01..$7F``, SET dur
+    ``dur|$80``, LOOP dur ``$FF`` with the target index in the value byte). Returns
+    the raw ``bytes``.
+    """
+    out = []
+    for row in rows:
+        if row[0] == "step":
+            _, dur, step = row
+            out += [dur & 0x7F, step & 0xFF]
+        elif row[0] == "set":
+            _, hold, value = row
+            out += [(hold & 0x7F) | 0x80, value & 0xFF]
+        else:  # loop
+            out += [0xFF, row[1] & 0xFF]
+    return bytes(out)
+
+
+def program_records(rows):
+    """The ``[length, value, is_set]`` records + loop index a table decodes to."""
+    records, loop = [], None
+    for row in rows:
+        if row[0] == "step":
+            step = row[2] & 0xFF
+            records.append([row[1], step - 256 if step >= 0x80 else step, 0])
+        elif row[0] == "set":
+            records.append([row[1], row[2] & 0xFF, 1])
+        else:  # loop
+            loop = row[1]
+            break
+    return records, loop
+
+
+def program_series(rows, seed, n):
+    """Reference: run a program table to an ``n``-frame register series.
+
+    An independent reimplementation of ``ir._recon_program`` so the synthetic test
+    builds ground truth here and recovers it there (a bug in one is not masked by
+    the other)."""
+    records, loop = program_records(rows)
+    out = np.zeros(n, dtype=np.int64)
+    acc, f, cur, guard = int(seed), 0, 0, 0
+    while f < n:
+        if cur >= len(records):
+            guard += 1
+            if loop is None or not 0 <= loop < len(records) or guard > n + len(records) + 8:
+                break
+            cur = loop
+            continue
+        length, value, is_set = records[cur]
+        cur += 1
+        if length <= 0:
+            continue
+        take = min(length, n - f)
+        if is_set:
+            acc = value
+            out[f : f + take] = acc
+        else:
+            out[f : f + take] = acc + value * np.arange(take, dtype=np.int64)
+            acc += value * length
+        f += take
+    if f < n:
+        out[f:] = acc
+    return out
+
+
 def recur_series(lo, hi, seeds, length, boundary, step_kind, up=1, down=1, rate=None):
     """A reseeded multi-note product series and its note-on reset frames.
 
