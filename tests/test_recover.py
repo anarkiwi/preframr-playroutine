@@ -2280,3 +2280,150 @@ def test_binop_add_sub_randomized_constants():
         res = analyze(trace)
         assert res[0xD418]["type"] in ("ADD", "SUB"), (const, res[0xD418]["type"])
         assert round_trip(trace)[0xD418] == 1.0
+
+
+# -- read-log dataflow narrowing (Phase 4) --------------------------------
+
+from preframr_playroutine.recover import (  # noqa: E402
+    _build_context,
+    _propose_binop,
+    _reads_near_store,
+    _window_cells,
+)
+
+
+def _narrowing_trace(target, feeders, noise, n=64, sid_addr=0xD418, with_reads=True):
+    """Trace whose store reads ``feeders`` in its local slice; ``noise`` cells
+
+    change every frame but are written only mid-frame, after the store (outside
+    the backward-slice window). With ``with_reads`` a read log records the feeder
+    reads; otherwise the trace has no read log (the CI fallback)."""
+    recs, ramwr, ramrd = [], [], []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ, addr=0x1003))
+        for off, (addr, ser) in enumerate(feeders):
+            ramwr.append(_ra(tick + 4 + off, addr, int(ser[i])))  # feeder computed
+            ramrd.append(_ra(tick + 10 + off, addr, int(ser[i])))  # LDA feeder
+        recs.append(
+            _ev(
+                tick + 20,
+                SID_WRITE,
+                reg=sid_addr & 0x1F,
+                value=int(target[i]) & 0xFF,
+                addr=sid_addr,
+                aux=0x1500,
+            )
+        )
+        for off, (addr, ser) in enumerate(noise):
+            ramwr.append(_ra(tick + 300 + off, addr, int(ser[i])))  # unrelated bookkeeping
+    evs = np.array(recs, dtype=EVENT_DTYPE)
+    evs.sort(order="cycle", kind="stable")
+    kwargs = {"ramwr": np.array(ramwr, dtype=RAMACCESS_DTYPE)}
+    if with_reads:
+        kwargs["ramrd"] = np.array(ramrd, dtype=RAMACCESS_DTYPE)
+    return Trace.from_events(evs, PAL_META, **kwargs)
+
+
+def test_window_cells_vectorized():
+    # A cell whose access sits within the window before a store is kept; one
+    # outside it is dropped -- no per-store loop, pure searchsorted.
+    stores = np.array([1000, 2000, 3000], dtype=np.int64)
+    acc_c = np.array([950, 400, 1990, 2600], dtype=np.int64)  # deltas 50,600,10,400
+    acc_a = np.array([0x10, 0x11, 0x12, 0x13], dtype=np.uint16)
+    got = _window_cells(stores, acc_c, acc_a, 512)
+    assert got == {0x10, 0x12, 0x13}  # 0x11 is 600 cycles before -> excluded
+
+
+def test_reads_near_store_narrows_candidates():
+    rng = np.random.default_rng(7)
+    n = 80
+    a = np.array([_LOWENT[int(rng.integers(0, len(_LOWENT)))] for _ in range(n)])
+    b = np.array([(0x0C, 0x14, 0x1C)[int(rng.integers(0, 3))] for _ in range(n)])
+    target = (a + b) & 0xFF
+    noise = [(0x20 + k, (rng.integers(0, 200, n)).astype(np.int64)) for k in range(6)]
+    trace = _narrowing_trace(target, [(0x40, a), (0x41, b)], noise, n=n)
+    ctx = _build_context(trace)
+    # Fallback set (all changing cells) is much larger than the narrowed set.
+    fallback = set(int(x) for x in ctx.stateseq.addrs)
+    assert {0x40, 0x41} <= fallback
+    assert any(0x20 + k in fallback for k in range(6))
+    cand = ctx.candidates(0xD418)
+    assert cand is not None  # read log present -> narrowing active
+    assert {0x40, 0x41} <= cand
+    assert not any((0x20 + k) in cand for k in range(6))  # noise excluded
+    assert len(ctx.candidate_cols(0xD418)) < len(fallback)
+
+
+def test_candidates_fallback_without_readlog():
+    rng = np.random.default_rng(8)
+    n = 60
+    a = np.array([_LOWENT[int(rng.integers(0, len(_LOWENT)))] for _ in range(n)])
+    target = (a + 0x1F) & 0xFF
+    noise = [(0x20 + k, (rng.integers(0, 200, n)).astype(np.int64)) for k in range(4)]
+    trace = _narrowing_trace(target, [(0x40, a)], noise, n=n, with_reads=False)
+    ctx = _build_context(trace)
+    assert ctx.reads_near is None
+    assert ctx.candidates(0xD418) is None  # no narrowing -> None
+    # candidate_cols falls back to every changing-cell column.
+    assert list(ctx.candidate_cols(0xD418)) == list(range(ctx.stateseq.grid.shape[1]))
+
+
+def test_narrowing_preserves_recovery():
+    # The same fold must be recovered with and without the read log (narrowing
+    # never drops a cell the store genuinely reads).
+    rng = np.random.default_rng(9)
+    n = 72
+    a = np.array([_LOWENT[int(rng.integers(0, len(_LOWENT)))] for _ in range(n)])
+    b = np.array([(0x0C, 0x14, 0x1C)[int(rng.integers(0, 3))] for _ in range(n)])
+    target = (a + b) & 0xFF
+    noise = [(0x20 + k, (rng.integers(0, 200, n)).astype(np.int64)) for k in range(5)]
+    feeders = [(0x40, a), (0x41, b)]
+    narrowed = analyze(_narrowing_trace(target, feeders, noise, n=n, with_reads=True))
+    fallback = analyze(_narrowing_trace(target, feeders, noise, n=n, with_reads=False))
+    assert narrowed[0xD418]["type"] == fallback[0xD418]["type"] == "ADD"
+    assert {narrowed[0xD418]["cell_a"], narrowed[0xD418]["cell_b"]} == {0x40, 0x41}
+    for tr in (
+        _narrowing_trace(target, feeders, noise, n=n, with_reads=True),
+        _narrowing_trace(target, feeders, noise, n=n, with_reads=False),
+    ):
+        assert round_trip(tr)[0xD418] == 1.0
+
+
+def test_narrowing_binop_speedup():
+    # Measurable speedup: with many unrelated changing cells the fold search is
+    # O(cells^2); narrowing collapses the candidate set, so the narrowed proposer
+    # is faster and considers far fewer cells.
+    import time  # noqa: PLC0415
+
+    rng = np.random.default_rng(11)
+    n = 200
+    a = np.array([_LOWENT[int(rng.integers(0, len(_LOWENT)))] for _ in range(n)])
+    b = np.array([(0x0C, 0x14, 0x1C)[int(rng.integers(0, 3))] for _ in range(n)])
+    target = (a + b) & 0xFF
+    noise = [(0x20 + k, (rng.integers(0, 24, n)).astype(np.int64)) for k in range(120)]
+    feeders = [(0x40, a), (0x41, b)]
+    tr_reads = _narrowing_trace(target, feeders, noise, n=n, with_reads=True)
+    tr_plain = _narrowing_trace(target, feeders, noise, n=n, with_reads=False)
+    ctx_n = _build_context(tr_reads)
+    ctx_f = _build_context(tr_plain)
+    n_narrow = len(ctx_n.candidate_cols(0xD418))
+    n_full = len(list(ctx_f.candidate_cols(0xD418)))
+    assert n_narrow <= 4 < n_full  # ~2 feeders vs ~122 changing cells
+
+    def _clock(ctx):
+        best = min(_timeit(_propose_binop, 0xD418, target, ctx) for _ in range(3))
+        return best
+
+    def _timeit(fn, *args):
+        t0 = time.perf_counter()
+        fn(*args)
+        return time.perf_counter() - t0
+
+    t_narrow = _clock(ctx_n)
+    t_full = _clock(ctx_f)
+    print(
+        f"\n_propose_binop: full={t_full*1e3:.2f}ms ({n_full} cells) "
+        f"narrowed={t_narrow*1e3:.2f}ms ({n_narrow} cells) speedup={t_full/max(t_narrow,1e-9):.1f}x"
+    )
+    assert t_narrow < t_full  # narrowing is a strict win at this cell count
