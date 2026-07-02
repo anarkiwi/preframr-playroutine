@@ -349,6 +349,12 @@ def evaluate(node, n, sampler):
 CAPTURED_W = 8.0
 INDEX_COST = 0.2  # a derivable cursor/index cell (not replayed modulation)
 PARAM_COST = 0.1  # a closed-form generator parameter (recur seed, cutoff cell)
+# A SEQ/prelude latch is captured event data charged *per latch* (absolute, not
+# per frame held) so event-latched song data stays cheap, yet a structured
+# generator that actually fits (recur/table walk) still wins the arbiter over a
+# latch list replaying its output. Modest, so genuine sparse latches stay cheaper
+# than a per-frame feeder.
+LATCH_COST = 2.0
 
 
 def _changed_frames(series) -> int:
@@ -389,12 +395,12 @@ def _cc_post(node, sampler, n):
         cost += 1.0 + sum(1 for _ in _predicate_terms(ov.get("predicate", [])))
     prelude = node.get("prelude")
     if prelude and prelude.get("end"):
-        cost += CAPTURED_W * len(prelude.get("values", [0])) / max(1, n or 1)
+        cost += LATCH_COST * len(prelude.get("values", [0]))
     return cost, cap
 
 
-def _cc_seq(node, _sampler, n):
-    return 1.0 + CAPTURED_W * len(node.get("values", [])) / max(1, n or 1), 0
+def _cc_seq(node, _sampler, _n):
+    return 1.0 + LATCH_COST * len(node.get("values", [])), 0
 
 
 def _cc_literal(node, _sampler, n):

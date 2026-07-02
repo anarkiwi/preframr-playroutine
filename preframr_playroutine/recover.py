@@ -1211,11 +1211,12 @@ def _defmon_cutoff(trace, sid_addr, series, store_pcs, ctx):
 _LAMBDA = 1e-3
 
 # Proposer priority (earlier = preferred on an exact-fidelity tie), mirroring the
-# old cascade order.  Also the descriptor-type -> priority rank.
+# old cascade order: structured generators first, then bitwise folds, then the
+# SEQ latch list / raw-cell fallbacks last (a fitting generator is preferred over
+# replaying its output). Also the descriptor-type -> priority rank.
 _PRIORITY = (
     "CONST",
     "CUTOFF",
-    "SEQ",
     "BACC",
     "PITCHWALK",
     "COMPOSITE",
@@ -1223,6 +1224,7 @@ _PRIORITY = (
     "XOR",
     "AND",
     "OR",
+    "SEQ",
     "FEEDER",
     "XSTATE",
 )
