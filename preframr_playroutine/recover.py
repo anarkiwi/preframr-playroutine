@@ -1466,8 +1466,18 @@ def attach_prelude(node, series, ctx, cells, max_latches: int = 6):
     end = max(ends) if ends else 0
     if not 0 < end < len(series):
         return
+    # Only the frames the register is *written* but the cell is not yet live need
+    # the held-seed prelude; frames before the register's own first write are
+    # already carried by ``_default_until_first_write``, and an all-zero held seed
+    # equals the cell's power-on default there too. Recording such an inert prelude
+    # only inflates the descriptor's MDL cost (making an identically-reconstructing
+    # raw feeder win the arbiter tie), so skip it -- it never changes the recon.
+    written = sampler.written_mask(int(sid))
+    first_written = int(np.argmax(written)) if written.any() else 0
+    if end <= first_written:
+        return
     frames, values = _seq_latches(np.asarray(series, dtype=np.int64)[:end])
-    if len(frames) > max_latches:
+    if len(frames) > max_latches or not any(values):
         return
     node["prelude_end"] = int(end)
     node["prelude_frames"] = frames
