@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 
@@ -51,20 +52,27 @@ def _render(entry, work):
     return Trace.load(prefix)
 
 
+def _snapshot_one(entry):
+    """Render + round-trip one fixture -> (key, {overall, regs}); None if unfetchable."""
+    if not fetchable(entry):
+        return None
+    with tempfile.TemporaryDirectory() as work:
+        trace = _render(entry, work)
+        rt = round_trip(trace)
+    regs = {hex(a): round(f, 6) for a, f in rt.items() if isinstance(a, int)}
+    return _key(entry), {"overall": round(rt["overall"], 6), "regs": dict(sorted(regs.items()))}
+
+
 def main():
     catalog = load_catalog()
+    # Tunes are independent; render them across a process pool (each sidtrace +
+    # round_trip is CPU-bound) rather than serially.
+    workers = min(len(catalog), os.cpu_count() or 1) or 1
     snapshot = {}
-    for entry in catalog:
-        if not fetchable(entry):
-            continue
-        with tempfile.TemporaryDirectory() as work:
-            trace = _render(entry, work)
-            rt = round_trip(trace)
-        regs = {hex(a): round(f, 6) for a, f in rt.items() if isinstance(a, int)}
-        snapshot[_key(entry)] = {
-            "overall": round(rt["overall"], 6),
-            "regs": dict(sorted(regs.items())),
-        }
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for result in pool.map(_snapshot_one, catalog):
+            if result is not None:
+                snapshot[result[0]] = result[1]
     with open(OUT, "w", encoding="utf-8") as fh:
         json.dump(dict(sorted(snapshot.items())), fh, indent=2, sort_keys=True)
         fh.write("\n")
