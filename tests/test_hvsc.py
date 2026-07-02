@@ -14,6 +14,7 @@ register classifications against their reverse-engineering docs, guarding those
 specifics regardless of the perfect gate.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -29,6 +30,13 @@ SIDTRACE = shutil.which("sidtrace") or "/usr/local/bin/sidtrace"
 HAVE_SIDTRACE = os.path.exists(SIDTRACE)
 
 CATALOG = load_catalog()
+
+_SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "fidelity_snapshot.json")
+try:
+    with open(_SNAPSHOT_PATH, encoding="utf-8") as _fh:
+        _SNAPSHOT = json.load(_fh)
+except (OSError, ValueError):
+    _SNAPSHOT = {}
 
 if not CATALOG:
     pytest.skip("tests/fixtures/tunes.json missing", allow_module_level=True)
@@ -188,6 +196,17 @@ def test_real_tune_perfect(entry, tmp_path_factory):
         a for a, d in result.items() if isinstance(a, int) and d.get("type") == "XSTATE"
     )
     rt = round_trip(trace)
+
+    # Ratchet: no recorded per-register or overall fidelity may regress. Absent
+    # key (e.g. the committed empty snapshot) -> no assertion, so CI stays green
+    # until the snapshot is populated in the Docker/HVSC environment.
+    snap = _SNAPSHOT.get(_ids(entry))
+    if snap is not None:
+        for reg, recorded in snap.get("regs", {}).items():
+            addr = int(reg, 16)
+            assert rt.get(addr, 0.0) >= recorded - 1e-9, (reg, rt.get(addr), recorded)
+        assert rt["overall"] >= snap["overall"] - 1e-9, (rt["overall"], snap["overall"])
+
     assert not xstate, [hex(a) for a in xstate]
     assert rt["overall"] == 1.0, (rt["overall"], rt["unmodeled"][:4])
 

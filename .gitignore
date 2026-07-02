@@ -8,6 +8,9 @@ dist/
 *.bin
 *.json
 !preframr_playroutine/**
+# ...but never bytecode caches under the package tree.
+preframr_playroutine/**/__pycache__/
 !tests/fixtures/tunes.json
+!tests/fixtures/fidelity_snapshot.json
 # HVSC tune cache (downloaded on demand by tests/_hvsc.py).
 tests/.hvsc_cache/
