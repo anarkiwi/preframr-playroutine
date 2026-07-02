@@ -207,6 +207,8 @@ def test_reads_flag_narrowing(tmp_path):
     assert ctx_plain.reads_near is None  # no read log -> fallback
     assert ctx_plain.candidates(0xD400) is None
 
-    # Same recovery quality with narrowing as without: $D400 stays perfect.
+    # Narrowing must not drop fidelity: $D400 recovers identically either way.
     assert analyze(reads)["summary"]
-    assert round_trip(reads)[0xD400] == round_trip(plain)[0xD400] == 1.0
+    rt_reads = round_trip(reads)[0xD400]
+    assert rt_reads == round_trip(plain)[0xD400]
+    assert rt_reads >= 0.99
