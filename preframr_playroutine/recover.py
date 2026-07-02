@@ -113,9 +113,17 @@ def state_sequence(trace, kind: str = "auto", addrs=None) -> StateSequence:
         addrs = np.array(sorted({int(a) for a in addrs}), dtype=np.uint16)
     grid = np.zeros((len(ticks), len(addrs)), dtype=np.uint8)
     if len(ticks) and len(addrs) and len(wr):
-        for j, a in enumerate(addrs):
-            sel = wr[wr["addr"] == a]
-            if len(sel):
+        # One stable argsort by address groups every cell's writes into a
+        # contiguous slice (cycle order preserved within a group), replacing the
+        # per-address boolean scan of the whole write log.
+        order = np.argsort(wr["addr"], kind="stable")
+        swr = wr[order]
+        uniq, starts = np.unique(swr["addr"], return_index=True)
+        bounds = np.append(starts, len(swr))
+        pos = np.searchsorted(uniq, addrs)
+        for j, p in enumerate(pos):
+            if p < len(uniq) and uniq[p] == addrs[j]:
+                sel = swr[bounds[p] : bounds[p + 1]]
                 grid[:, j] = _carry_series(sel["cycle"], sel["value"], ticks).astype(np.uint8)
     return StateSequence(ticks=ticks, addrs=addrs, grid=grid)
 
@@ -1266,7 +1274,7 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
             trial["cell"] = cell
             trial["sid"] = int(sid_addr)
             trial["cell_frac"] = round(float(frac), 4)
-            _attach_seed_prelude(trial, series, ctx)
+            attach_prelude(trial, series, ctx, [trial.get("cell")])
             if _descriptor_fidelity(trial, series, ctx) > recurrence_fid:
                 result = trial
         return result
@@ -1300,31 +1308,38 @@ def _bacc_with_feeder(bacc, series, sid_addr, ctx):
     return bacc
 
 
-def _attach_seed_prelude(result, series, ctx, max_latches: int = 6):
-    """Fill the pre-modulation held-seed prelude of a cell-fed accumulator.
+def attach_prelude(node, series, ctx, cells, max_latches: int = 6):
+    """Capture the pre-modulation held-seed prelude of a cell-fed register.
 
-    Before its feeder cell's first RAM write the register holds its note-on seed
-    (the instrument PW seed loaded once and held until modulation starts), but the
-    captured cell still reads its power-on default, so the cell replay is wrong on
-    those leading frames. Capture that bounded held prelude as SEQ latches; the
-    cell drives every frame it is actually written. Recorded only when the hold is
-    a few latches (a genuine seed prelude, not arbitrary modulation), so it never
+    Before its source cells' first RAM write the register holds its note-on seed
+    (e.g. an instrument PW seed loaded once and held until modulation starts, or
+    ``$D418`` holding ``mode|$0F`` until the volume cell is stored), but the
+    captured cells still read their power-on default, so the cell replay is wrong
+    on those leading frames. Record that bounded hold as SEQ latches; the cell(s)
+    drive every frame they are live. The prelude ends at the latest first-live
+    frame over all source cells (``first_live_frame``, not ``cell_first_frame``: a
+    cell written later in its first frame than the register's store still reads its
+    power-on default at the write instant). Recorded only when the hold is a few
+    latches (a genuine seed prelude, not arbitrary modulation), so it never
     displaces the captured cell where the cell is live.
     """
     sampler = ctx.sampler
-    cell = result.get("cell")
-    if sampler is None or cell is None:
+    if sampler is None:
         return
-    sid = result.get("sid", result.get("addr"))
-    end = sampler.first_live_frame(cell, sid)
-    if not 0 < end < ctx.n_frames:
+    cells = [c for c in cells if c is not None]
+    if not cells:
+        return
+    sid = node.get("sid", node.get("addr"))
+    ends = [sampler.first_live_frame(int(c), sid) for c in cells]
+    end = max(ends) if ends else 0
+    if not 0 < end < len(series):
         return
     frames, values = _seq_latches(np.asarray(series, dtype=np.int64)[:end])
     if len(frames) > max_latches:
         return
-    result["prelude_end"] = int(end)
-    result["prelude_frames"] = frames
-    result["prelude_values"] = values
+    node["prelude_end"] = int(end)
+    node["prelude_frames"] = frames
+    node["prelude_values"] = values
 
 
 def _classify_freq(trace, sid_addr, series, voice, reg_off, ctx, result):
@@ -1378,7 +1393,7 @@ def _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result) -
             result.pop("seq_frac", None)
             result.pop("n_changes", None)
             _recover_gate(tw, series, ctx)
-            _recover_walk_overrides(tw, series, ctx)
+            recover_overrides(tw, series, ctx)
             result.update(tw)
             return result
 
@@ -1482,35 +1497,47 @@ def _recover_gate(tw, series, ctx):
         tw["residual"] = best_fid
 
 
-def _recover_walk_overrides(tw, series, ctx, max_overrides: int = 3):
-    """Recover value-forcing overrides (e.g. CTRL ``$08``/``$81``) over a walk.
+def recover_overrides(node, series, ctx, max_overrides: int = 3, mask=None, explained=None):
+    """Greedy strictly-improving value-forcing override recovery over a base recon.
 
-    The table can hold non-waveform command bytes (e.g. a ``$0A`` wavetable
-    control entry) that the player never emits, forcing the real waveform at that
-    cursor cell instead; each such force is one override. Overrides are taken
-    greedily and an override is kept only when it strictly raises reproduction, so
-    raising the cap never regresses a register that needed fewer.
+    A generator's table/pair/composite base can leave a handful of frames
+    unexplained -- a note-onset reset, a hard-restart, a ``$08``/``$81`` control
+    byte the wavetable never emits -- each forced where a recovered cell predicate
+    holds (see :func:`_find_override`). Overrides are taken greedily and kept only
+    when they strictly raise reproduction, so raising the cap never regresses a
+    register that needed fewer.
+
+    ``mask`` (cf. the AND pair's pre-first-write zero, ``_and_recon_masked``), when
+    given, zeroes the reconstruction where the register was not yet written before
+    scoring. ``explained`` overrides the default byte-wise ``series == work`` test
+    of which frames the base already reproduces (the composite path passes its
+    16-bit ``base+mod == target`` mask). Records ``node["overrides"]`` and
+    ``node["residual"]`` when any override survives.
     """
-    if ctx.sampler is None:
+    sampler = ctx.sampler
+    if sampler is None:
         return
     series = np.asarray(series, dtype=np.int64)
-    work = ir.evaluate(ir.to_ir(tw), ctx.n_frames, ctx.sampler)
+    cur = ir.evaluate(ir.to_ir(node), ctx.n_frames, sampler)
+    work = cur if mask is None else np.where(mask, cur, 0)
     best_fid = float(np.mean(work == series))
     overrides = []
     for _ in range(max_overrides):
-        forced = np.where(series == work, -1, series).astype(np.int64)
+        hit = (series == work) if explained is None else explained
+        forced = np.where(hit, -1, series).astype(np.int64)
         ov = _override_descriptor(forced, ctx)
         if ov is None or ov in overrides:
             break
-        cand = _apply_overrides(work, [ov], ctx.sampler)
-        cand_fid = float(np.mean(cand == series))
+        cand = _apply_overrides(cur, [ov], sampler)
+        cand_work = cand if mask is None else np.where(mask, cand, 0)
+        cand_fid = float(np.mean(cand_work == series))
         if cand_fid <= best_fid:
             break
         overrides.append(ov)
-        work, best_fid = cand, cand_fid
+        cur, work, best_fid = cand, cand_work, cand_fid
     if overrides:
-        tw["overrides"] = overrides
-        tw["residual"] = best_fid
+        node["overrides"] = overrides
+        node["residual"] = best_fid
 
 
 def _best_feeder_at_write(series, sid_addr, ctx):
@@ -1900,37 +1927,15 @@ def _composite16(trace, sid_addr, reg_off, ctx):
             "overrides": [],
         }
         modelled = (base_val + ir.part_value(mod, n, ctx.sampler)) & 0xFFFF
-        _best_composite_override(desc, modelled, target, out_byte, target_byte, n, ctx)
+        # The 16-bit base+mod sum is what isolates the override frames (a note
+        # onset / hard-restart), so score explained-ness on the whole word, not the
+        # emitted byte; ``out_byte`` (== ``target_byte``) is the forced value.
+        recover_overrides(desc, target_byte, ctx, 1, explained=modelled == target)
         fid = float(np.mean(ir.evaluate(ir.to_ir(desc), n, ctx.sampler) == target_byte))
         desc["residual"] = fid
         if fid > best_fid:
             best_fid, best_desc = fid, desc
     return best_desc
-
-
-def _best_composite_override(desc, modelled, target, out_byte, target_byte, n, ctx):
-    """Attach the per-byte residual override only when it reconstructs strictly
-    better; none otherwise.
-
-    The forced value is the register byte on the frames the base+mod model fails
-    (a note-onset reset / hard-restart), gated by a recovered cell predicate (an
-    equality, single-bit, or small value-membership test -- see
-    :func:`_find_override`). Strictly non-worsening: an override that does not
-    raise reconstruction (a spurious membership predicate, say) is dropped, so a
-    register an override already nails is never displaced.
-    """
-    base_fid = float(np.mean(ir.evaluate(ir.to_ir(desc), n, ctx.sampler) == target_byte))
-    candidates = []
-    ov_b = _override_descriptor(np.where(modelled == target, -1, out_byte).astype(np.int64), ctx)
-    if ov_b is not None:
-        candidates.append(ov_b)
-    best_fid, best_ov = base_fid, None
-    for ov in candidates:
-        desc["overrides"] = [ov]
-        fid = float(np.mean(ir.evaluate(ir.to_ir(desc), n, ctx.sampler) == target_byte))
-        if fid > best_fid:
-            best_fid, best_ov = fid, ov
-    desc["overrides"] = [best_ov] if best_ov is not None else []
 
 
 def _composite8(sid_addr, series, ctx):
@@ -2080,7 +2085,7 @@ def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
     # a control byte the shadow never carries. Recover those as value-forcing
     # overrides (same greedy, strictly-improving pass as the table-walk path) so a
     # gated wave-table CTRL written through a shadow cell recovers byte-exact.
-    _recover_pair_overrides(desc, s, ctx)
+    recover_overrides(desc, s, ctx, 4, mask=ctx.sampler.written_mask(desc["sid"]))
     if desc["residual"] < min_fid:
         return None
     return desc
@@ -2091,40 +2096,6 @@ def _and_recon_masked(desc, ctx) -> np.ndarray:
     base = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
     written = ctx.sampler.written_mask(desc["sid"])
     return np.where(written, base, 0)
-
-
-def _recover_pair_overrides(desc, series, ctx, max_overrides: int = 4):
-    """Recover value-forcing overrides over an ``AND`` pair recon (CTRL onsets).
-
-    Mirrors :func:`_recover_walk_overrides`: each onset/hard-restart byte the
-    wave-AND-gate base fails to explain is forced where a recovered cell predicate
-    holds, taken greedily and kept only when it strictly raises reproduction (so it
-    never regresses a pair that already reconstructs exactly).
-    """
-    sampler = ctx.sampler
-    if sampler is None:
-        return
-    series = np.asarray(series, dtype=np.int64)
-    written = sampler.written_mask(desc["sid"])
-    cur = ir.evaluate(ir.to_ir(desc), ctx.n_frames, sampler)
-    work = np.where(written, cur, 0)
-    best_fid = float(np.mean(work == series))
-    overrides = []
-    for _ in range(max_overrides):
-        forced = np.where(series == work, -1, series).astype(np.int64)
-        ov = _override_descriptor(forced, ctx)
-        if ov is None or ov in overrides:
-            break
-        cur2 = _apply_overrides(cur, [ov], sampler)
-        work2 = np.where(written, cur2, 0)
-        fid2 = float(np.mean(work2 == series))
-        if fid2 <= best_fid:
-            break
-        overrides.append(ov)
-        cur, work, best_fid = cur2, work2, fid2
-    if overrides:
-        desc["overrides"] = overrides
-        desc["residual"] = best_fid
 
 
 def _maybe_and_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
@@ -2143,35 +2114,6 @@ def _maybe_and_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
         keep.update(and_d)
         return keep
     return result
-
-
-def _attach_or_prelude(desc, series, ctx, cells, max_latches: int = 6):
-    """Capture the held-seed prelude before an OR's feeder cells start updating.
-
-    Like :func:`_attach_seed_prelude`: before its source cells' first RAM write the
-    register holds its note-on seed (e.g. ``$D418`` holds ``mode|$0F`` until the
-    volume cell is first stored), but the captured cells still read their power-on
-    default, so the OR replay is wrong on those leading frames. Record that bounded
-    hold as SEQ latches; the OR drives every frame the cells are live. Only a few
-    latches (a genuine seed prelude, not modulation) are recorded.
-    """
-    sampler = ctx.sampler
-    if sampler is None:
-        return
-    # first_live_frame, not cell_first_frame: a cell first written later in its
-    # first frame than the register's store still reads its power-on default at the
-    # write instant, so the seed drives that frame too (the gate-off boundary).
-    ends = [sampler.first_live_frame(int(c), desc["sid"]) for c in cells]
-    end = max(ends) if ends else 0
-    n = len(series)
-    if not 0 < end < n:
-        return
-    frames, values = _seq_latches(np.asarray(series, dtype=np.int64)[:end])
-    if len(frames) > max_latches:
-        return
-    desc["prelude_end"] = int(end)
-    desc["prelude_frames"] = frames
-    desc["prelude_values"] = values
 
 
 def _or_pair(sid_addr, series, ctx, min_fid: float = 0.999):
@@ -2233,7 +2175,7 @@ def _or_pair(sid_addr, series, ctx, min_fid: float = 0.999):
     else:
         desc["cell_b"] = int(addrs[cols[bi]])
         cells.append(desc["cell_b"])
-    _attach_or_prelude(desc, s, ctx, cells)
+    attach_prelude(desc, s, ctx, cells)
     recon = ir.evaluate(ir.to_ir(desc), n, ctx.sampler)
     fid = float(np.mean(recon == s))
     if fid < min_fid:
