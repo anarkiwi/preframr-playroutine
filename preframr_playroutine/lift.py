@@ -33,6 +33,11 @@ import numpy as np
 
 from . import ir
 
+# Shared witness encoders (the sampler-column packer + per-spec sampler), reused so
+# the lifter and the evaluator agree on the witness key layout exactly.
+_encode_rows = ir._encode_rows  # pylint: disable=protected-access
+_witness_col = ir._witness_col  # pylint: disable=protected-access
+
 # -- 6502 decoder (tabular; ~60 opcodes) --------------------------------------
 #
 # Addressing modes and their instruction lengths (opcode byte included).
@@ -208,12 +213,28 @@ def _prev_instr_start(image, covered, pc):
     return None
 
 
+# A call/return terminates the backward walk: the slice cannot cross it (the
+# slicer fails closed on calls), and the register the store reads is either
+# redefined after the boundary (so earlier code is dead) or produced by the call
+# (statically unrecoverable). Stopping here keeps the cone the store's own emit
+# instructions -- crucially the SMC-immediate feeder of an ``LDA #imm ; STA $D4xx``
+# unrolled writer -- instead of the whole compute routine before the JSR/RTS.
+_SLICE_BOUNDARY = frozenset({"JSR", "RTS", "RTI"})
+
+
 def block_start(image, covered, store_pc, max_instrs=_MAX_INSTRS):
-    """Walk back over executed instructions to the slice's entry PC."""
+    """Walk back over executed instructions to the slice's entry PC.
+
+    Stops at a call/return boundary (see ``_SLICE_BOUNDARY``): the entry PC is the
+    first executed instruction after the most recent JSR/RTS/RTI before the store.
+    """
     cur = store_pc
     for _ in range(max_instrs):
         prev = _prev_instr_start(image, covered, cur)
         if prev is None:
+            break
+        pins = decode(image, prev)
+        if pins is not None and pins.name in _SLICE_BOUNDARY:
             break
         cur = prev
     return cur
@@ -270,7 +291,9 @@ class _Slicer:
             return _const(ins.operand)
         if mode in ("zp", "abs"):
             if _is_io(ins.operand):
-                raise _Fail("io read")
+                # A live chip-state read (osc3/env3, CIA timer): the player's own
+                # LDA $D41B idiom -> a chip source node driven by the I/O-read log.
+                return {"op": "chip", "addr": int(ins.operand), "sid": self.sid}
             return _cell(ins.operand, self.sid, "write")
         if mode in ("abx", "aby", "zpx", "zpy"):
             idx = state["X"] if mode.endswith("x") else state["Y"]
@@ -491,12 +514,18 @@ def lift_store(image, covered, store_pc, sid_addr, is_smc):
         return None
 
 
+_CONE_IDX = ("abx", "aby", "zpx", "zpy", "indx", "indy")
+
+
 def slice_cone(image, covered, store_pc, is_smc, max_instrs=_MAX_INSTRS):
-    """Ordered input-cell cone of the code that emits ``store_pc``'s value.
+    """Ordered input cone of the code that emits ``store_pc``'s value.
 
     Decodes the executed instructions from the slice's entry to the store and
-    collects every RAM address the value reads -- absolute/zero-page operands and
-    self-modifying immediates -- as ``(addr, "write")`` input specs. Unlike a full
+    collects every input the value reads as an ordered ``(id, sample)`` spec:
+    absolute/zero-page RAM operands and self-modifying immediates -> ``(addr,
+    "write")``; live I/O reads (osc3/env3, CIA) -> ``(addr, "chip")``; indexed
+    reads whose effective address varies per frame -> ``(read_pc, "readpc")`` (the
+    logged per-frame read value is the input, whatever the address). Unlike a full
     symbolic slice this succeeds even when the value function itself resists static
     lifting (within-call loops, unusual dataflow), giving Tier 3 the dataflow cone
     to memoise over (GENERIC_RECOVERY.md 3.5). Returns an ordered, de-duplicated
@@ -513,63 +542,121 @@ def slice_cone(image, covered, store_pc, is_smc, max_instrs=_MAX_INSTRS):
         cur = decode(image, pc)
         if cur is None:
             break
-        addr = None
+        spec = None
         if cur.mode == "imm" and cur.name in _CONE_IMM and is_smc(cur.pc + 1):
-            addr = cur.pc + 1
-        elif cur.mode in ("zp", "abs") and cur.name in _CONE_ABS and not _is_io(cur.operand):
-            addr = cur.operand
-        if addr is not None and addr not in seen:
-            seen.add(addr)
-            cone.append((int(addr), "write"))
+            spec = (int(cur.pc + 1), "write")
+        elif cur.mode in ("zp", "abs") and cur.name in _CONE_ABS:
+            spec = (int(cur.operand), "chip" if _is_io(cur.operand) else "write")
+        elif cur.mode in _CONE_IDX and cur.name in _CONE_ABS:
+            spec = (int(cur.pc), "readpc")
+        if spec is not None and spec not in seen:
+            seen.add(spec)
+            cone.append(spec)
         if pc == store_pc:
             break
         pc += cur.length
     return cone
 
 
-def _witness_from_specs(series, specs, sid_addr, ctx):
-    """Build a Tier-3 witness descriptor from an ordered input-cell list.
+# A structured key packs arbitrarily many byte columns, so the witness is not
+# capped at 7 inputs -- a 16-bit SMC accumulator or an unrolled multi-site writer
+# (Blackout/Commando FREQ) needs a wider determining set. The picks cap bounds the
+# greedy cost; the pool bounds the candidate set considered.
+_WITNESS_CAP = 16
+_WITNESS_POOL = 40
 
-    Samples each cell per frame (deduplicated, capped at 7 -- one int64 key), then
-    memoises the observed ``inputs -> value`` mapping. Exact when the cells
-    determine the register; a residual collision leaves that key at its first
-    observed value (scored below 1.0, so a fitting tree still wins).
+
+def _pure_from_inv(inv, target) -> int:
+    """Frames in output-constant groups, given a per-frame group index ``inv``.
+
+    A group (frames sharing an input tuple) is pure iff its outputs are all equal;
+    adding a column only splits groups, so this is monotone -- the greedy objective.
+    Equals ``n`` iff the inputs determine the register (an exact witness).
+    """
+    k = int(inv.max()) + 1 if len(inv) else 0
+    gmin = np.full(k, np.iinfo(np.int64).max, dtype=np.int64)
+    gmax = np.full(k, np.iinfo(np.int64).min, dtype=np.int64)
+    np.minimum.at(gmin, inv, target)
+    np.maximum.at(gmax, inv, target)
+    return int((gmin == gmax)[inv].sum())
+
+
+def _select_determining(cols, target, cap=_WITNESS_CAP):
+    """Greedily pick up to ``cap`` columns maximising output-determining frames.
+
+    Returns the chosen column indices (cone order, ties to earliest). Only inputs
+    that reduce collisions are kept, so noise cells never dilute the witness key --
+    the memoised mapping is exact whenever the cone determines the output
+    (GENERIC_RECOVERY.md 3.5 premises 1-3), else maximally pure. The chosen columns'
+    group index is cached and each candidate folds in one more byte column with a
+    single int64 ``np.unique`` (no per-step structured-void sort), keeping the
+    search fast on the longest fixtures (millions of frames x dozens of read-PCs).
+    """
+    n = len(target)
+    chosen = []
+    chosen_inv = np.zeros(n, dtype=np.int64)
+    best = -1
+    while len(chosen) < cap and best < n:
+        add, add_inv, add_score = None, None, best
+        for i, col in enumerate(cols):
+            if i in chosen:
+                continue
+            inv = np.asarray(np.unique(chosen_inv * 256 + col, return_inverse=True)[1]).ravel()
+            score = _pure_from_inv(inv, target)
+            if score > add_score:
+                add, add_inv, add_score = i, inv, score
+        if add is None:
+            break
+        chosen.append(add)
+        chosen_inv = add_inv
+        best = add_score
+    return chosen
+
+
+def _witness_from_specs(series, specs, sid_addr, ctx):
+    """Build a Tier-3 witness descriptor from a code-derived input cone.
+
+    Samples each input spec per frame (RAM cell / SMC immediate / live chip read /
+    per-frame read-PC value), greedily keeps the determining subset, then memoises
+    the observed ``inputs -> value`` mapping. Exact when
+    the cone determines the register (the totality guarantee); a residual collision
+    leaves that key at its first observed value (scored below 1.0, so a fitting
+    tree still wins).
     """
     sampler = ctx.sampler
     n = ctx.n_frames
     if sampler is None or n == 0:
         return None
     seen, uniq = set(), []
-    for addr, samp in specs:
-        key = (int(addr), samp)
-        if key in seen or _is_io(addr):
+    for spec in specs:
+        key = (int(spec[0]), spec[1])
+        if key in seen:
             continue
         seen.add(key)
         uniq.append(key)
-        if len(uniq) >= 7:
+        if len(uniq) >= _WITNESS_POOL:
             break
     if not uniq:
         return None
-    cols = []
-    for addr, samp in uniq:
-        if samp == "eof":
-            col = sampler.eof(addr)
-        elif samp == "operand":
-            col = sampler.operand(addr, sid_addr)
-        else:
-            col = sampler.at_write(addr, sid_addr)
-        cols.append(np.asarray(col, dtype=np.int64)[:n] & 0xFF)
-    enc = ir._encode_rows(cols)  # pylint: disable=protected-access
     target = np.asarray(series, dtype=np.int64)[:n]
-    keys, first = np.unique(enc, return_index=True)
-    values = target[first]
+    cols = [
+        np.asarray(_witness_col(spec, int(sid_addr), sampler), dtype=np.int64)[:n] & 0xFF
+        for spec in uniq
+    ]
+    keep = _select_determining(cols, target)
+    if not keep:
+        return None
+    specs_kept = [uniq[i] for i in keep]
+    sel = [np.asarray(cols[i], dtype=np.uint8) for i in keep]
+    _keys, first = np.unique(_encode_rows(sel), return_index=True)
+    stacked = np.ascontiguousarray(np.stack(sel, axis=1))  # (n, k) byte rows
     return {
         "type": "WITNESS",
         "addr": int(sid_addr),
         "sid": int(sid_addr),
-        "specs": uniq,
-        "kenc": keys.astype(np.int64),
-        "values": values.astype(np.int64),
+        "specs": specs_kept,
+        "krows": stacked[first].astype(np.uint8),
+        "values": target[first].astype(np.int64),
     }
 
 
@@ -606,6 +693,16 @@ def propose_lift(series, sid_addr, store_pcs, ctx):
                 }
             )
         for spec in slice_cone(image, covered, int(pc), is_smc):
+            if spec not in seen:
+                seen.add(spec)
+                cone.append(spec)
+    # Supplement the static (PC-decoded) cone with the log-based read-PC cone: reads
+    # inside called subroutines a bounded static slice cannot reach. The greedy
+    # subset selection keeps only the determining inputs (GENERIC_RECOVERY.md 3.5).
+    pcs_near = getattr(ctx, "read_pcs_near", None)
+    if pcs_near is not None:
+        for rpc in sorted(pcs_near.get(int(sid_addr), ())):
+            spec = (int(rpc), "readpc")
             if spec not in seen:
                 seen.add(spec)
                 cone.append(spec)

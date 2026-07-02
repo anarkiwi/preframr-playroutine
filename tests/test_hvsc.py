@@ -78,6 +78,9 @@ _PERFECT = {
     ("JCH_NewPlayer", "24th_Amaranth_Grand_Prix_3.sid"),
     ("JCH_NewPlayer", "Dreams.sid"),
     ("FutureComposer", "Hawkeye.sid"),
+    ("FutureComposer", "Tune_06.sid"),
+    ("FutureComposer", "Manchester_United.sid"),
+    ("Hubbard", "Commando.sid"),
     ("GoatTracker2", "Grid_Runner.sid"),
     ("GoatTracker2", "Day_6_in_Kleve_Hades.sid"),
     ("GoatTracker2", "Raindrops.sid"),
@@ -259,16 +262,22 @@ def test_real_tune_perfect(entry, tmp_path_factory):
             assert rt.get(addr, 0.0) >= recorded - 1e-6, (reg, rt.get(addr), recorded)
         assert rt["overall"] >= snap["overall"] - 1e-6, (rt["overall"], snap["overall"])
 
+    # Zero-XSTATE is an ENFORCED invariant for EVERY tune, perfect or not (P1):
+    # the Tier-3 dynamic witness (fed the I/O-read log + the ``--reads`` RAM-read
+    # cone) retires XSTATE as a terminal category (GENERIC_RECOVERY.md 3.5). No
+    # per-register tolerance -- a register that cannot be witnessed exactly is a
+    # reported blocker, never a swallowed exception.
+    assert not xstate, [hex(a) for a in xstate]
+
     if _key(entry) in _PERFECT:
-        assert not xstate, [hex(a) for a in xstate]
         assert rt["overall"] == 1.0, (rt["overall"], rt["unmodeled"][:4])
     else:
         # Not yet perfect. The fidelity ratchet above guards against regression;
         # this forces promotion -- when the tune reaches perfect recovery, add it
         # to _PERFECT (CI fails here until you do; the old strict-xfail intent).
-        assert xstate or rt["overall"] < 1.0, (
-            f"{_ids(entry)} now recovers perfectly (overall==1.0, no XSTATE); " "add it to _PERFECT"
-        )
+        assert (
+            rt["overall"] < 1.0
+        ), f"{_ids(entry)} now recovers perfectly (overall==1.0, no XSTATE); add it to _PERFECT"
 
 
 _PERFECT_ENTRIES = [e for e in CATALOG if _key(e) in _PERFECT]
@@ -313,5 +322,6 @@ def test_real_tune_anchors(entry, tmp_path_factory):
     trace2 = run_sidtrace(sid, prefix_b, entry["seconds"], entry.get("subtune", 1))
     assert np.array_equal(trace.events.view(np.uint8), trace2.events.view(np.uint8))
     assert np.array_equal(trace.ram_writes().view(np.uint8), trace2.ram_writes().view(np.uint8))
+    assert np.array_equal(trace.ram_reads().view(np.uint8), trace2.ram_reads().view(np.uint8))
     assert np.array_equal(trace.io_reads().view(np.uint8), trace2.io_reads().view(np.uint8))
     assert np.array_equal(trace.io_writes().view(np.uint8), trace2.io_writes().view(np.uint8))

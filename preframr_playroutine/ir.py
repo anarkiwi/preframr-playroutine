@@ -482,6 +482,19 @@ def _ev_cell(node, n, sampler):
     return sampler.at_write(node["addr"], node["sid"])
 
 
+def _ev_chip(node, n, sampler):
+    """A live chip-state read at the emit instant (the player's own ``LDA $D41B``).
+
+    During recovery/scoring the logged I/O-read values drive reconstruction through
+    the sampler like any input cell (GENERIC_RECOVERY.md 3.5: no circularity -- the
+    trace observed them). ``addr`` is the I/O register read ($D41B osc3, $D41C env3,
+    a CIA timer, ...); ``sid`` selects the store instant the read fed.
+    """
+    if sampler is None:
+        return np.zeros(n, dtype=np.int64)
+    return np.asarray(sampler.chip(node["addr"], node.get("sid")), dtype=np.int64)[:n]
+
+
 def _ev_lohi(node, n, sampler):
     from . import recover  # pylint: disable=import-outside-toplevel,cyclic-import
 
@@ -646,29 +659,57 @@ def _ev_cmpsel(node, n, sampler):
     return np.where(mask, then, els)
 
 
+def _witness_col(spec, sid, sampler):
+    """One per-frame input column for a witness spec ``(id, sample_mode)``.
+
+    ``chip`` samples the logged I/O read of an address; ``readpc`` the value a
+    specific read-PC observed (indexed/subroutine/dynamic reads captured by value,
+    GENERIC_RECOVERY.md 3.5); ``eof``/``operand`` are RAM cell samples, else the
+    at-write cell value.
+    """
+    ident, samp = int(spec[0]), spec[1]
+    if samp == "chip":
+        return sampler.chip(ident, sid)
+    if samp == "readpc":
+        return sampler.read_pc(ident, sid)
+    if samp == "eof":
+        return sampler.eof(ident)
+    if samp == "operand":
+        return sampler.operand(ident, sid)
+    return sampler.at_write(ident, sid)
+
+
 def _witness_cols(node, n, sampler):
     """Per-frame sampled columns for a witness node's input cells."""
     sid = node.get("sid")
-    cols = []
-    for addr, samp in node["specs"]:
-        if samp == "eof":
-            col = sampler.eof(int(addr))
-        elif samp == "operand":
-            col = sampler.operand(int(addr), sid)
-        else:
-            col = sampler.at_write(int(addr), sid)
-        cols.append(np.asarray(col, dtype=np.int64)[:n] & 0xFF)
-    return cols
+    return [
+        np.asarray(_witness_col(spec, sid, sampler), dtype=np.int64)[:n] & 0xFF
+        for spec in node["specs"]
+    ]
+
+
+def _pack_rows(cols) -> np.ndarray:
+    """Pack byte columns into one key per frame for ``np.unique`` / ``searchsorted``.
+
+    Up to eight byte columns fit one ``uint64`` (fast integer ordering); a wider
+    cone (a 16-bit SMC accumulator, an unrolled multi-site writer) packs into a
+    structured (void) key ordered lexicographically -- so the witness key has no
+    column cap.
+    """
+    if not cols:
+        return np.zeros(0, dtype=np.uint64)
+    if len(cols) <= 8:
+        enc = np.zeros(len(cols[0]), dtype=np.uint64)
+        for j, col in enumerate(cols):
+            enc |= (np.asarray(col, dtype=np.uint64) & np.uint64(0xFF)) << np.uint64(8 * j)
+        return enc
+    stacked = np.ascontiguousarray(np.stack([np.asarray(c, dtype=np.uint8) for c in cols], axis=1))
+    return stacked.view([("", np.uint8)] * stacked.shape[1]).ravel()
 
 
 def _encode_rows(cols) -> np.ndarray:
-    """Pack up to 7 byte columns into one int64 key per frame (base 256)."""
-    if not cols:
-        return np.zeros(0, dtype=np.int64)
-    enc = np.zeros(len(cols[0]), dtype=np.int64)
-    for j, col in enumerate(cols):
-        enc |= (np.asarray(col, dtype=np.int64) & 0xFF) << np.int64(8 * j)
-    return enc
+    """Per-frame structured witness key for a list of byte columns."""
+    return _pack_rows(cols)
 
 
 def _ev_witness(node, n, sampler):
@@ -682,11 +723,13 @@ def _ev_witness(node, n, sampler):
     """
     if sampler is None or not node.get("specs"):
         return np.zeros(n, dtype=np.int64)
-    frame_enc = _encode_rows(_witness_cols(node, n, sampler))
-    kenc = np.asarray(node["kenc"], dtype=np.int64)
+    krows = np.asarray(node["krows"], dtype=np.uint8)
     vals = np.asarray(node["values"], dtype=np.int64)
-    if len(kenc) == 0:
+    if krows.shape[0] == 0:
         return np.zeros(n, dtype=np.int64)
+    cols = _witness_cols(node, n, sampler)
+    frame_enc = _pack_rows(cols)
+    kenc = _pack_rows([krows[:, j] for j in range(krows.shape[1])])
     order = np.argsort(kenc, kind="stable")
     ks, vs = kenc[order], vals[order]
     pos = np.clip(np.searchsorted(ks, frame_enc), 0, len(ks) - 1)
@@ -723,6 +766,7 @@ _EVAL = {
     "latent": _ev_latent,
     "cmpsel": _ev_cmpsel,
     "witness": _ev_witness,
+    "chip": _ev_chip,
 }
 
 
@@ -834,6 +878,14 @@ def _cc_cell(node, sampler, n):
     return 1.0 + CAPTURED_W * cf / max(1, n or 1), cf
 
 
+def _cc_chip(node, sampler, n):
+    """A live chip read is captured per-frame modulation -- priced like a cell."""
+    if sampler is None or not n:
+        return 1.0, 0
+    cf = _changed_frames(np.asarray(sampler.chip(node["addr"], node.get("sid")))[:n])
+    return 1.0 + CAPTURED_W * cf / max(1, n or 1), cf
+
+
 def _cc_lohi(node, sampler, n):
     cl, capl = _cost_captured(node["lo"], sampler, n)
     ch, caph = _cost_captured(node["hi"], sampler, n)
@@ -912,7 +964,7 @@ def _cc_witness(node, _sampler, n):
     # The Tier-3 backstop is charged heavily: one distinct input->output entry per
     # observed key (the captured mapping) at CAPTURED_W, plus every input cell, so
     # any Tier-1/2 tree that reproduces the series always out-scores it (3.5).
-    cap = len(node.get("kenc", []))
+    cap = len(node.get("krows", []))
     cost = 1.0 + WITNESS_W * cap / max(1, n or 1) + CAPTURED_W * len(node.get("specs", []))
     return cost, cap
 
@@ -925,6 +977,7 @@ _COST = {
     "seq": _cc_seq,
     "literal": _cc_literal,
     "cell": _cc_cell,
+    "chip": _cc_chip,
     "lohi": _cc_lohi,
     "binop": _cc_binop,
     "table": _cc_table,
@@ -1239,7 +1292,7 @@ def _witness_ir(d):
         "op": "witness",
         "specs": [(int(a), s) for a, s in d["specs"]],
         "sid": d.get("sid"),
-        "kenc": d["kenc"],
+        "krows": d["krows"],
         "values": d["values"],
     }
     return _post(node, d)

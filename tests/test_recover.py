@@ -948,12 +948,17 @@ def test_classify_seq_sparse():
     assert res["type"] == "SEQ"
 
 
-def test_classify_xstate_dense_irregular():
+def test_classify_dense_irregular_bare_feeder():
+    # Dense irregular values with no captured cell, no code image and no read log:
+    # the raw-cell fallback has nothing to replay -> a bare FEEDER (no cell), which
+    # reconstructs to None. XSTATE is retired as a terminal category (the Tier-3
+    # witness, absent a code cone here, has nothing to memoise).
     rng = np.random.default_rng(1)
     values = rng.integers(0, 256, size=80)
     trace = _trace_with_register(values, sid_addr=0xD402)
     res = classify_register(trace, 0xD402)
-    assert res["type"] == "XSTATE"
+    assert res["type"] == "FEEDER"
+    assert res.get("cell") is None
 
 
 def test_classify_filter_feeder_latch():
