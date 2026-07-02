@@ -465,6 +465,17 @@ def _comp_part_ir(part):
     return {"op": "cell", "addr": part["cell"], "sample": "write", "sid": part["sid"]}
 
 
+def part_value(part, n, sampler):
+    """Per-frame value of a single composite part (``None`` -> zeros).
+
+    Exposes the part-level reconstruction (16-bit lo/hi pair, 8-bit cell, or
+    literal series) that ``_composite_ir`` folds into a COMPOSITE tree, for
+    recover.py's composite scoring.
+    """
+    node = _comp_part_ir(part)
+    return np.zeros(n, dtype=np.int64) if node is None else evaluate(node, n, sampler)
+
+
 def _composite_ir(d):
     base = _comp_part_ir(d.get("base"))
     mod = _comp_part_ir(d.get("mod"))
