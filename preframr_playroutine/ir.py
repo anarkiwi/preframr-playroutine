@@ -71,7 +71,35 @@ def _run_recurrence(
     return lo + ((int(seed) - lo) + step * np.arange(length, dtype=np.int64)) % mod
 
 
-def _recon_tickband(desc, n) -> np.ndarray:
+def _global_tick(desc, n, sampler):
+    """A global tick series for a ``recur`` whose ``index`` is not the note tick.
+
+    ``index`` accepts ``"frame"`` (the 0..n-1 frame counter) or a cell address
+    (its end-of-frame series); ``None``/``"tick"`` keep the per-segment note tick
+    (the default) and return ``None``. Lets a tick-indexed stride be driven by a
+    shared latent (Commando-class global phase) instead of the note-on reset.
+    """
+    idx = desc.get("index")
+    if idx in (None, "tick"):
+        return None
+    if idx == "frame":
+        return np.arange(n, dtype=np.int64)
+    if isinstance(idx, (int, np.integer)) and sampler is not None:
+        return _fit_len(sampler.eof(int(idx)), n)
+    return None
+
+
+def _seg_rate(rate, start, length, tick):
+    """Per-segment stride vector, gathered by a global ``tick`` when supplied."""
+    if tick is None:
+        return rate
+    if len(rate) == 0:
+        return rate
+    pos = np.clip(tick[start : start + length], 0, len(rate) - 1)
+    return np.asarray(rate, dtype=np.int64)[pos]
+
+
+def _recon_tickband(desc, n, sampler=None) -> np.ndarray:
     """Regenerate a tick-banded reflecting sweep from its per-segment rate tables."""
     from . import recover  # pylint: disable=import-outside-toplevel,cyclic-import
 
@@ -81,6 +109,7 @@ def _recon_tickband(desc, n) -> np.ndarray:
     seg_tables = list(desc.get("seg_tables", []))
     tables = desc.get("rate_tables", [])
     lo, hi = desc["lo"], desc["hi"]
+    tick = _global_tick(desc, n, sampler)
     if not resets or resets[0] != 0:
         resets = [0] + resets
         seeds = [seeds[0] if seeds else lo] + seeds
@@ -96,6 +125,7 @@ def _recon_tickband(desc, n) -> np.ndarray:
         d = dirs[i] if i < len(dirs) else 1
         ti = seg_tables[i] if i < len(seg_tables) else 0
         rate = tables[ti] if ti < len(tables) else np.zeros(0, dtype=np.int64)
+        rate = _seg_rate(rate, start, length, tick)
         out[start : start + length] = (
             recover._simulate_tickreflect(  # pylint: disable=protected-access
                 lo, hi, rate, int(seed), int(d), length
@@ -104,7 +134,7 @@ def _recon_tickband(desc, n) -> np.ndarray:
     return out
 
 
-def _recon_product(desc, n) -> np.ndarray:
+def _recon_product(desc, n, sampler=None) -> np.ndarray:
     """Regenerate a segmented step x boundary product recurrence.
 
     The general per-frame kernel (``recover._simulate_recur``) covers every cell
@@ -128,6 +158,7 @@ def _recon_product(desc, n) -> np.ndarray:
     step_kind = desc.get("step_kind", "const")
     boundary = desc.get("boundary", "reflect")
     modulus = desc.get("modulus")
+    tick = _global_tick(desc, n, sampler)
     if not resets or resets[0] != 0:
         resets = [0] + resets
         seeds = [seeds[0] if seeds else lo] + seeds
@@ -145,6 +176,7 @@ def _recon_product(desc, n) -> np.ndarray:
         if step_kind == "table":
             ti = seg_tables[i] if i < len(seg_tables) else 0
             rate = tables[ti] if ti < len(tables) else np.zeros(0, dtype=np.int64)
+            rate = _seg_rate(rate, start, length, tick)
         out[start : start + length] = recover._simulate_recur(  # pylint: disable=protected-access
             lo,
             hi,
@@ -161,12 +193,12 @@ def _recon_product(desc, n) -> np.ndarray:
     return out
 
 
-def _recon_bacc_full(desc, n) -> np.ndarray:
+def _recon_bacc_full(desc, n, sampler=None) -> np.ndarray:
     """Regenerate the full (8- or 16-bit) accumulator series from its descriptor."""
     if desc.get("mode") == "tickband":
-        return _recon_tickband(desc, n)
+        return _recon_tickband(desc, n, sampler)
     if desc.get("mode") == "product":
-        return _recon_product(desc, n)
+        return _recon_product(desc, n, sampler)
     resets = list(desc.get("resets", [0]))
     seeds = list(desc.get("seeds", [desc.get("phase", desc.get("lo", 0))]))
     if not resets or resets[0] != 0:
@@ -337,9 +369,76 @@ def _ev_lohi(node, n, sampler):
     return recover.combine_lohi(evaluate(node["lo"], n, sampler), evaluate(node["hi"], n, sampler))
 
 
+def _fit_len(series, n) -> np.ndarray:
+    """Clip/pad a shared latent series to exactly ``n`` frames (hold-last)."""
+    s = np.asarray(series, dtype=np.int64).ravel()
+    if len(s) == n:
+        return s
+    if len(s) == 0:
+        return np.zeros(n, dtype=np.int64)
+    if len(s) > n:
+        return s[:n]
+    out = np.empty(n, dtype=np.int64)
+    out[: len(s)] = s
+    out[len(s) :] = s[-1]
+    return out
+
+
+def _ev_frame(_node, n, _sampler):
+    """A global monotonic frame counter (0..n-1) -- the Commando-class phase source."""
+    return np.arange(n, dtype=np.int64)
+
+
+def _ev_latent(node, n, sampler):
+    """Resolve a shared per-voice latent (tick or cursor) via ``sampler.latents``.
+
+    Falls back to the sampler's end-of-frame series for a cursor cell (so a
+    reconstruction with no latents attached still resolves), then to an inline
+    ``data`` series, then to zeros.
+    """
+    kind = node.get("kind", "tick")
+    voice = node.get("voice")
+    addr = node.get("addr")
+    series = None
+    latents = getattr(sampler, "latents", None) if sampler is not None else None
+    if latents is not None and voice in latents:
+        lv = latents[voice]
+        if kind == "tick":
+            series = lv.get("tick")
+        elif kind == "cursor":
+            for a, s in lv.get("cursors", []):
+                if addr is None or int(a) == int(addr):
+                    series = s
+                    break
+    if series is None and kind == "cursor" and addr is not None and sampler is not None:
+        series = sampler.eof(int(addr))
+    if series is None:
+        series = node.get("data")
+    if series is None:
+        return np.zeros(n, dtype=np.int64)
+    return _fit_len(series, n)
+
+
+def _resolve_index(index, n, sampler, voice=None) -> np.ndarray:
+    """Resolve a table/recur index source to a per-frame int64 series.
+
+    ``index`` accepts the string ``"tick"``/``"frame"``, a cell address (int),
+    or a nested index node -- so ``table`` and ``recur`` share one index model.
+    """
+    if isinstance(index, str):
+        if index == "frame":
+            return np.arange(n, dtype=np.int64)
+        return _ev_latent({"op": "latent", "kind": "tick", "voice": voice}, n, sampler)
+    if isinstance(index, (int, np.integer)):
+        return _ev_latent(
+            {"op": "latent", "kind": "cursor", "addr": int(index), "voice": voice}, n, sampler
+        )
+    return np.asarray(evaluate(index, n, sampler), dtype=np.int64)
+
+
 def _ev_table(node, n, sampler):
     table = np.asarray(node["data"], dtype=np.int64)
-    index = np.asarray(evaluate(node["index"], n, sampler), dtype=np.int64)
+    index = _resolve_index(node["index"], n, sampler, node.get("voice"))
     idx = np.clip(index * int(node["stride"]) + int(node["offset"]), 0, len(table) - 1)
     return table[idx]
 
@@ -359,8 +458,8 @@ def _ev_binop(node, n, sampler):
     return a + b
 
 
-def _ev_recur(node, n, _sampler):
-    return _recon_bacc_full(node, n)
+def _ev_recur(node, n, sampler):
+    return _recon_bacc_full(node, n, sampler)
 
 
 def _ev_cutoff(node, n, sampler):
@@ -379,6 +478,8 @@ _EVAL = {
     "binop": _ev_binop,
     "recur": _ev_recur,
     "cutoff": _ev_cutoff,
+    "frame": _ev_frame,
+    "latent": _ev_latent,
 }
 
 
@@ -433,13 +534,25 @@ def _cell_changed(node, sampler, n) -> int:
     return _changed_frames(_ev_cell(node, n, sampler))
 
 
-def _index_cost(node) -> float:
-    """Cost of a derivable table index/cursor subtree (nodes only, no capture)."""
+def _index_cost(node) -> float:  # pylint: disable=too-many-return-statements
+    """Cost of a derivable table index/cursor subtree (nodes only, no capture).
+
+    A shared latent (``"tick"``/``"frame"`` string, cursor cell int, or a
+    ``latent``/``frame`` node) is a *derivable* index, priced like a cursor cell
+    -- so collapsing to the shared per-voice tick never costs more than the raw
+    cursor cell it replaces.
+    """
     if node is None:
         return 0.0
-    op = node["op"]
-    if op == "cell":
+    if isinstance(node, str):
+        return 1.0 if node == "frame" else 1.0 + INDEX_COST
+    if isinstance(node, (int, np.integer)):
         return 1.0 + INDEX_COST
+    op = node["op"]
+    if op in ("cell", "latent"):
+        return 1.0 + INDEX_COST
+    if op == "frame":
+        return 1.0
     if op == "binop":
         return 1.0 + _index_cost(node["a"]) + _index_cost(node["b"])
     if op == "lohi":
@@ -517,6 +630,8 @@ _COST = {
     "table": _cc_table,
     "recur": _cc_recur,
     "cutoff": _cc_cutoff,
+    "frame": lambda node, _s, _n: (1.0, 0),
+    "latent": lambda node, _s, _n: (1.0 + INDEX_COST, 0),
 }
 
 
@@ -641,7 +756,11 @@ def _cutoff_ir(d):
 
 
 def _table_walk_ir(d):
-    if d.get("cursor") is not None:  # a literal cursor series (test fixtures)
+    latent = d.get("index_latent")
+    if latent is not None:  # shared per-voice cursor latent (voice, kind, addr)
+        voice, kind, addr = latent
+        idx = {"op": "latent", "kind": kind, "voice": voice, "addr": addr}
+    elif d.get("cursor") is not None:  # a literal cursor series (test fixtures)
         idx = {"op": "literal", "data": d["cursor"]}
     elif d.get("cursor_addr") is not None:
         idx = {"op": "cell", "addr": d["cursor_addr"], "sample": "eof", "sid": d.get("addr")}

@@ -50,3 +50,102 @@ def test_sampler_modes():
     op = smp.operand(0x12, 0xD402)
     for f in range(16):
         assert int(op[f]) == (f * 5) & 0xFF, (f, int(op[f]))
+
+
+# -- Phase 5: index-source resolution (frame / latent / recur index) ------
+
+from preframr_playroutine import ir  # noqa: E402
+
+
+class _LatentSampler:
+    """Minimal sampler exposing latents + an eof cell for index resolution."""
+
+    def __init__(self, latents, eof_cells=None):
+        self.latents = latents
+        self._eof = {int(a): np.asarray(s, dtype=np.int64) for a, s in (eof_cells or {}).items()}
+
+    def eof(self, addr):
+        return self._eof[int(addr)]
+
+
+def test_evaluate_frame_index():
+    table = np.arange(10, 20, dtype=np.int64)
+    node = {"op": "table", "data": table, "index": "frame", "stride": 1, "offset": 0}
+    out = ir.evaluate(node, 6, None)
+    assert list(out) == [10, 11, 12, 13, 14, 15]
+
+
+def test_evaluate_latent_tick_index():
+    tick = np.array([0, 1, 2, 0, 1, 2], dtype=np.int64)
+    table = np.array([100, 101, 102], dtype=np.int64)
+    sampler = _LatentSampler({0: {"tick": tick, "cursors": []}})
+    node = {"op": "table", "data": table, "index": "tick", "voice": 0, "stride": 1, "offset": 0}
+    out = ir.evaluate(node, 6, sampler)
+    assert list(out) == [100, 101, 102, 100, 101, 102]
+
+
+def test_evaluate_latent_cursor_and_int_index_match():
+    cur = np.array([0, 1, 2, 3, 0, 1], dtype=np.int64)
+    table = np.array([5, 6, 7, 8], dtype=np.int64)
+    sampler = _LatentSampler({1: {"tick": None, "cursors": [(0x40, cur)]}}, eof_cells={0x40: cur})
+    latent_node = {
+        "op": "table",
+        "data": table,
+        "index": {"op": "latent", "kind": "cursor", "voice": 1, "addr": 0x40},
+        "stride": 1,
+        "offset": 0,
+    }
+    int_node = {"op": "table", "data": table, "index": 0x40, "voice": 1, "stride": 1, "offset": 0}
+    a = ir.evaluate(latent_node, 6, sampler)
+    b = ir.evaluate(int_node, 6, sampler)
+    assert np.array_equal(a, b)
+    assert list(a) == [5, 6, 7, 8, 5, 6]
+
+
+def test_evaluate_cursor_falls_back_to_eof_without_latents():
+    cur = np.array([0, 1, 2, 1, 0], dtype=np.int64)
+    table = np.array([9, 8, 7], dtype=np.int64)
+    sampler = _LatentSampler({}, eof_cells={0x77: cur})
+    node = {
+        "op": "table",
+        "data": table,
+        "index": {"op": "latent", "kind": "cursor", "voice": 0, "addr": 0x77},
+        "stride": 1,
+        "offset": 0,
+    }
+    out = ir.evaluate(node, 5, sampler)
+    assert list(out) == [9, 8, 7, 8, 9]
+
+
+def test_recur_global_frame_index_drives_stride():
+    # A tick-indexed reflecting sweep whose stride is read from a GLOBAL frame
+    # counter (no note reset), verified against an independent simulation.
+    rate = np.array([1, 1, 2, 2, 3, 3, 1, 1], dtype=np.int64)
+    n = 8
+    desc = {
+        "op": "recur",
+        "mode": "tickband",
+        "lo": 0,
+        "hi": 20,
+        "resets": [0],
+        "seeds": [0],
+        "directions": [1],
+        "rate_tables": [rate],
+        "seg_tables": [0],
+        "index": "frame",
+    }
+    out = ir.evaluate(desc, n, None)
+    # Reference: single reflecting run stepping by rate[frame].
+    v, d, ref = 0, 1, []
+    for i in range(n):
+        ref.append(v)
+        st = int(rate[i])
+        nv = v + d * st
+        if nv > 20:
+            d = -d
+            nv = 20 - (nv - 20)
+        elif nv < 0:
+            d = -d
+            nv = -nv
+        v = nv
+    assert list(out) == ref

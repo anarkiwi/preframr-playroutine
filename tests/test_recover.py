@@ -2427,3 +2427,111 @@ def test_narrowing_binop_speedup():
         f"narrowed={t_narrow*1e3:.2f}ms ({n_narrow} cells) speedup={t_full/max(t_narrow,1e-9):.1f}x"
     )
     assert t_narrow < t_full  # narrowing is a strict win at this cell count
+
+
+# -- Phase 5: shared per-voice latent state -------------------------------
+
+from preframr_playroutine.recover import (  # noqa: E402
+    _build_context,
+    _build_latents,
+    _synth_tick,
+    propose_index_sum,
+)
+
+
+def _shared_cursor_trace():
+    """Trace whose voice-0 PW-lo and PW-hi are two table walks over ONE cursor.
+
+    The cursor cell ($0040) resets to 0 at each note-on and steps +1; the voice-0
+    CTRL gate provides the note-ons; PW-lo and PW-hi each read a DIFFERENT table at
+    the SAME cursor (byte-even tables so the SID gate-mask search is lossless). The
+    recovery rule: recover the cursor once, both registers reference the shared
+    latent.
+    """
+    note_len = 8
+    n = 96
+    tab_lo = np.array([0x30, 0x80, 0x10, 0x60, 0x20, 0x90, 0x40, 0x70], dtype=np.uint8)
+    tab_hi = np.array([0x12, 0x34, 0x56, 0x78, 0x2A, 0x4C, 0x6E, 0x22], dtype=np.uint8)
+    ram = np.zeros(65536, dtype=np.uint8)
+    lo_base, hi_base = 0x2000, 0x2400
+    ram[lo_base : lo_base + len(tab_lo)] = tab_lo
+    ram[hi_base : hi_base + len(tab_hi)] = tab_hi
+    cursor_cell = 0x0040
+    recs, ramwr = [], []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        cur = i % note_len
+        gate = 0x40 if cur == note_len - 1 else 0x41  # note-on at cursor 0
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        recs.append(_ev(tick + 10, SID_WRITE, reg=4, value=gate, addr=0xD404, aux=0x1500))
+        recs.append(
+            _ev(tick + 12, SID_WRITE, reg=2, value=int(tab_lo[cur]), addr=0xD402, aux=0x1510)
+        )
+        recs.append(
+            _ev(tick + 14, SID_WRITE, reg=3, value=int(tab_hi[cur]), addr=0xD403, aux=0x1520)
+        )
+        ramwr.append(_ra(tick + 6, cursor_cell, cur))
+    trace = _build_trace(recs, ram_writes=ramwr, ram=ram)
+    return trace
+
+
+def test_synth_tick_resets_and_steps():
+    tick = _synth_tick([0, 4, 9], 12)
+    assert list(tick) == [0, 1, 2, 3, 0, 1, 2, 3, 4, 0, 1, 2]
+
+
+def test_latents_group_cursor_and_prefer_captured_tick():
+    trace = _shared_cursor_trace()
+    ctx = _build_context(trace)
+    lat = ctx.latents
+    assert 0 in lat and "global" in lat
+    # The $0040 cursor resets at voice-0 note-ons -> grouped to voice 0.
+    cursor_addrs = [a for a, _s in lat[0]["cursors"]]
+    assert 0x0040 in cursor_addrs
+    # It matches the synthesized wavetable tick, so it is the preferred note cell.
+    assert lat[0]["note_cell"] == 0x0040
+
+
+def test_shared_cursor_two_registers_same_latent():
+    """The core Phase 5 proof: two registers, ONE recovered cursor latent."""
+    trace = _shared_cursor_trace()
+    ctx = _build_context(trace)
+    pw_lo = classify_register(trace, 0xD402, ctx=ctx)
+    pw_hi = classify_register(trace, 0xD403, ctx=ctx)
+    assert pw_lo["type"] == "TABLE_WALK"
+    assert pw_hi["type"] == "TABLE_WALK"
+    # Both walk the SAME cursor cell, tagged with the SAME shared latent id --
+    # not two independently-derived cursors.
+    assert pw_lo["cursor_addr"] == pw_hi["cursor_addr"] == 0x0040
+    assert "index_latent" in pw_lo and "index_latent" in pw_hi
+    assert pw_lo["index_latent"] == pw_hi["index_latent"]
+    voice, kind, addr = pw_lo["index_latent"]
+    assert (voice, kind, addr) == (0, "cursor", 0x0040)
+    # The id resolves into the voice's shared latent set.
+    assert addr in [a for a, _s in ctx.latents[voice]["cursors"]]
+    # Reconstruction stays perfect through the shared latent (round_trip builds a
+    # latent-less sampler, so this also exercises the eof-cell fallback).
+    rt = round_trip(trace)
+    assert rt[0xD402] == 1.0
+    assert rt[0xD403] == 1.0
+
+
+def test_propose_index_sum_recovers_additive_index():
+    """The generalized index builder recovers a table index as a cell sum."""
+    n = 80
+    rng = np.random.default_rng(7)
+    base = rng.integers(0, 20, n).astype(np.int64)
+    offset = rng.integers(0, 6, n).astype(np.int64)
+    idx = base + offset
+    recs, ramwr = [], []
+    for i in range(n):
+        tick = _frame_cycle(i)
+        recs.append(_ev(tick + 2, CPU_VECTOR, value=VEC_IRQ))
+        recs.append(_ev(tick + 12, SID_WRITE, reg=3, value=int(idx[i]) & 0xFF, addr=0xD403))
+        ramwr.append(_ra(tick + 4, 0x0050, int(base[i])))
+        ramwr.append(_ra(tick + 5, 0x0051, int(offset[i])))
+    trace = _build_trace(recs, ram_writes=ramwr)
+    ctx = _build_context(trace)
+    cells, running = propose_index_sum(idx, ctx, sid_addr=0xD403, clip_hi=int(idx.max()))
+    assert set(cells) == {0x0050, 0x0051}
+    assert np.array_equal(running, idx)
