@@ -152,29 +152,66 @@ def build_ioprobe_psid() -> bytes:
     return _build_psid(0, IOPROBE_INIT, IOPROBE_PLAY, IOPROBE_CODE)
 
 
-def recur_segment(lo, hi, seed, direction, length, boundary, step_kind, up=1, down=1, rate=None):
+def recur_segment(  # pylint: disable=too-many-branches,too-many-locals,too-many-arguments
+    lo,
+    hi,
+    seed,
+    direction,
+    length,
+    boundary,
+    step_kind,
+    up=1,
+    down=1,
+    rate=None,
+    divide=1,
+    up_n=0,
+    down_n=0,
+    target=None,
+):
     """Reference simulator for one step x boundary product segment.
 
     A deliberately INDEPENDENT reimplementation of the recovery kernel
     (``recover._simulate_recur``): the product-fitter tests build ground truth
     here and recover it there, so a bug in one is not masked by the other.
     ``step_kind`` in {const, updown, table}; ``boundary`` in
-    {wrap, saw, reflect, clampflip}."""
+    {wrap, saw, reflect, clampflip, countflip, target}. ``divide`` applies the
+    step only every n-th frame; ``up_n``/``down_n`` are the countflip dwell
+    counts; ``target`` is the clamp-to-target latch value."""
     rate = None if rate is None else [int(x) for x in rate]
     m = 0 if rate is None else len(rate)
     span = hi - lo
+    divide = int(divide) if divide else 1
+    tgt = None if target is None else int(target)
     out = []
     v, d = int(seed), int(direction)
-    for i in range(length):
+    dc, fc, tk = 0, 0, 0
+    for _ in range(length):
         out.append(v)
         if step_kind == "table":
             if m == 0:
                 continue
-            st = rate[i] if i < m else rate[m - 1]
+            st = rate[tk] if tk < m else rate[m - 1]
         elif step_kind == "updown":
             st = up if d > 0 else down
         else:
             st = up
+        dc += 1
+        if dc < divide:
+            continue
+        dc = 0
+        if step_kind == "table":
+            tk += 1
+        if boundary == "target":
+            step = st if st else 1
+            if tgt is not None:
+                if v < tgt:
+                    nv = min(v + step, tgt)
+                elif v > tgt:
+                    nv = max(v - step, tgt)
+                else:
+                    nv = v
+                v = nv
+            continue
         nv = v + d * st
         if boundary == "wrap":
             mod = (span + st) if span > 0 else 1
@@ -189,6 +226,12 @@ def recur_segment(lo, hi, seed, direction, length, boundary, step_kind, up=1, do
             elif nv < lo:
                 d = -d
                 nv = lo + (lo - nv)
+        elif boundary == "countflip":
+            fc += 1
+            limit = up_n if d > 0 else down_n
+            if limit > 0 and fc >= limit:
+                d = -d
+                fc = 0
         else:  # clampflip
             if nv > hi:
                 d = -d
@@ -296,16 +339,35 @@ def program_series(rows, seed, n):
     return out
 
 
-def recur_series(lo, hi, seeds, length, boundary, step_kind, up=1, down=1, rate=None):
+def recur_series(  # pylint: disable=too-many-arguments
+    lo,
+    hi,
+    seeds,
+    length,
+    boundary,
+    step_kind,
+    up=1,
+    down=1,
+    rate=None,
+    divide=1,
+    up_n=0,
+    down_n=0,
+    targets=None,
+):
     """A reseeded multi-note product series and its note-on reset frames.
 
     Each entry of ``seeds`` seeds one note segment of ``length`` frames; the
     return is ``(series, resets)`` where ``resets`` are the segment start frames
-    (the synthesized note-ons the product fitter segments on)."""
+    (the synthesized note-ons the product fitter segments on). ``targets`` (one
+    per seed) drives the clamp-to-target glide boundary; the other new axes
+    (``divide``, ``up_n``, ``down_n``) are shared across segments."""
     segs, resets, acc = [], [], 0
-    for seed in seeds:
+    for k, seed in enumerate(seeds):
         resets.append(acc)
-        seg = recur_segment(lo, hi, seed, 1, length, boundary, step_kind, up, down, rate)
+        tgt = None if targets is None else targets[k]
+        seg = recur_segment(
+            lo, hi, seed, 1, length, boundary, step_kind, up, down, rate, divide, up_n, down_n, tgt
+        )
         segs.append(seg)
         acc += len(seg)
     return np.concatenate(segs), resets

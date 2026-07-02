@@ -2361,6 +2361,97 @@ def test_product_fitter_loses_to_constant_step_on_cost():
     assert _ir.complexity(_ir.to_ir(product), None, n) > _ir.complexity(_ir.to_ir(scalar), None, n)
 
 
+# -- Phase 6c: countflip / target / divide axis extensions -----------------
+
+
+def _assert_product_roundtrip(desc, series):
+    """The product desc reconstructs the series frame-exact via both paths."""
+    recon = _ir._recon_product(desc, len(series))  # noqa: SLF001
+    assert np.array_equal(recon, series)
+    rt = reconstruct_register(desc, _ticks(len(series)))
+    assert np.array_equal(rt, series)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_product_countflip_recovers_dwell(seed):
+    # ``countflip`` flips direction after a dwell count (up_n frames up, down_n
+    # down), independent of the value bounds. Asymmetric dwells make a drifting
+    # wave a reflect/clampflip cannot reproduce, so the fitter must recover the
+    # count boundary itself -- not any magic value. Parameters are randomized.
+    rng = np.random.default_rng(seed)
+    step = int(rng.integers(1, 4))
+    up_n = int(rng.integers(2, 6))
+    down_n = int(rng.integers(2, 6))
+    while down_n == up_n:  # asymmetry forces the count boundary over reflect
+        down_n = int(rng.integers(2, 6))
+    n_seg = int(rng.integers(4, 7))
+    base = int(rng.integers(40, 90))
+    seeds = [base + int(rng.integers(-4, 5)) for _ in range(n_seg)]
+    series, resets = recur_series(
+        0, 0, seeds, 30, "countflip", "const", up=step, down=step, up_n=up_n, down_n=down_n
+    )
+    bounds = list(resets) + [len(series)]
+    desc = _recur_product(series, bounds)
+    assert desc is not None and desc["boundary"] == "countflip"
+    assert desc["up_n"] == up_n and desc["down_n"] == down_n
+    assert np.any(np.diff(series) < 0) and np.any(np.diff(series) > 0)
+    _assert_product_roundtrip(desc, series)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_product_target_recovers_latch_glide(seed):
+    # ``target`` glides toward a per-note target and latches on arrival: a ramp
+    # that flattens where no other boundary holds (saw resets, reflect/clampflip
+    # bounce). Randomized seeds/targets, so recovery is the generator, not values.
+    rng = np.random.default_rng(seed)
+    step = int(rng.integers(2, 6))
+    n_seg = int(rng.integers(4, 7))
+    seglen = 34
+    seeds, targets = [], []
+    for _ in range(n_seg):
+        s = int(rng.integers(20, 200))
+        k = int(rng.integers(3, seglen - 8))  # reach the target well before segment end
+        t = s + (step * k if rng.random() < 0.5 else -step * k)
+        seeds.append(s)
+        targets.append(int(t))
+    series, resets = recur_series(
+        0, 255, seeds, seglen, "target", "const", up=step, down=step, targets=targets
+    )
+    bounds = list(resets) + [len(series)]
+    desc = _recur_product(series, bounds)
+    assert desc is not None and desc["boundary"] == "target"
+    assert desc["targets"] == targets
+    # A genuine latch: each segment ends flat (glide arrived and held).
+    for k in range(n_seg):
+        seg = series[bounds[k] : bounds[k + 1]]
+        assert seg[-1] == seg[-2] == targets[k]
+    _assert_product_roundtrip(desc, series)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_product_divide_table_step(seed):
+    # ``divide`` applies the (table) step only every n-th frame: the register
+    # dwells n frames per applied stride. The fitter must recover the compact
+    # rate program + divide, not the zero-interleaved per-frame table (MDL prefers
+    # the compact spelling). Randomized divide, rate program, and segment count.
+    rng = np.random.default_rng(seed)
+    div = int(rng.integers(2, 4))
+    rate = [int(rng.integers(1, 6)) for _ in range(6)]
+    n_seg = int(rng.integers(6, 9))
+    seeds = [0] * n_seg
+    series, resets = recur_series(
+        0, 100000, seeds, 30, "reflect", "table", up=0, down=0, rate=rate, divide=div
+    )
+    bounds = list(resets) + [len(series)]
+    desc = _recur_product(series, bounds)
+    assert desc is not None and desc["step_kind"] == "table"
+    assert desc["divide"] == div
+    # The recovered program is compact (one entry per applied step, no zero pad).
+    table = np.asarray(desc["rate_tables"][0])
+    assert len(np.unique(table[table != 0])) > 1
+    _assert_product_roundtrip(desc, series)
+
+
 # -- unified binop proposer (add / sub / or / and / xor) -------------------
 
 
