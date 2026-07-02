@@ -1159,13 +1159,14 @@ _CUTOFF_SIG = {
 }
 
 
-def _defmon_cutoff(trace, sid_addr, series, store_pcs, ctx, min_fid: float = 0.999):
+def _defmon_cutoff(trace, sid_addr, series, store_pcs, ctx):
     """Recover the defMON filter-cutoff SMC micro-routine, or ``None``.
 
     Verifies a store PC carries the routine's opcode signature (so it never fires
-    on another player), reads the operand-cell addresses from their fixed offsets,
-    and returns a ``CUTOFF`` descriptor only when it reconstructs ``>= min_fid`` --
-    a strict high-fidelity gate that keeps it from displacing a better fit.
+    on another player -- a legitimate precondition, kept inside the proposer) and
+    reads the operand-cell addresses from their fixed offsets. Returns the
+    ``CUTOFF`` descriptor whenever the signature matches; the arbiter scores it
+    against the other proposals (no per-proposer fidelity gate).
     """
     del trace
     if ctx.sampler is None or ctx.ram is None or not store_pcs:
@@ -1193,24 +1194,225 @@ def _defmon_cutoff(trace, sid_addr, series, store_pcs, ctx, min_fid: float = 0.9
         recon = ir.evaluate(ir.to_ir(desc), ctx.n_frames, ctx.sampler)
         fid = float(np.mean(recon == np.asarray(series, dtype=np.int64)))
         desc["residual"] = round(fid, 4)
-        if fid >= min_fid:
-            return desc
+        return desc
     return None
+
+
+# -- MDL arbiter tuning (the single documented place) -------------------------
+#
+# Selection is fidelity-dominant lexicographic: (fidelity, -complexity,
+# -priority). This equals ``argmax(fidelity - LAMBDA * complexity)`` in the
+# LAMBDA -> 0+ limit (LAMBDA below the 1/n_frames fidelity granularity), so a
+# higher-fidelity tree always wins -- keeping the perfect set at 1.0 -- and
+# complexity only breaks exact-fidelity ties, then the documented proposer
+# priority order. ``LAMBDA``/``ir.CAPTURED_W`` are the reported-score constants;
+# the calibration test (tests/test_hvsc.py) pins that this reproduces the old
+# cascade's winners on the perfect set.
+_LAMBDA = 1e-3
+
+# Proposer priority (earlier = preferred on an exact-fidelity tie), mirroring the
+# old cascade order.  Also the descriptor-type -> priority rank.
+_PRIORITY = (
+    "CONST",
+    "CUTOFF",
+    "SEQ",
+    "BACC",
+    "PITCHWALK",
+    "COMPOSITE",
+    "TABLE_WALK",
+    "XOR",
+    "AND",
+    "OR",
+    "FEEDER",
+    "XSTATE",
+)
+
+
+def _type_priority(desc_type) -> int:
+    try:
+        return _PRIORITY.index(desc_type)
+    except ValueError:
+        return len(_PRIORITY)
+
+
+# -- stateless proposers (each returns >= 0 candidate descriptors) ------------
+
+
+def _propose_cutoff(trace, sid_addr, series, pcs, ctx):
+    """CUTOFF proposer (only $D415-$D418; the opcode-signature gate stays inside)."""
+    if not 0xD415 <= int(sid_addr) <= 0xD418:
+        return []
+    cutoff = _defmon_cutoff(trace, sid_addr, series, pcs, ctx)
+    return [cutoff] if cutoff is not None else []
+
+
+def _propose_seq(series, sid_addr, reg_off, on_frames, wr, ctx):
+    """SEQ proposer: envelope (AD/SR) always, else note-gated / sparse registers."""
+    seq_frac, n_changes = _seq_correlation(series, on_frames, ctx.n_frames)
+    if reg_off not in (_AD, _SR):
+        per_frame = len(wr) >= 0.5 * max(1, ctx.n_frames)
+        note_gated = n_changes <= 1 or (
+            seq_frac >= 0.85 and n_changes <= 2.5 * max(1, len(on_frames))
+        )
+        sparse = n_changes <= max(8, 0.15 * ctx.n_frames)
+        if not (note_gated or sparse or not per_frame):
+            return []
+    desc = {
+        "type": "SEQ",
+        "addr": int(sid_addr),
+        "seq_frac": round(seq_frac, 4),
+        "n_changes": int(n_changes),
+    }
+    return [_finish_seq(desc, series)]
+
+
+def _propose_recurrence(trace, sid_addr, series, voice, reg_off, ctx):
+    """BACC proposer: the bare recurrence, plus a captured-cell (+prelude) variant."""
+    bacc = _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx)
+    if bacc is None:
+        return []
+    out = [dict(bacc)]
+    cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
+    if cell is not None and frac >= 0.5:
+        trial = dict(bacc)
+        trial["cell"] = int(cell)
+        trial["sid"] = int(sid_addr)
+        trial["cell_frac"] = round(float(frac), 4)
+        trial["addr"] = int(sid_addr)
+        if reg_off not in (_FREQ_LO, _FREQ_HI):
+            attach_prelude(trial, series, ctx, [trial.get("cell")])
+        out.append(trial)
+    return out
+
+
+def _propose_pitchwalk(trace, sid_addr, reg_off, ctx):
+    pw = _pitch_walk(trace, sid_addr, reg_off, ctx)
+    return [pw] if pw is not None else []
+
+
+def _propose_composite(trace, sid_addr, series, ctx, reg_off):
+    comp = _composite(trace, sid_addr, series, ctx, reg_off)
+    return [comp] if comp is not None else []
+
+
+def _propose_table_walk(series, wr, ctx, sid_addr):
+    """TABLE_WALK proposer (per-frame registers): read-log then image scan."""
+    if len(wr) < 0.5 * max(1, ctx.n_frames):
+        return []
+    tw = _table_walk_search(series, ctx)
+    if tw is None and not ctx.tables:
+        tw = _table_walk_scan(series, ctx)
+    if tw is None:
+        return []
+    # The masked search scores under its gate mask, so it can pick a mask that
+    # clears a bit the register in fact always sets (a constant-1 bit): harmless
+    # to the masked score, fatal to the reconstruction. Force every constant-1
+    # bit back into the mask so evaluated fidelity is not thrown away.
+    s = np.asarray(series, dtype=np.int64) & 0xFF
+    const_one = int(np.bitwise_and.reduce(s)) if len(s) else 0
+    tw["mask"] = int(tw.get("mask", 0xFF)) | const_one
+    tw["addr"] = int(sid_addr)
+    _recover_gate(tw, series, ctx)
+    recover_overrides(tw, series, ctx)
+    return [tw]
+
+
+def _propose_pairs(sid_addr, series, reg_off, ctx):
+    """Bitwise-fold proposers: XOR/AND for CTRL, OR for any per-frame register."""
+    out = []
+    if reg_off == _CTRL:
+        for prop in (_xor_pair, _and_pair):
+            desc = prop(sid_addr, series, ctx)
+            if desc is not None:
+                out.append(desc)
+    or_d = _or_pair(sid_addr, series, ctx)
+    if or_d is not None:
+        out.append(or_d)
+    return out
+
+
+def _propose_feeder(series, sid_addr, ctx):
+    """Feeder fallback: the closest captured cell (FEEDER if exact, else XSTATE)."""
+    desc = {"type": "XSTATE", "addr": int(sid_addr)}
+    cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
+    if cell is not None and frac > 0.0:
+        desc["cell"] = int(cell)
+        desc["sid"] = int(sid_addr)
+        desc["cell_frac"] = round(float(frac), 4)
+        if frac >= 0.999:
+            desc["type"] = "FEEDER"
+    return [desc]
+
+
+def _register_proposals(trace, sid_addr, series, wr, pcs, voice, reg_off, on_frames, ctx):
+    """All candidate descriptors for a register, routed by the class hint table.
+
+    The routing priors (XOR/AND only-CTRL, PITCHWALK only-FREQ, CUTOFF only
+    $D415-18) are proposer *hints* here -- which proposers run for a register
+    class -- not adoption rules; the arbiter scores whatever they emit.
+    """
+    cands = _propose_cutoff(trace, sid_addr, series, pcs, ctx)
+    if reg_off in (_AD, _SR):
+        cands += _propose_seq(series, sid_addr, reg_off, on_frames, wr, ctx)
+    elif reg_off in (_FREQ_LO, _FREQ_HI):
+        cands += _propose_pitchwalk(trace, sid_addr, reg_off, ctx)
+        cands += _propose_composite(trace, sid_addr, series, ctx, reg_off)
+        cands += _propose_recurrence(trace, sid_addr, series, voice, reg_off, ctx)
+        cands += _propose_feeder(series, sid_addr, ctx)
+    else:
+        cands += _propose_recurrence(trace, sid_addr, series, voice, reg_off, ctx)
+        cands += _propose_table_walk(series, wr, ctx, sid_addr)
+        cands += _propose_composite(trace, sid_addr, series, ctx, reg_off)
+        cands += _propose_pairs(sid_addr, series, reg_off, ctx)
+        cands += _propose_seq(series, sid_addr, reg_off, on_frames, wr, ctx)
+        cands += _propose_feeder(series, sid_addr, ctx)
+    return cands
+
+
+def _arbitrate(cands, series, sid_addr, ctx, base):
+    """Score every candidate and pick the MDL winner, merged onto ``base``.
+
+    ``score = fidelity - LAMBDA * complexity``; selection is fidelity-dominant
+    lexicographic ``(fidelity, -complexity, -priority)`` (see ``_LAMBDA``). Each
+    winner carries ``score``/``complexity``/``captured_frames`` for the report.
+    """
+    s = np.asarray(series, dtype=np.int64)
+    n = ctx.n_frames
+    best, best_key = None, None
+    for cand in cands:
+        if cand is None:
+            continue
+        cand = dict(cand)
+        cand["addr"] = int(sid_addr)
+        tree = ir.to_ir(cand)
+        recon = ir.evaluate(tree, n, ctx.sampler)
+        fid = 1.0 if not n else (0.0 if recon is None else float(np.mean(recon == s)))
+        cx, cap = ir.cost_captured(tree, ctx.sampler, n)
+        cand["complexity"] = round(cx, 4)
+        cand["captured_frames"] = int(cap)
+        cand["score"] = round(fid - _LAMBDA * cx, 6)
+        key = (fid, -cx, -_type_priority(cand.get("type", "")))
+        if best_key is None or key > best_key:
+            best, best_key = cand, key
+    result = dict(base)
+    if best is not None:
+        result.update(best)
+    return result
 
 
 def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx=None) -> dict:
     """Classify the generator producing a SID register's per-frame value.
 
-    Returns a dict with ``type`` in {'BACC','TABLE_WALK','SEQ','XSTATE','CONST'},
-    the recovered parameters, ``store_pcs`` (the store-site PCs that wrote this
-    register), and (where recovered) the feeder ``cell_addr``, table walk
-    ``cursor_addr``/``table``/``mask``, and BACC segment info. Strategy, in
-    order: CONST -> (note-segmented, feeder-cell) BACC -> (read-log/image)
-    TABLE_WALK -> SEQ (note-gated event latch) -> XSTATE.
+    Runs the class-routed stateless proposers (:func:`_register_proposals`) and
+    picks the MDL winner with the global arbiter (:func:`_arbitrate`): the tree
+    that maximises ``fidelity - LAMBDA * complexity``, ties broken by lower
+    complexity then documented proposer priority. Returns a descriptor dict with
+    ``type`` in {'CONST','CUTOFF','SEQ','BACC','PITCHWALK','COMPOSITE',
+    'TABLE_WALK','XOR','AND','OR','FEEDER','XSTATE'}, its recovered parameters,
+    ``store_pcs``, and the arbiter's ``score``/``complexity``/``captured_frames``.
 
     ``ctx`` is a precomputed :class:`RecoverContext` (built once by
-    :func:`analyze`); ``stateseq``/``ram`` are accepted for backwards
-    compatibility and seed a context when ``ctx`` is not given.
+    :func:`analyze`); ``stateseq``/``ram`` seed a context when ``ctx`` is absent.
     """
     if ctx is None:
         ctx = _build_context(trace, kind, stateseq, ram)
@@ -1224,88 +1426,18 @@ def classify_register(trace, sid_addr, kind="auto", stateseq=None, ram=None, ctx
         result.update(type="CONST", value=None if empty else int(wr["value"][0]))
         return result
 
-    # defMON global-filter cutoff: a signed SMC accumulator emitted through a
-    # clamp -- neither a plain feeder cell nor a self-reseeding BACC. Recover it
-    # from the routine's operand cells (signature- and fidelity-gated) before the
-    # generic paths can over-fit it.
-    if 0xD415 <= int(sid_addr) <= 0xD418:
-        cutoff = _defmon_cutoff(trace, sid_addr, series, pcs, ctx)
-        if cutoff is not None:
-            result.update(cutoff)
-            return result
-
+    # End-of-frame feeder hint (informational cell_addr/cell_frac), kept for
+    # callers that inspect the closest captured cell regardless of the winner.
     feeder, ffrac = _best_feeder(series, ctx.stateseq)
     if feeder is not None and ffrac >= 0.5:
         result["cell_addr"] = feeder
         result["cell_frac"] = round(ffrac, 4)
 
     on_frames = ctx.note_on.get(voice, []) if voice is not None else ctx.all_on
-    # AD / SR are envelope registers: every player writes them once per note (or
-    # re-blits a per-note shadow). They are event-latched SEQ, never a per-frame
-    # accumulator or table walk -- short-circuit so a per-frame re-blit cannot
-    # over-fit a spurious BACC/TABLE_WALK.
-    if reg_off in (_AD, _SR):
-        seq_frac, n_changes = _seq_correlation(series, on_frames, ctx.n_frames)
-        result.update(type="SEQ", seq_frac=round(seq_frac, 4), n_changes=int(n_changes))
-        return _finish_seq(result, series)
-
-    # FREQ is base (note->freq table, sequencer-indexed) + modulation + hard-
-    # restart override: a composite, not a single accumulator. Choose between the
-    # composite decomposition and an accumulator fit by which actually
-    # reconstructs the register; if neither does (e.g. a tick-driven pitch-table
-    # player not yet modelled) record the best-effort feeder.
-    if reg_off in (_FREQ_LO, _FREQ_HI):
-        return _classify_freq(trace, sid_addr, series, voice, reg_off, ctx, result)
-
-    bacc = _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx)
-    if bacc is not None:
-        result.update(bacc)
-        cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
-        # The feeder cell captures dwell/hold the bare recurrence can miss, so it
-        # is used at reconstruction when attached (:func:`_recon_bacc`). The feeder
-        # plus its held-seed prelude (the captured cell drives every live frame, the
-        # prelude fills the pre-modulation leading hold the cell has not yet been
-        # written on) is attached only when it strictly beats the recurrence's own
-        # fidelity, so a model that already regenerates the register (e.g. the
-        # tick-banded sweep) is never displaced by a lower-fidelity captured cell.
-        recurrence_fid = _candidate_fidelity(bacc, series, bacc.get("byte_role", "full"))
-        if cell is not None and frac >= 0.5:
-            trial = dict(result)
-            trial["cell"] = cell
-            trial["sid"] = int(sid_addr)
-            trial["cell_frac"] = round(float(frac), 4)
-            attach_prelude(trial, series, ctx, [trial.get("cell")])
-            if _descriptor_fidelity(trial, series, ctx) > recurrence_fid:
-                result = trial
-        return result
-
-    result = _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result)
-    if reg_off == _CTRL:
-        result = _maybe_xor_ctrl(sid_addr, series, ctx, result)
-        result = _maybe_and_ctrl(sid_addr, series, ctx, result)
-    result = _maybe_feeder_upgrade(result, series, sid_addr, ctx)
-    result = _maybe_or_reg(sid_addr, series, ctx, result)
-    return result
-
-
-def _descriptor_fidelity(desc, series, ctx):
-    """Fraction of frames a descriptor's reconstruction matches ``series``."""
-    recon = reconstruct_register(desc, ctx.stateseq.ticks, sampler=ctx.sampler)
-    if recon is None:
-        return 0.0
-    return float(np.mean(recon == np.asarray(series, dtype=np.int64)))
-
-
-def _bacc_with_feeder(bacc, series, sid_addr, ctx):
-    """Attach the captured accumulator feeder cell to a BACC descriptor."""
-    if bacc is None:
-        return None
-    cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
-    if cell is not None and frac >= 0.5:
-        bacc["cell"] = cell
-        bacc["sid"] = int(sid_addr)
-        bacc["cell_frac"] = round(float(frac), 4)
-    return bacc
+    cands = _register_proposals(trace, sid_addr, series, wr, pcs, voice, reg_off, on_frames, ctx)
+    if not cands:
+        cands = _propose_feeder(series, sid_addr, ctx)
+    return _arbitrate(cands, series, sid_addr, ctx, result)
 
 
 def attach_prelude(node, series, ctx, cells, max_latches: int = 6):
@@ -1342,129 +1474,11 @@ def attach_prelude(node, series, ctx, cells, max_latches: int = 6):
     node["prelude_values"] = values
 
 
-def _classify_freq(trace, sid_addr, series, voice, reg_off, ctx, result):
-    """Pick the FREQ model (composite vs accumulator) with the best round-trip."""
-    candidates = [
-        _pitch_walk(trace, sid_addr, reg_off, ctx),
-        _composite(trace, sid_addr, series, ctx, reg_off),
-        _bacc_with_feeder(
-            _bacc_candidate(trace, sid_addr, series, voice, reg_off, ctx), series, sid_addr, ctx
-        ),
-    ]
-    best, best_fid = None, -1.0
-    for cand in candidates:
-        if cand is None:
-            continue
-        fid = _descriptor_fidelity(cand, series, ctx)
-        if fid > best_fid:
-            best, best_fid = cand, fid
-    if best is not None and best_fid >= 0.6:
-        result.update(best)
-        return result
-    return _xstate_with_feeder(result, series, sid_addr, ctx)
-
-
 def _finish_seq(result, series):
     """Attach the event latch points an SEQ register reconstructs from."""
     frames, values = _seq_latches(series)
     result["latch_frames"] = frames
     result["latch_values"] = values
-    return result
-
-
-def _classify_walk_or_seq(trace, sid_addr, series, wr, on_frames, ctx, result) -> dict:
-    """Resolve a per-frame register as TABLE_WALK, COMPOSITE, else SEQ / XSTATE."""
-    seq_frac, n_changes = _seq_correlation(series, on_frames, ctx.n_frames)
-    result["seq_frac"] = round(seq_frac, 4)
-    result["n_changes"] = int(n_changes)
-    note_gated = n_changes <= 1 or (seq_frac >= 0.85 and n_changes <= 2.5 * max(1, len(on_frames)))
-    sparse = n_changes <= max(8, 0.15 * ctx.n_frames)
-    # A register written on (almost) every frame is a per-frame generator even
-    # when its value is held; one written only once per note is an event-latched
-    # SEQ write. Gate the per-frame table-walk search on the write density (not
-    # the change density), so a held-waveform CTRL is still recovered as a
-    # TABLE_WALK while per-note AD/SR/RES/VOL stay SEQ.
-    per_frame = len(wr) >= 0.5 * max(1, ctx.n_frames)
-    if per_frame:
-        tw = _table_walk_search(series, ctx)
-        if tw is None and not ctx.tables:
-            tw = _table_walk_scan(series, ctx)
-        if tw is not None:
-            result.pop("seq_frac", None)
-            result.pop("n_changes", None)
-            _recover_gate(tw, series, ctx)
-            recover_overrides(tw, series, ctx)
-            result.update(tw)
-            return result
-
-    if note_gated or sparse or not per_frame:
-        result.update(type="SEQ")
-        return _finish_seq(result, series)
-
-    # No single generator fits: decompose into base + modulation + overrides
-    # before declaring the dependency not-yet-modelled (XSTATE).
-    _voice, reg_off = _voice_of(sid_addr)
-    composite = _composite(trace, sid_addr, series, ctx, reg_off)
-    if composite is not None and composite["residual"] >= 0.6:
-        result.update(composite)
-        return result
-    # Not yet decomposed into a single generator: record the closest observable
-    # feeder so reconstruction (and round_trip) reports the actual gap rather
-    # than nothing -- the dependency is modellable, just not yet modelled.
-    return _xstate_with_feeder(result, series, sid_addr, ctx)
-
-
-def _xstate_with_feeder(result, series, sid_addr, ctx):
-    """Mark XSTATE and attach the closest observable feeder for best-effort recon."""
-    result.update(type="XSTATE")
-    cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
-    if cell is not None and frac > 0.0:
-        result["cell"] = cell
-        result["sid"] = int(sid_addr)
-        result["cell_frac"] = round(float(frac), 4)
-    return result
-
-
-def _maybe_feeder_upgrade(result, series, sid_addr, ctx, min_feeder: float = 0.999):
-    """Recover a per-frame register as a FEEDER (exact captured-cell copy).
-
-    The player often computes a register's value into a RAM cell and then stores
-    that cell to SID; a register that is a near-exact latched copy of such a
-    captured feeder cell is a real per-frame primitive (``FEEDER``), not an
-    unmodelled dependency (``XSTATE``) nor an over-fit table/composite. This
-    generalizes the original filter-only relabel ($D415-$D418) to every per-frame
-    register, in two cases:
-
-    1. an ``XSTATE`` result whose attached feeder cell is an exact copy
-       (``cell_frac >= min_feeder``) -- e.g. a wave-table CTRL written through a
-       gated shadow cell; relabel it ``FEEDER``;
-    2. an imperfect ``TABLE_WALK``/``COMPOSITE`` that a captured feeder cell,
-       sampled at the write instant, reconstructs exactly (``>= min_feeder``) and
-       strictly better than the chosen generator -- the register IS that cell
-       copy; replace the descriptor.
-
-    Strictly non-worsening: case 2 only fires when the feeder beats the current
-    generator, and case 1 never changes the reconstruction (both replay the same
-    cell). Generators that already reconstruct perfectly are left untouched.
-    """
-    rtype = result.get("type")
-    if rtype == "XSTATE" and result.get("cell_frac", 0.0) >= min_feeder:
-        result["type"] = "FEEDER"
-        return result
-    if rtype in ("TABLE_WALK", "COMPOSITE"):
-        cur = _descriptor_fidelity(result, series, ctx)
-        if cur >= 1.0:
-            return result
-        cell, _recon, frac = _best_feeder_at_write(series, sid_addr, ctx)
-        if cell is not None and frac >= min_feeder and frac > cur:
-            keep = {k: result[k] for k in ("addr", "store_pcs", "n_writes") if k in result}
-            keep.update(
-                type="FEEDER",
-                cell=int(cell),
-                sid=int(sid_addr),
-                cell_frac=round(float(frac), 4),
-            )
-            return keep
     return result
 
 
@@ -1960,7 +1974,7 @@ def _composite8(sid_addr, series, ctx):
     return desc
 
 
-def _xor_pair(sid_addr, series, ctx, min_fid: float = 0.999):
+def _xor_pair(sid_addr, series, ctx):
     """Recover a CTRL register written as ``cellA XOR cellB`` (or ``None``).
 
     A common gate/test/waveform idiom (defMON, and any player that flips control
@@ -1970,7 +1984,7 @@ def _xor_pair(sid_addr, series, ctx, min_fid: float = 0.999):
     only partly fit it; the exact-XOR of the right pair reproduces it byte-for-
     byte. Searches low-entropy (control-like) cells, sampled at the SID-write
     instant, over a frame subsample, then verifies the best pair on all frames.
-    Returns an ``XOR`` descriptor only when it reproduces ``>= min_fid``.
+    The prefilter (low-entropy cells) is cheap; adoption is the arbiter's job.
     """
     ss = ctx.stateseq
     if ss.grid.shape[1] == 0 or ctx.sampler is None:
@@ -2002,8 +2016,6 @@ def _xor_pair(sid_addr, series, ctx, min_fid: float = 0.999):
         return None
     recon = (mat_full[:, ai] ^ mat_full[:, bi]) & 0xFF
     fid = float(np.mean(recon == s))
-    if fid < min_fid:
-        return None
     return {
         "type": "XOR",
         "cell_a": int(addrs[cols[ai]]),
@@ -2013,25 +2025,7 @@ def _xor_pair(sid_addr, series, ctx, min_fid: float = 0.999):
     }
 
 
-def _maybe_xor_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
-    """Upgrade a CTRL register to the ``cellA XOR cellB`` model when it wins.
-
-    Tried only after the generic per-frame classification, and adopted only when
-    the XOR reproduces ``>= min_fid`` AND strictly beats the current descriptor
-    (so a clean table-walk/SEQ CTRL that already reconstructs perfectly is never
-    displaced, and no spurious pair can fire below near-exact fidelity).
-    """
-    xor = _xor_pair(sid_addr, series, ctx, min_fid)
-    if xor is None:
-        return result
-    if xor["residual"] > _descriptor_fidelity(result, series, ctx):
-        keep = {k: result[k] for k in ("addr", "store_pcs", "n_writes") if k in result}
-        keep.update(xor)
-        return keep
-    return result
-
-
-def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
+def _and_pair(sid_addr, series, ctx):
     """Recover a CTRL register written as ``waveCell AND gateCell`` (or ``None``).
 
     The GoatTracker2 idiom ``CTRL = chnwave AND chngate`` masks a waveform shadow
@@ -2040,8 +2034,8 @@ def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
     so the search is asymmetric: each low-entropy gate-like cell (``<= 4`` values)
     is AND-ed against every control-like candidate cell (``<= 32`` values),
     sampled at the SID-write instant over a frame subsample, then the best pair
-    is verified on all frames. Returns an ``AND`` descriptor only when it
-    reproduces ``>= min_fid``.
+    is verified on all frames. The asymmetric entropy prefilter is cheap;
+    adoption is the arbiter's job.
     """
     ss = ctx.stateseq
     if ss.grid.shape[1] == 0 or ctx.sampler is None:
@@ -2086,8 +2080,6 @@ def _and_pair(sid_addr, series, ctx, min_fid: float = 0.999):
     # overrides (same greedy, strictly-improving pass as the table-walk path) so a
     # gated wave-table CTRL written through a shadow cell recovers byte-exact.
     recover_overrides(desc, s, ctx, 4, mask=ctx.sampler.written_mask(desc["sid"]))
-    if desc["residual"] < min_fid:
-        return None
     return desc
 
 
@@ -2098,25 +2090,7 @@ def _and_recon_masked(desc, ctx) -> np.ndarray:
     return np.where(written, base, 0)
 
 
-def _maybe_and_ctrl(sid_addr, series, ctx, result, min_fid: float = 0.999):
-    """Upgrade a CTRL register to the ``waveCell AND gateCell`` model when it wins.
-
-    Mirrors :func:`_maybe_xor_ctrl`: adopted only when the AND reproduces
-    ``>= min_fid`` AND strictly beats the current descriptor (so a CTRL that
-    already reconstructs perfectly -- including a freshly adopted XOR -- is never
-    displaced).
-    """
-    and_d = _and_pair(sid_addr, series, ctx, min_fid)
-    if and_d is None:
-        return result
-    if and_d["residual"] > _descriptor_fidelity(result, series, ctx):
-        keep = {k: result[k] for k in ("addr", "store_pcs", "n_writes") if k in result}
-        keep.update(and_d)
-        return keep
-    return result
-
-
-def _or_pair(sid_addr, series, ctx, min_fid: float = 0.999):
+def _or_pair(sid_addr, series, ctx):
     """Recover a register written as ``cellA | cellB`` or ``cell | const``.
 
     The global MODE/VOL register ``$D418`` is blitted as ``filter_mode | volume``
@@ -2127,8 +2101,8 @@ def _or_pair(sid_addr, series, ctx, min_fid: float = 0.999):
     :func:`_xor_pair`/:func:`_and_pair`: searches low-entropy (control-like) cells
     over a frame subsample, fitting each against every other cell and against its
     per-bit-optimal constant, then verifies the best model (plus any held-seed
-    prelude) on all frames. Returns an ``OR`` descriptor only when it reproduces
-    ``>= min_fid``.
+    prelude) on all frames. The low-entropy prefilter is cheap; adoption is the
+    arbiter's job.
     """
     ss = ctx.stateseq
     if ss.grid.shape[1] == 0 or ctx.sampler is None:
@@ -2177,33 +2151,8 @@ def _or_pair(sid_addr, series, ctx, min_fid: float = 0.999):
         cells.append(desc["cell_b"])
     attach_prelude(desc, s, ctx, cells)
     recon = ir.evaluate(ir.to_ir(desc), n, ctx.sampler)
-    fid = float(np.mean(recon == s))
-    if fid < min_fid:
-        return None
-    desc["residual"] = fid
+    desc["residual"] = float(np.mean(recon == s))
     return desc
-
-
-def _maybe_or_reg(sid_addr, series, ctx, result, min_fid: float = 0.999):
-    """Upgrade a per-frame register to ``cellA | cellB`` / ``cell | const`` when it wins.
-
-    The MODE/VOL ``$D418`` blit (``filter_mode | volume``) and similar OR-folds are
-    not single-cell generators, so the generic per-frame path leaves them
-    imperfect. Tried on any register the generic path did not already reconstruct
-    perfectly, and adopted only when the OR reproduces ``>= min_fid`` AND strictly
-    beats the current descriptor -- so a register already nailed (including a
-    freshly adopted XOR/AND) is never displaced. Not CTRL-only, unlike
-    :func:`_maybe_xor_ctrl`.
-    """
-    cur = _descriptor_fidelity(result, series, ctx)
-    if cur >= 1.0:
-        return result
-    or_d = _or_pair(sid_addr, series, ctx, min_fid)
-    if or_d is None or or_d["residual"] <= cur:
-        return result
-    keep = {k: result[k] for k in ("addr", "store_pcs", "n_writes") if k in result}
-    keep.update(or_d)
-    return keep
 
 
 # -- event/state correlation ----------------------------------------------

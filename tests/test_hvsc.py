@@ -38,6 +38,15 @@ try:
 except (OSError, ValueError):
     _SNAPSHOT = {}
 
+_CLASS_SNAPSHOT_PATH = os.path.join(
+    os.path.dirname(__file__), "fixtures", "classification_snapshot.json"
+)
+try:
+    with open(_CLASS_SNAPSHOT_PATH, encoding="utf-8") as _fh:
+        _CLASS_SNAPSHOT = json.load(_fh)
+except (OSError, ValueError):
+    _CLASS_SNAPSHOT = {}
+
 if not CATALOG:
     pytest.skip("tests/fixtures/tunes.json missing", allow_module_level=True)
 if not HAVE_SIDTRACE:
@@ -209,6 +218,32 @@ def test_real_tune_perfect(entry, tmp_path_factory):
 
     assert not xstate, [hex(a) for a in xstate]
     assert rt["overall"] == 1.0, (rt["overall"], rt["unmodeled"][:4])
+
+
+_PERFECT_ENTRIES = [e for e in CATALOG if _key(e) in _PERFECT]
+
+
+@pytest.mark.parametrize("entry", _PERFECT_ENTRIES, ids=[_ids(e) for e in _PERFECT_ENTRIES])
+def test_arbiter_calibration(entry, tmp_path_factory):
+    """Phase-2 calibration: on the perfect set the MDL arbiter's winning
+    descriptor type per register is UNCHANGED vs the pre-Phase-2 cascade
+    (recorded in classification_snapshot.json). This pins that LAMBDA / CAPTURED_W
+    reproduce the hand-ordered priors on known-good tunes. Absent key (committed
+    empty snapshot) -> skip, so CI stays green until the snapshot is populated in
+    the Docker/HVSC environment, exactly like the fidelity ratchet.
+    """
+    snap = _CLASS_SNAPSHOT.get(_ids(entry))
+    if snap is None:
+        pytest.skip("classification snapshot not populated")
+    if not fetchable(entry):
+        pytest.skip(f"tune not fetchable: {entry['path']}")
+    work = tmp_path_factory.mktemp("hvsc")
+    _sid, _prefix, trace = _render(entry, work)
+    result = analyze(trace)
+    for reg, expected in snap.get("regs", {}).items():
+        addr = int(reg, 16)
+        got = result.get(addr, {}).get("type")
+        assert got == expected, (reg, got, expected)
 
 
 @pytest.mark.parametrize("entry", _ANCHORS, ids=[_ids(e) for e in _ANCHORS])
